@@ -399,6 +399,7 @@ This task implements the "must be strictly valid; may be invariant-imperfect" co
   - `malformed.json` — truncated JSON.
   - `not-an-object.json` — a bare JSON array.
   - `v2-invariant-violations.json` — dangling `collectionId`, duplicate `(uri, collectionId)`, non-contiguous `order`. Strictly valid; the extension repairs it.
+  - `empty-collections.json` — no collections.
 - [ ] **Step 2: Write the failing tests.** Named tests that must exist:
   - `'undefined input yields an empty result, not an error'`
   - `'a v1 file parses and reports version 1'`
@@ -459,7 +460,7 @@ Input: `uri` (required, absolute), `type` (`'file' | 'folder'`, required), `coll
   - `'adding to a missing file creates .vscode/ and the file with version 2'`
   - `'adding to a v1 file writes version 2 and preserves existing items'`
   - `'unknown fields on untouched items survive the write'` ← the forward-compat write guarantee
-  - `'a new item gets order = max sibling order + 1'`
+  - `'a new item gets order = the count of existing siblings'`
   - `'an exact duplicate (uri, collectionId) is rejected without writing'`
   - `'an unknown collectionId is rejected and lists the valid collections'`
   - `'a whitespace-only description is omitted, not stored as an empty string'`
