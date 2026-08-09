@@ -21,7 +21,7 @@ skills_relevant:
 
 **Issue:** [glitchwerks/vscode-bookmarks-plus#57](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/57) — state: open (fetched 2026-08-09).
 
-**Revision 5 — status: UNBLOCKED, review findings incorporated.** Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 added an extension-owned resolution source (§ 4B); Rev 4 settled registration scope (§ 4C); Rev 5 resolves two blocking `project-reviewer` findings with real design changes — the sentinel's **cross-boundary agreement mechanism** (§ 4B.7) and its **delivery path** (§ 4B.8). § 12 records the full history. **Do not implement Rev 1's layered design.**
+**Revision 6 — status: READY FOR IMPLEMENTATION.** All `project-reviewer` findings are closed; Rev 6 resolves the last one by naming the optional-`Config` strategy in § 4B.8. Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 added an extension-owned resolution source (§ 4B); Rev 4 settled registration scope (§ 4C); Rev 5 fixed two blocking review findings with real design changes — the sentinel's **cross-boundary agreement mechanism** (§ 4B.7a) and its **delivery path** (§ 4B.8). § 12 records the full history. **Do not implement Rev 1's layered design.**
 
 **#57 ships standalone.** Confirmed in review: tier 3 (`CLAUDE_PROJECT_DIR`) delivers the ergonomic win — a path-free registration entry — with **zero extension changes**. The follow-up issue #58 only closes the launched-from-a-subdirectory gap (R1's original failure mode) and adds the multi-root refusal. Do not treat #57 as blocked on #58 in either direction.
 
@@ -277,21 +277,43 @@ Today's startup throw is acceptable because it fires only on **active misconfigu
 ```
 main()
   state = resolveWorkspaceState(argv, env)
-  state.kind === 'disabled' → createServer(config?, { disabledReason }) → connect()   // still serves
-  state.kind === 'ok'       → createServer(config) → connect()                        // unchanged
-  resolveConfig throws      → existing stderr + exit path, unchanged                  // real misconfiguration
+  state.kind === 'disabled' → createServer(undefined, { disabledReason }) → connect()   // still serves
+  state.kind === 'ok'       → createServer(state.config) → connect()                    // unchanged
+  resolveConfig throws      → existing stderr + exit path, unchanged                    // real misconfiguration
 ```
 
-Both tools check `disabledReason` **before touching any path** and return `{ isError: true, content: [{ type: 'text', text: <reason message> }] }` — the same shape both already use for every other failure (`mcp-server/src/tools/add.ts:L35-L40`, `mcp-server/src/tools/list.ts:L26-L31`). The model gets a legible explanation it can relay; no file is read, no directory is created.
+**Strategy (a): `Config` becomes genuinely optional through the factories, and absence *is* the disabled signal.**
 
-**Why this preserves the 57.** The new logic goes in a **new** function, `resolveWorkspaceState`, layered above `resolveConfig`:
+```ts
+createServer(config: Config | undefined, options?: { disabledReason?: string })
+createListHandler(config: Config | undefined, deps: { …; disabledReason?: string })
+createAddHandler (config: Config | undefined, deps: { …; disabledReason?: string })
+```
 
-- `resolveConfig(argv, env)` keeps its exact signature, return type, and throwing behavior. Its 10 existing tests are untouched.
-- `Config`'s shape is unchanged, so every fixture literal in `index.test.ts`, `list.test.ts`, and `add.test.ts` still compiles.
-- `createServer(config)` gains an **optional** second parameter; `index.test.ts:L50`'s one-argument call still compiles.
-- The tool factories gain an optional field on their existing `deps` object; every existing two-argument call site still compiles.
+Each handler opens with a single guard, and that guard is the *only* disabled check needed:
 
-A discriminated-union return on `resolveConfig` would have been the tidier type, and it was rejected on purpose: it forces every existing test that reads `config.workspacePath` to narrow the union first, converting a zero-churn change into a suite-wide edit.
+```ts
+if (config === undefined) {
+  return toolError(deps.disabledReason ?? 'The Bookmarks Plus mirror is unavailable in this VS Code window.');
+}
+// TypeScript narrows `config` to Config for the rest of the body — every existing line below is unchanged.
+```
+
+One branch does three jobs: it delivers the reason, it satisfies the type checker, and it makes the refusal unbypassable. No file is read, no directory is created.
+
+**Why (a) over a synthesized placeholder `Config`.** The alternative — keeping the type non-optional by passing `{ workspacePath: '', mirrorPath: '', verifyDelayMs: 0 }` with a "never read this" comment — is more attractive on paper and considerably worse in failure. Compare what each does **if a future edit drops the guard**:
+
+- **(a)** `config.mirrorPath` on a possibly-`undefined` value is a **compile error**. The mistake cannot ship.
+- **(b)** `mirrorPath: ''` flows straight into the existing code. `readMirror('')` throws `ENOENT` → returns `undefined` → `list_bookmarks` reports an **empty but successful** workspace. Worse, `writeMirrorAtomic('')` takes `dirname('') === '.'`, calls `mkdir('.', { recursive: true })`, and writes `bookmarks.json` **into the server's current working directory** — resurrecting exactly the directory-pollution failure R2 records as designed-out.
+
+An invariant enforced by the type system beats one enforced by a comment, and here the comment-enforced version degrades into a silent wrong answer plus a stray file write. The reviewer's instinct was right.
+
+**Correction to Rev 5's framing.** Rev 5 said this piece was zero-churn; that was wrong and is withdrawn. Accurately:
+
+- **No existing test is modified.** Passing a `Config` to a `Config | undefined` parameter is valid TypeScript, so every fixture literal in `index.test.ts`, `list.test.ts`, and `add.test.ts` still compiles, and `index.test.ts:L50`'s one-argument `createServer(config)` call still compiles against the new optional second parameter.
+- **Two source files do change** beyond the new tier logic: `tools/list.ts` and `tools/add.ts` each gain the four-line guard above. That is a small, contained ripple — not zero, and it needs no apology.
+
+`resolveConfig(argv, env)` itself keeps its exact signature, return type, and throwing behavior, so its 10 existing cases are untouched. A discriminated-union return on `resolveConfig` was rejected on purpose: it would force every existing test that reads `config.workspacePath` to narrow first, converting a contained ripple into a suite-wide edit.
 
 Splitting keeps #57 shippable today, lets the extension change land on its own schedule, and avoids a second `mcp-server` PR to add the variable later.
 
@@ -523,8 +545,9 @@ All paths are relative to the repo root on the implementation branch. `mcp-serve
 - [ ] Define the sentinel prefix and reason slugs as **exported constants** in `mcp-server/src/config.ts` — e.g. `export const DISABLED_PREFIX = 'disabled:';` with known slugs `multi-root` and `no-folder` (§ 4B.7). Declared independently here; **never imported from `src/`, and never imported *by* `src/`** (§ 4B.7a).
 - [ ] Add `resolveWorkspaceState(argv, env)` to `mcp-server/src/config.ts` per § 4B.8: returns a disabled state when the tier-2 value carries the prefix, otherwise delegates to `resolveConfig` unchanged. **Do not modify `resolveConfig`'s signature, return type, or throwing behavior.**
 - [ ] `mcp-server/test/config.test.ts`: cases for `resolveWorkspaceState` — each known slug yields a disabled state with a reason; an **unknown** slug yields a disabled state with a generic reason rather than being treated as a path (forward compatibility, § 4B.7); a normal path yields the same `Config` `resolveConfig` would.
-- [ ] `mcp-server/src/index.ts`: on a disabled state, **still connect the transport** and pass `disabledReason` into `createServer` via a new optional second parameter (§ 4B.8). Leave the existing throw/stderr/exit path at `:L52-L59` untouched for genuine misconfiguration.
-- [ ] `mcp-server/src/tools/list.ts` and `add.ts`: check `disabledReason` **before any path use** and return `isError: true` with the reason message, using the existing error shape (`add.ts:L35-L40`).
+- [ ] `mcp-server/src/index.ts`: on a disabled state, **still connect the transport** and call `createServer(undefined, { disabledReason })` — the config argument becomes `Config | undefined` and the second parameter is new and optional (§ 4B.8, strategy (a)). Leave the existing throw/stderr/exit path at `:L52-L59` untouched for genuine misconfiguration.
+- [ ] `mcp-server/src/tools/list.ts` and `add.ts`: widen the first parameter to `Config | undefined`, add `disabledReason?: string` to the existing `deps` object, and open each handler with the **single** guard from § 4B.8 — `if (config === undefined) return toolError(deps.disabledReason ?? <generic>)`. TypeScript narrows `config` for every line below it, so no other line in either handler changes.
+- [ ] **Do not** synthesize a placeholder `Config` with empty-string paths as a way to keep the type non-optional. § 4B.8 records why: a dropped guard becomes a silent empty result plus a stray `bookmarks.json` written into the server's cwd, instead of a compile error.
 - [ ] `mcp-server/test/list.test.ts` and `add.test.ts`: **add** cases asserting each tool returns `isError` with a legible reason when disabled, and — critically — that **no file is read and no directory is created**. Change no existing case.
 - [ ] Messages should echo the extension's own wording where it exists: `src/bookmarkMirror.ts:L26` and `:L32`.
 - [ ] **Deliberate asymmetry, recorded here so it is not mistaken for an oversight:** until #58 ships, these checks guard a value nothing produces (§ 3, "inert until the extension ships its half"), and the two halves' agreement on the strings is **not** covered by any test in this repo. #58 closes that with `sentinelDrift.test.ts` (§ 4B.7a).
@@ -557,6 +580,16 @@ The extension half (§ 4B.5/4B.7 — the follow-up issue), MCP `roots` (D2), any
 ---
 
 ## 12. Revision history
+
+### Rev 6 — the optional-`Config` strategy
+
+Closes the last open review item. Rev 5's § 4B.8 pseudocode implied `Config` became optional while the surrounding text claimed the change was zero-churn; those could not both be true, because the tool factories type their first parameter as a non-optional `Config` and dereference it directly.
+
+**Named strategy: (a) — `Config | undefined` through `createServer` and both tool factories, with `config === undefined` serving as the disabled signal.** Justification is failure behavior, not aesthetics: if a future edit drops the guard, (a) produces a **compile error**, while the placeholder-`Config` alternative writes `bookmarks.json` into the server's working directory and reports an empty-but-successful bookmark list. An invariant the type checker enforces beats one a comment enforces.
+
+Rev 5's "zero-churn" claim for this piece is withdrawn and replaced with an accurate one: **no existing test is modified** (a `Config` argument still satisfies a `Config | undefined` parameter), but `tools/list.ts` and `tools/add.ts` each gain a four-line guard. Contained ripple, not zero.
+
+
 
 ### Rev 5 — `project-reviewer` findings
 
