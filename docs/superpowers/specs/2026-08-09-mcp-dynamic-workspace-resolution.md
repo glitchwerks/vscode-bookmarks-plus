@@ -6,8 +6,12 @@ touches:
   - README.md
   - CHANGELOG.md
   - mcp-server/src/index.ts
+  - mcp-server/src/tools/list.ts
+  - mcp-server/src/tools/add.ts
+  - mcp-server/test/list.test.ts
+  - mcp-server/test/add.test.ts
   # Deferred to the follow-up issue in § 4B.5, not touched by #57 itself:
-  # src/extension.ts, package.json (activationEvents)
+  # src/extension.ts, src/bookmarkMirror.ts, package.json (activationEvents)
 skills_relevant:
   - test-driven-development
   - simplicity-first
@@ -17,9 +21,11 @@ skills_relevant:
 
 **Issue:** [glitchwerks/vscode-bookmarks-plus#57](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/57) — state: open (fetched 2026-08-09).
 
-**Revision 3.** Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 adds a second, extension-owned resolution source proposed by the user (§ 4B) and promotes it above `CLAUDE_PROJECT_DIR`. § 12 records the full history. **Do not implement Rev 1's layered design.**
+**Revision 5 — status: UNBLOCKED, review findings incorporated.** Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 added an extension-owned resolution source (§ 4B); Rev 4 settled registration scope (§ 4C); Rev 5 resolves two blocking `project-reviewer` findings with real design changes — the sentinel's **cross-boundary agreement mechanism** (§ 4B.7) and its **delivery path** (§ 4B.8). § 12 records the full history. **Do not implement Rev 1's layered design.**
 
-**Rev 4 — status: UNBLOCKED.** Both § 6 questions are answered (Q1 as recommended, Q2 against the recommendation — see § 6 and § 4C). The Phase 0 probe (§ 8) is now an implementation task rather than a gate on drafting: no remaining decision depends on its outcome, only the strength of the tier-2/tier-3 ordering rationale does. Task breakdown in § 13. Ready for `project-reviewer`.
+**#57 ships standalone.** Confirmed in review: tier 3 (`CLAUDE_PROJECT_DIR`) delivers the ergonomic win — a path-free registration entry — with **zero extension changes**. The follow-up issue #58 only closes the launched-from-a-subdirectory gap (R1's original failure mode) and adds the multi-root refusal. Do not treat #57 as blocked on #58 in either direction.
+
+Task breakdown in § 13.
 
 ## 0. Citation ground rules
 
@@ -205,7 +211,7 @@ It does expand the *file* scope: activation logic and `package.json` in the exte
 **Recommendation: split.**
 
 - **#57 (this spec):** `mcp-server` reads `BOOKMARKS_PLUS_WORKSPACE` at its documented precedence. Inert until the extension sets it. Still a sub-10-line change, still 57/57 tests preserved.
-- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in 4B.7, importing or mirroring `MIRROR_DISABLED_SENTINEL` from `mcp-server/src/config.ts` with a pointer back to it (§ 13 Task 3 — the two halves' agreement on that string is not testable from `mcp-server/` alone, so it must be tested here); extension-side tests.
+- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in § 4B.7 by declaring its **own** literal for both reason slugs (never importing from `mcp-server/`); add `mcp-server/test/sentinelDrift.test.ts` per § 4B.7a to enforce agreement across the boundary; extension-side tests.
 
 ### 4B.7 Multi-root: the extension must set a sentinel, not stay silent
 
@@ -221,11 +227,71 @@ So in a multi-root window **there is no `.vscode/bookmarks.json` anywhere**. If 
 **Contract: the extension always sets the variable, to one of two things.**
 
 - Mirror enabled → the workspace root path.
-- Mirror disabled (multi-root, or no folder open) → a reserved sentinel, e.g. `BOOKMARKS_PLUS_WORKSPACE=disabled:multi-root`.
+- Mirror disabled → a reserved sentinel of the form `disabled:<reason-slug>`.
 
-The server recognizes the sentinel and **fails with a named error** ("the Bookmarks Plus mirror is disabled in this VS Code window: multi-root workspaces are not supported yet") instead of falling through. Silence is reserved for "the extension isn't running here at all," which is the only case where falling through to tier 3 is correct.
+Silence is reserved for "the extension isn't running here at all," which is the only case where falling through to tier 3 is correct.
 
 This also strengthens D5: the extension variable can carry *mirror-enabled state*, which no other tier is in a position to know. Tier 3 can report a directory; only tier 2 can report that bookmarks are unavailable in this window.
+
+**The sentinel must cover both disabled reasons, not just multi-root.** `resolveMirrorLocation` returns `kind: 'disabled'` for *two* cases — `'no workspace folder is open'` (`src/bookmarkMirror.ts:L25-L27`) and `'multi-root workspaces are not supported by the bookmarks mirror yet'` (`:L29-L34`). The chosen form is **prefix-based with a reason slug**, because it maps directly onto the `MirrorLocation` type the extension already has: `{ kind: 'disabled'; reason: string }` (`src/bookmarkMirror.ts:L10-L12`).
+
+| Extension state | Variable value |
+| --- | --- |
+| `kind: 'enabled'` | absolute workspace root path |
+| `kind: 'disabled'`, multi-root | `disabled:multi-root` |
+| `kind: 'disabled'`, no folder open | `disabled:no-folder` |
+
+The server matches the `disabled:` prefix, maps known slugs to specific user-facing messages, and **falls back to a generic message for an unrecognized slug** rather than treating it as a path. That forward-compatibility matters: a future extension version can add a disabled reason without the server needing to ship first.
+
+### 4B.7a Cross-boundary agreement: duplicated literal + a drift test
+
+Rev 4 said the extension should "import or mirror" the constant. **Both halves of that were wrong** and the review was right to block it:
+
+- **Importing** would make the extension's `src/` depend on the standalone `mcp-server/` package. #52's D4 established "`mcp-server` has no dependency on `../src`"; § 4B.5 defended only *that* direction. Creating the reverse dependency is worse — it would drag a separate npm package into the VSIX build.
+- **"Mirroring"** with no enforcement is exactly the unchecked duplicated literal that Task 3's own rationale rejects.
+
+**This repo already has two working patterns for cross-component string agreement. Adopt pattern (a), plus the enforcement from pattern (b).** No third mechanism is invented:
+
+- **(a) Duplicated literal, independently declared on each side.** Already in use: `MIRROR_RELATIVE_PATH = '.vscode/bookmarks.json'` is exported at `src/bookmarkMirror.ts:L5`, and `mcp-server/src/config.ts:L29` re-derives the same location as `path.join(workspacePath, '.vscode', 'bookmarks.json')` — no import crosses the boundary.
+- **(b) A drift test that reads across the package boundary at test time.** Already in use: `mcp-server/test/schemaDrift.test.ts:L30` reads the authored schema at `../../../schemas/bookmarks.schema.json` and asserts agreement with `contract.ts`.
+
+The key distinction that makes this safe: **a test reading a file across the boundary is not a source dependency.** `schemaDrift.test.ts` already reaches into the repo root without any package coupling, and D4 remains intact.
+
+**Mechanism:** each side declares its own literal. **#58 adds `mcp-server/test/sentinelDrift.test.ts`**, modeled on `schemaDrift.test.ts`, which reads the extension's source across the boundary and asserts the two declarations agree — failing loudly on a rename from either side. It lands in #58 rather than #57 because until the extension half exists there is nothing to compare against.
+
+Known fragility, stated rather than hidden: asserting on source text is coarser than a type-checked import. It catches the failure being guarded (a rename on one side) and not much else. That is an acceptable trade for keeping D4 intact, and it is the same trade `schemaDrift.test.ts` already makes.
+
+### 4B.8 Delivering the refusal: connect first, refuse per-call
+
+**A startup throw cannot deliver this message, and this is a design change, not a caveat.**
+
+`main()` catches a `resolveConfig` failure, writes it to `console.error`, sets a non-zero exit code and returns — **before `server.connect()`** (`mcp-server/src/index.ts:L51-L63`). Two consequences make that path wrong for the sentinel:
+
+- The message goes to stderr only, and the client "**MAY** capture, forward, or ignore the server's `stderr` output" (MCP stdio binding, fetched 2026-08-09). Delivery is not guaranteed.
+- The process exits without ever connecting. Per the same binding, "If the server process exits unexpectedly, the client **SHOULD** restart it" — so the likely observable behavior is a restart loop, not an explanation.
+
+Today's startup throw is acceptable because it fires only on **active misconfiguration** — a user who registered the server with no resolvable workspace. The sentinel is different: it fires **routinely, for a user who did nothing wrong**, merely by opening a multi-root workspace or a window with no folder. That user must actually see why bookmarks are unavailable.
+
+**Design: detect the sentinel before the throw, connect the transport anyway, and refuse per tool call.**
+
+```
+main()
+  state = resolveWorkspaceState(argv, env)
+  state.kind === 'disabled' → createServer(config?, { disabledReason }) → connect()   // still serves
+  state.kind === 'ok'       → createServer(config) → connect()                        // unchanged
+  resolveConfig throws      → existing stderr + exit path, unchanged                  // real misconfiguration
+```
+
+Both tools check `disabledReason` **before touching any path** and return `{ isError: true, content: [{ type: 'text', text: <reason message> }] }` — the same shape both already use for every other failure (`mcp-server/src/tools/add.ts:L35-L40`, `mcp-server/src/tools/list.ts:L26-L31`). The model gets a legible explanation it can relay; no file is read, no directory is created.
+
+**Why this preserves the 57.** The new logic goes in a **new** function, `resolveWorkspaceState`, layered above `resolveConfig`:
+
+- `resolveConfig(argv, env)` keeps its exact signature, return type, and throwing behavior. Its 10 existing tests are untouched.
+- `Config`'s shape is unchanged, so every fixture literal in `index.test.ts`, `list.test.ts`, and `add.test.ts` still compiles.
+- `createServer(config)` gains an **optional** second parameter; `index.test.ts:L50`'s one-argument call still compiles.
+- The tool factories gain an optional field on their existing `deps` object; every existing two-argument call site still compiles.
+
+A discriminated-union return on `resolveConfig` would have been the tidier type, and it was rejected on purpose: it forces every existing test that reads `config.workspacePath` to narrow the union first, converting a zero-churn change into a suite-wide edit.
 
 Splitting keeps #57 shippable today, lets the extension change land on its own schedule, and avoids a second `mcp-server` PR to add the variable later.
 
@@ -355,7 +421,9 @@ Build, register the server with no `args` path, then take **five** measurements 
 
 6. **Cache-scope check, once the extension half exists** (§ 4B.2): open window A on repo A, let the extension activate, then open window B on repo B and read the probe file for a terminal created *before* B's Bookmarks view is revealed. If it records repo A's path, the persistence cache is global and R6 is the full leak; if it records nothing, the cache is per-workspace and R6 is benign. Either way `persistent = false` stays.
 
-Rev 3 lowers the stakes on measurement 1: under Rev 2 a wrong answer broke the design's foundation; now it costs one fallback tier and strengthens the case for § 4B. **Still stop and re-open § 6 if measurements 1 *and* 5 both disappoint** — that would mean neither tier is reliable for the target session type.
+**This probe is not a design gate, but it *is* a correctness gate on tier 3 — do not let the first framing obscure the second.** No decision in this spec changes based on the outcome. But tier 3 is the only automatic source #57 ships (tier 2 arrives with #58), so if it does not resolve correctly in VS Code sessions, **#57 delivers zero ergonomic improvement until #58 lands** — the user would still have to put a path in every registration entry, which is the state C1 rejected.
+
+**Stop condition:** if measurements 1 **and** 5 both disappoint — `CLAUDE_PROJECT_DIR` absent, or pointing somewhere other than the workspace root, in ordinary VS Code sessions — **halt and return to the router.** Do not ship a tier that does not work and rely on #58 to rescue it. That outcome would mean #57's value depends entirely on #58, which changes the issue's sequencing and is a decision for the user, not the implementer.
 
 **Phase 1 — the change itself.**
 1. `mcp-server/src/config.ts`: insert `env.BOOKMARKS_PLUS_WORKSPACE` then `env.CLAUDE_PROJECT_DIR` between the positional and the legacy env var (`:L13`), per § 3's order. Signature, return type, and all downstream derivation unchanged.
@@ -388,7 +456,9 @@ Test-first per the repo standard: the four new `config.test.ts` cases before the
 
 ## 10. Test impact — revised
 
-**Rev 1 estimated 21 tests untouched, ~25 needing fixture edits, 3 relocated, 1 rewritten, 3 replaced. That estimate is superseded: all 57 tests are preserved verbatim.**
+**The completion criterion is "no existing test was modified" — not a preserved-test count.** Counts drift as tasks add cases (Tasks 2 and 3 add roughly seven to `config.test.ts` alone, plus cases in `list.test.ts` and `add.test.ts`), and a count invites the wrong reconciliation when it does. The invariant that matters: `git diff mcp-server/test/` shows **additions and comments only**. Rev 1's estimate (21 untouched, ~25 fixture-edited, 3 relocated, 1 rewritten, 3 replaced) is superseded — no existing test needs to change at all.
+
+The table below therefore describes *why* each file's existing cases survive, not how many will exist afterward.
 
 Because `resolveConfig`'s signature, return type, and `Config`'s shape are unchanged, and no tool schema or handler changes:
 
@@ -400,9 +470,9 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 | `add.test.ts` | 17 | Untouched — no fixture-helper change is needed now |
 | `list.test.ts` | 8 | Untouched — including `:L279-L281`, which pins `Object.keys(inputSchema)` as `[]`. Rev 1 called this a deliberate break; under invariant 2 it stays green and becomes a **regression guard** for C2: if a future change adds a workspace argument to `list_bookmarks`, this test fails and should be read as C2 being violated. Worth a comment saying so. |
 | `index.test.ts` | 1 | Untouched — `createServer` stays synchronous and I/O-free, which Rev 1 had to engineer for and Rev 2 gets for free |
-| `config.test.ts` | 10 | Untouched. The throw-when-nothing-present test (`:L36-L41`) still passes: it calls `resolveConfig(argvWith(), {})` with an empty env object, so no `CLAUDE_PROJECT_DIR` is present. Verified by reading the test. |
+| `config.test.ts` | 10 | No existing case modified; Tasks 2-3 **add** to this file. `resolveConfig` keeps its signature, return type, and throwing behavior — the sentinel logic lands in the new `resolveWorkspaceState` (§ 4B.8). The throw-when-nothing-present case (`:L36-L41`) still passes: it calls `resolveConfig(argvWith(), {})` with an empty env literal, so no `CLAUDE_PROJECT_DIR` is present. Verified by reading the test. |
 
-**Net: 57/57 preserved, ~4 tests added.** If an implementation of this spec modifies an existing test, that is a signal it has drifted from the design — treat it as a review finding, not a cleanup.
+**Net: no existing test modified; new cases added by Tasks 2, 3, and 4.** If an implementation of this spec modifies an existing test, that is a signal it has drifted from the design — treat it as a review finding, not a cleanup.
 
 ---
 
@@ -446,23 +516,32 @@ All paths are relative to the repo root on the implementation branch. `mcp-serve
 - [ ] `mcp-server/src/config.ts:L16`: update the error text to name all four sources.
 - [ ] `npm test` green: 57 + new.
 
-### Task 3 — The multi-root sentinel (§ 4B.7)
+### Task 3 — The sentinel: detection, refusal, delivery (§ 4B.7, § 4B.8)
 
-- [ ] `mcp-server/test/config.test.ts`: add a case asserting the reserved sentinel value produces a **named, distinguishable error** rather than being treated as a path.
-- [ ] Define the sentinel as an **exported constant** in `mcp-server/src/config.ts` — e.g. `export const MIRROR_DISABLED_SENTINEL = 'disabled:multi-root';` — not an inline string literal. This is the point of the task: the sentinel is a cross-component contract, and only one half of it lives in this repo's `mcp-server/`. A named export makes a rename a compile-visible change on at least one side; a bare literal makes it a comment nobody greps.
-- [ ] Implement the sentinel check in `resolveConfig`. Error text must name the reason ("the Bookmarks Plus mirror is disabled in this VS Code window: multi-root workspaces are not supported yet"), matching `src/bookmarkMirror.ts:L32`'s wording.
-- [ ] Add a comment at the constant recording that the extension half must produce this exact value, and naming the follow-up issue.
-- [ ] **Note the deliberate asymmetry:** until the extension half ships, this check guards a value nothing produces. That is intended (§ 3, "inert until the extension ships its half") — but it means the two halves' agreement on the string is **not** covered by any test in this repo. The follow-up issue's scope must include importing or mirroring `MIRROR_DISABLED_SENTINEL` with a pointer back to it, and that is where the agreement gets tested.
+> **Task 3 must merge together with Task 2 — never as a follow-on commit.** Task 2's `??`-chain reads like a simple extension, and its tests pass without any sentinel handling. An implementer who stops there ships a chain that treats `disabled:multi-root` as a **relative path**, resolves it against `process.cwd()`, and lets `add_bookmark` create a mirror file in a bogus directory — precisely the silent-wrong-write § 4B.7 exists to prevent. **Do not mark Task 2 done until Task 3's checks are in place.**
+
+- [ ] Define the sentinel prefix and reason slugs as **exported constants** in `mcp-server/src/config.ts` — e.g. `export const DISABLED_PREFIX = 'disabled:';` with known slugs `multi-root` and `no-folder` (§ 4B.7). Declared independently here; **never imported from `src/`, and never imported *by* `src/`** (§ 4B.7a).
+- [ ] Add `resolveWorkspaceState(argv, env)` to `mcp-server/src/config.ts` per § 4B.8: returns a disabled state when the tier-2 value carries the prefix, otherwise delegates to `resolveConfig` unchanged. **Do not modify `resolveConfig`'s signature, return type, or throwing behavior.**
+- [ ] `mcp-server/test/config.test.ts`: cases for `resolveWorkspaceState` — each known slug yields a disabled state with a reason; an **unknown** slug yields a disabled state with a generic reason rather than being treated as a path (forward compatibility, § 4B.7); a normal path yields the same `Config` `resolveConfig` would.
+- [ ] `mcp-server/src/index.ts`: on a disabled state, **still connect the transport** and pass `disabledReason` into `createServer` via a new optional second parameter (§ 4B.8). Leave the existing throw/stderr/exit path at `:L52-L59` untouched for genuine misconfiguration.
+- [ ] `mcp-server/src/tools/list.ts` and `add.ts`: check `disabledReason` **before any path use** and return `isError: true` with the reason message, using the existing error shape (`add.ts:L35-L40`).
+- [ ] `mcp-server/test/list.test.ts` and `add.test.ts`: **add** cases asserting each tool returns `isError` with a legible reason when disabled, and — critically — that **no file is read and no directory is created**. Change no existing case.
+- [ ] Messages should echo the extension's own wording where it exists: `src/bookmarkMirror.ts:L26` and `:L32`.
+- [ ] **Deliberate asymmetry, recorded here so it is not mistaken for an oversight:** until #58 ships, these checks guard a value nothing produces (§ 3, "inert until the extension ships its half"), and the two halves' agreement on the strings is **not** covered by any test in this repo. #58 closes that with `sentinelDrift.test.ts` (§ 4B.7a).
 
 ### Task 4 — C2 regression guard
 
 - [ ] Add a comment at `mcp-server/test/list.test.ts:L279-L281` explaining that the empty-`inputSchema` assertion is a **C2 guard**: if a future change adds a workspace argument to `list_bookmarks`, this failing test means the no-cross-workspace-exposure invariant (§ 3, invariant 2) was violated, not that the test is stale.
+- [ ] In that same comment, record the guard's **blind spot**: the assertion is wrapped in `if (list.inputSchema !== undefined)` (`:L279`), so it silently passes if `inputSchema` is removed altogether — it catches an added workspace argument, not a deleted schema. Note it rather than restructuring the test, which would violate the no-existing-test-modified criterion.
 - [ ] Same for `add_bookmark`'s five-field schema at `mcp-server/src/tools/add.ts:L156-L162`.
 
 ### Task 5 — Documentation
 
 - [ ] `README.md:L50-L127`: rewrite per Phase 1 step 4 — project-scoped path-free entry, `${VAR:-default}` build path, approval prompt, both-scopes warning, `args` override, Desktop-chat limitation, `BOOKMARKS_MCP_WORKSPACE` shell-export warning.
-- [ ] `CHANGELOG.md`: the workspace path is now optional under VS Code-launched Claude Code.
+- [ ] `CHANGELOG.md` — **two entries, and one of them is not an addition:**
+  - **Added:** the workspace path is now optional under VS Code-launched Claude Code.
+  - **Changed:** `BOOKMARKS_MCP_WORKSPACE` is demoted below `CLAUDE_PROJECT_DIR`. This is a **behavior regression against documented, previously-correct configuration** — `README.md:L108-L109` currently instructs users to omit the `args` path and set that variable in the entry's `env` block. Anyone who followed those instructions will now find their value **silently overridden** by `CLAUDE_PROJECT_DIR` under Claude Code. Filing it under Added would hide a breaking change.
+- [ ] **Migration note in both `README.md` and `CHANGELOG.md`:** users who configured via `BOOKMARKS_MCP_WORKSPACE` should switch to the path-free entry (§ 3). Keeping the old `env`-block form is no longer reliable — state plainly that it is overridden, not merely deprecated.
 - [ ] Verify no remaining text in either file describes the one-registration-per-workspace model.
 
 ### Task 6 — Close out
@@ -478,6 +557,19 @@ The extension half (§ 4B.5/4B.7 — the follow-up issue), MCP `roots` (D2), any
 ---
 
 ## 12. Revision history
+
+### Rev 5 — `project-reviewer` findings
+
+Two blocking findings, both fixed as design changes rather than caveats:
+
+1. **Cross-boundary agreement (§ 4B.7a).** Rev 4's "import or mirror the constant" was architecturally wrong in both branches — importing would have created a `src/` → `mcp-server/` dependency (the reverse of #52's D4, which § 4B.5 had defended only in the forward direction), and "mirroring" was the unenforced duplicated literal the same task rejected elsewhere. Replaced with the repo's existing pattern (a) duplicated literal, enforced by pattern (b)'s cross-boundary drift test in #58.
+2. **Delivery path (§ 4B.8).** A startup throw exits before `connect()`, so the refusal would reach the user only via stderr the client *may* discard, with a likely restart loop. Redesigned: connect first, refuse per tool call with `isError`. The new logic sits in a new `resolveWorkspaceState` so `resolveConfig`'s existing tests stay untouched.
+
+Concerns folded in: Phase 0 reframed as a correctness gate on tier 3 with an explicit stop-and-return condition; the `BOOKMARKS_MCP_WORKSPACE` demotion moved to **Changed** with a migration note in both README and CHANGELOG; the sentinel extended to cover **both** disabled reasons via a prefix-plus-slug form with generic-fallback handling; Task 3 bound to merge with Task 2. Nits: count-based preservation language replaced with "no existing test modified," the `if (inputSchema !== undefined)` blind spot recorded, `touches:` completed, stale "Revision 3." header corrected.
+
+The lesson worth keeping: **a cross-component contract needs a named owner for its enforcement, not just its value.** Rev 4 specified the sentinel's value carefully and left "how do the two sides stay in agreement" to a code comment. Naming the value is the easy half; the half that decays silently is the check.
+
+
 
 ### Rev 4 — registration scope
 
