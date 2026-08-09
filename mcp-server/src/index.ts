@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { resolveConfig, type Config } from './config.js';
+import { resolveWorkspaceState, type Config, type WorkspaceState } from './config.js';
 import { readMirror, writeMirrorAtomic } from './mirrorFile.js';
 import { createAddHandler } from './tools/add.js';
 import { createListHandler } from './tools/list.js';
@@ -12,13 +12,19 @@ import { createListHandler } from './tools/list.js';
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-export function createServer(config: Config): McpServer {
+export function createServer(
+  config: Config | undefined,
+  options?: { disabledReason?: string },
+): McpServer {
   const server = new McpServer({
     name: 'bookmarks-plus-mcp',
     version: '0.0.0',
   });
 
-  const listTool = createListHandler(config, { readMirror });
+  const listTool = createListHandler(config, {
+    readMirror,
+    disabledReason: options?.disabledReason,
+  });
   server.registerTool(
     listTool.name,
     {
@@ -34,6 +40,7 @@ export function createServer(config: Config): McpServer {
     writeMirrorAtomic,
     sleep,
     uuid: randomUUID,
+    disabledReason: options?.disabledReason,
   });
   server.registerTool(
     addTool.name,
@@ -49,16 +56,19 @@ export function createServer(config: Config): McpServer {
 }
 
 async function main(): Promise<void> {
-  let config: Config;
+  let state: WorkspaceState;
   try {
-    config = resolveConfig(process.argv, process.env);
+    state = resolveWorkspaceState(process.argv, process.env);
   } catch (error: unknown) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
     return;
   }
 
-  const server = createServer(config);
+  const server =
+    state.kind === 'ok'
+      ? createServer(state.config)
+      : createServer(undefined, { disabledReason: state.reason });
   await server.connect(new StdioServerTransport());
 }
 

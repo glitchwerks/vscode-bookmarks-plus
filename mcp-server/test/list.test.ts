@@ -121,6 +121,21 @@ function containsValue(node: unknown, value: string): boolean {
   return false;
 }
 
+/** Counts readMirror calls while still performing the real read, mirroring add.test.ts's spyOnRealWrite. */
+function spyOnRead(): {
+  readMirror: typeof readMirror;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  return {
+    readMirror: async (mirrorPath: string) => {
+      calls.push(mirrorPath);
+      return readMirror(mirrorPath);
+    },
+    calls,
+  };
+}
+
 test('a missing file returns an empty result, not an error', async () => {
   const { workspacePath, mirrorPath } = await makeWorkspace();
   const config = makeConfig(workspacePath, mirrorPath);
@@ -294,4 +309,44 @@ test('the result surfaces the resolved workspace and mirror path', async () => {
     containsValue(payload, mirrorPath) || containsValue(payload, workspacePath),
     'the success payload should surface the resolved workspace or mirror path somewhere',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Disabled workspace (config === undefined, spec § 4B.8, strategy (a)). This
+// is the regression guard for the rejected placeholder-Config alternative:
+// a dropped guard there would still let readMirror('') run against whatever
+// the process's cwd happens to be. Here, no file may be read at all.
+// ---------------------------------------------------------------------------
+
+test('a disabled config (undefined) returns a tool error matching the provided disabledReason, without ever reading the mirror', async () => {
+  const { readMirror: spiedRead, calls } = spyOnRead();
+  const list = createListHandler(undefined, {
+    readMirror: spiedRead,
+    disabledReason: 'Bookmarks are unavailable: multi-root workspaces are not supported yet.',
+  });
+
+  const result = await list.handler({});
+
+  assert.equal(result.isError, true);
+  const message = extractMessage(result);
+  // Containment rather than equality: the handler is free to wrap
+  // disabledReason in its own prefix/formatting, it just must surface the
+  // reason verbatim somewhere in the message.
+  assert.ok(
+    message.includes('Bookmarks are unavailable: multi-root workspaces are not supported yet.'),
+    'the tool error must surface the provided disabledReason',
+  );
+  assert.equal(calls.length, 0, 'a disabled config must never reach readMirror');
+});
+
+test('a disabled config (undefined) with no disabledReason still returns a non-empty tool error, without ever reading the mirror', async () => {
+  const { readMirror: spiedRead, calls } = spyOnRead();
+  const list = createListHandler(undefined, { readMirror: spiedRead });
+
+  const result = await list.handler({});
+
+  assert.equal(result.isError, true);
+  const message = extractMessage(result);
+  assert.ok(message.length > 0, 'a disabled config with no disabledReason must still surface a legible error message');
+  assert.equal(calls.length, 0, 'a disabled config must never reach readMirror');
 });

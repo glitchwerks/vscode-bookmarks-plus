@@ -163,6 +163,21 @@ function spyOnRealWrite(): {
   };
 }
 
+/** Counts readMirror calls while still performing the real read. */
+function spyOnRead(): {
+  readMirror: typeof readMirror;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  return {
+    readMirror: async (mirrorPath: string) => {
+      calls.push(mirrorPath);
+      return readMirror(mirrorPath);
+    },
+    calls,
+  };
+}
+
 const BOOKMARK_ITEM_SCHEMA_POINTER = '#/definitions/bookmarkItem';
 
 // ajv v8's default export is typed against `moduleResolution: "node16"` in a
@@ -669,4 +684,69 @@ test('the success result surfaces the new id and the mirror path', async () => {
     containsValue(payload, mirrorPath),
     'the success payload should surface the resolved mirror path',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Disabled workspace (config === undefined, spec § 4B.8, strategy (a)). This
+// is the regression guard for the rejected placeholder-Config alternative:
+// a dropped guard there would let writeMirrorAtomic('') resolve dirname('')
+// to '.' and write bookmarks.json into the server's own cwd (§ 4B.8). Here,
+// no file may be read OR written at all.
+// ---------------------------------------------------------------------------
+
+test('a disabled config (undefined) returns a tool error matching the provided disabledReason, without ever reading or writing the mirror', async () => {
+  const { readMirror: spiedRead, calls: readCalls } = spyOnRead();
+  const { writeMirrorAtomic: spiedWrite, calls: writeCalls } = spyOnRealWrite();
+  const { sleep } = fastSleep();
+  const add = createAddHandler(undefined, {
+    readMirror: spiedRead,
+    writeMirrorAtomic: spiedWrite,
+    sleep,
+    uuid: randomUUID,
+    disabledReason: 'Bookmarks are unavailable: no workspace folder is open.',
+  });
+
+  const result = await add.handler({
+    uri: 'file:///workspace/should-not-be-written.ts',
+    type: 'file',
+  });
+
+  assert.equal(result.isError, true);
+  const message = extractMessage(result);
+  // Containment rather than equality: the handler is free to wrap
+  // disabledReason in its own prefix/formatting, it just must surface the
+  // reason verbatim somewhere in the message.
+  assert.ok(
+    message.includes('Bookmarks are unavailable: no workspace folder is open.'),
+    'the tool error must surface the provided disabledReason',
+  );
+  assert.equal(readCalls.length, 0, 'a disabled config must never reach readMirror');
+  assert.equal(
+    writeCalls.length,
+    0,
+    'a disabled config must never reach writeMirrorAtomic -- a dropped guard here would write into the server process\'s own cwd',
+  );
+});
+
+test('a disabled config (undefined) with no disabledReason still returns a non-empty tool error, without ever reading or writing the mirror', async () => {
+  const { readMirror: spiedRead, calls: readCalls } = spyOnRead();
+  const { writeMirrorAtomic: spiedWrite, calls: writeCalls } = spyOnRealWrite();
+  const { sleep } = fastSleep();
+  const add = createAddHandler(undefined, {
+    readMirror: spiedRead,
+    writeMirrorAtomic: spiedWrite,
+    sleep,
+    uuid: randomUUID,
+  });
+
+  const result = await add.handler({
+    uri: 'file:///workspace/should-not-be-written.ts',
+    type: 'file',
+  });
+
+  assert.equal(result.isError, true);
+  const message = extractMessage(result);
+  assert.ok(message.length > 0, 'a disabled config with no disabledReason must still surface a legible error message');
+  assert.equal(readCalls.length, 0, 'a disabled config must never reach readMirror');
+  assert.equal(writeCalls.length, 0, 'a disabled config must never reach writeMirrorAtomic');
 });

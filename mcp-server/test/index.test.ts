@@ -31,9 +31,31 @@ function makeConfig(): Config {
  * introspection point the installed SDK (v1.30.x) exposes short of driving
  * a real `tools/list` protocol round trip, which would require connecting a
  * transport — exactly what this test must avoid.
+ *
+ * `registeredTool.handler` (same object literal, `mcp.js:616`) is exposed
+ * for the same reason and used below to prove that a disabledReason passed
+ * to `createServer` actually reaches a tool's *call*-time behavior, not
+ * merely that registration succeeds -- calling the stored handler directly
+ * bypasses the SDK's request-routing layer entirely (no transport, no
+ * schema validation before the call), which is exactly the introspection
+ * this suite needs and nothing more.
  */
+interface ToolResultLike {
+  content?: Array<{ type: string; text?: string }>;
+  isError?: boolean;
+}
+
 interface RegisteredToolLike {
   annotations?: Record<string, unknown>;
+  handler: (args: unknown) => Promise<ToolResultLike>;
+}
+
+/** Joins every text content block in a tool result into one string. */
+function resultText(result: ToolResultLike): string {
+  return (result.content ?? [])
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .join('\n');
 }
 
 interface McpServerInternals {
@@ -73,4 +95,67 @@ test('createServer registers exactly list_bookmarks and add_bookmark with the ex
     idempotentHint: false,
     openWorldHint: false,
   });
+});
+
+// ---------------------------------------------------------------------------
+// createServer(config: Config | undefined, options?: { disabledReason?: string })
+// (spec § 4B.8, strategy (a)). Registration itself must never fail on a
+// disabled workspace -- the transport still connects, and the refusal is
+// deferred to tool-call time inside each handler.
+// ---------------------------------------------------------------------------
+
+test('createServer still accepts a single Config argument (the pre-#57 call shape) and registers both tools', () => {
+  const config = makeConfig();
+
+  const server = createServer(config);
+
+  const registered = registeredTools(server);
+  assert.deepEqual(Object.keys(registered).sort(), ['add_bookmark', 'list_bookmarks']);
+});
+
+test('createServer(undefined, { disabledReason }) still registers both tools without throwing -- the disabled refusal is deferred to tool-call time, not registration time', () => {
+  const server = createServer(undefined, { disabledReason: 'some reason' });
+
+  assert.ok(server instanceof McpServer);
+  assert.equal(server.isConnected(), false);
+
+  const registered = registeredTools(server);
+  assert.deepEqual(Object.keys(registered).sort(), ['add_bookmark', 'list_bookmarks']);
+});
+
+test('createServer(undefined, { disabledReason }) threads the reason through to a real list_bookmarks call, not just past registration', async () => {
+  // Registering successfully is not enough: createServer must actually pass
+  // disabledReason into createListHandler's deps, or a call would surface
+  // only a generic message (or worse, attempt real I/O). Calling the stored
+  // handler directly exercises that wiring without a transport.
+  const server = createServer(undefined, {
+    disabledReason: 'Bookmarks are unavailable: no workspace folder is open.',
+  });
+  const registered = registeredTools(server);
+
+  const result = await registered.list_bookmarks.handler({});
+
+  assert.equal(result.isError, true);
+  assert.ok(
+    resultText(result).includes('no workspace folder is open'),
+    'the disabledReason passed to createServer must reach the list_bookmarks call',
+  );
+});
+
+test('createServer(undefined, { disabledReason }) threads the reason through to a real add_bookmark call, not just past registration', async () => {
+  const server = createServer(undefined, {
+    disabledReason: 'Bookmarks are unavailable: multi-root workspaces are not supported yet.',
+  });
+  const registered = registeredTools(server);
+
+  const result = await registered.add_bookmark.handler({
+    uri: 'file:///workspace/should-not-be-written.ts',
+    type: 'file',
+  });
+
+  assert.equal(result.isError, true);
+  assert.ok(
+    resultText(result).includes('multi-root workspaces are not supported yet'),
+    'the disabledReason passed to createServer must reach the add_bookmark call',
+  );
 });

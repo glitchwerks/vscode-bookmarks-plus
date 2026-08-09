@@ -81,16 +81,20 @@ function isToolError(value: object): value is ToolErrorResult {
 }
 
 export function createAddHandler(
-  config: Config,
+  config: Config | undefined,
   deps: {
     readMirror: typeof readMirror;
     writeMirrorAtomic: typeof writeMirrorAtomic;
     sleep: (ms: number) => Promise<void>;
     uuid: () => string;
+    disabledReason?: string;
   },
 ) {
-  const addOnce = async (args: AddBookmarkArgs): Promise<AddAttemptOutcome> => {
-    const raw = await deps.readMirror(config.mirrorPath);
+  const addOnce = async (
+    args: AddBookmarkArgs,
+    resolvedConfig: Config,
+  ): Promise<AddAttemptOutcome> => {
+    const raw = await deps.readMirror(resolvedConfig.mirrorPath);
     const parsed = parseMirror(raw);
 
     if (parsed.kind === 'error') {
@@ -129,14 +133,14 @@ export function createAddHandler(
 
     data.items.push(item);
     const serialized = serialize(toCanonicalV2(data));
-    await deps.writeMirrorAtomic(config.mirrorPath, serialized);
+    await deps.writeMirrorAtomic(resolvedConfig.mirrorPath, serialized);
 
-    if (config.verifyDelayMs === 0) {
+    if (resolvedConfig.verifyDelayMs === 0) {
       return { item, collection, survived: true };
     }
 
-    await deps.sleep(config.verifyDelayMs);
-    const verification = parseMirror(await deps.readMirror(config.mirrorPath));
+    await deps.sleep(resolvedConfig.verifyDelayMs);
+    const verification = parseMirror(await deps.readMirror(resolvedConfig.mirrorPath));
     const survived =
       verification.kind === 'ok' &&
       verification.data.items.some((candidate) => candidate.id === item.id);
@@ -161,14 +165,21 @@ export function createAddHandler(
       description: z.string().optional(),
     },
     handler: async (args: AddBookmarkArgs): Promise<CallToolResult> => {
-      const firstAttempt = await addOnce(args);
+      if (config === undefined) {
+        return toolError(
+          deps.disabledReason ??
+            'The Bookmarks Plus mirror is unavailable in this VS Code window.',
+        );
+      }
+
+      const firstAttempt = await addOnce(args, config);
       if (isToolError(firstAttempt)) {
         return firstAttempt;
       }
 
       let successfulAttempt = firstAttempt;
       if (!firstAttempt.survived) {
-        const secondAttempt = await addOnce(args);
+        const secondAttempt = await addOnce(args, config);
         if (isToolError(secondAttempt)) {
           return secondAttempt;
         }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { resolveConfig } from '../src/config.js';
+import { resolveConfig, resolveWorkspaceState, DISABLED_PREFIX } from '../src/config.js';
 
 /**
  * Builds a `process.argv`-shaped array, with the workspace path (if any)
@@ -90,4 +90,162 @@ test('resolveConfig rejects a non-numeric BOOKMARKS_MCP_VERIFY_DELAY_MS instead 
       BOOKMARKS_MCP_VERIFY_DELAY_MS: 'abc',
     }),
   );
+});
+
+// ---------------------------------------------------------------------------
+// 4-tier precedence (issue #57, spec § 3):
+//   1. argv[2]                      explicit override
+//   2. env.BOOKMARKS_PLUS_WORKSPACE NEW — extension-injected
+//   3. env.CLAUDE_PROJECT_DIR       NEW — Claude Code's own project root
+//   4. env.BOOKMARKS_MCP_WORKSPACE  legacy override, demoted (D1)
+//   else -> throw
+// ---------------------------------------------------------------------------
+
+test('resolveConfig uses BOOKMARKS_PLUS_WORKSPACE when no positional argument is supplied', () => {
+  const config = resolveConfig(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: 'from-plus-workspace',
+  });
+
+  assert.equal(config.workspacePath, path.resolve('from-plus-workspace'));
+});
+
+test('resolveConfig prefers the positional workspace argument over BOOKMARKS_PLUS_WORKSPACE when both are present', () => {
+  const config = resolveConfig(argvWith('from-argv-workspace'), {
+    BOOKMARKS_PLUS_WORKSPACE: 'from-plus-workspace',
+  });
+
+  assert.equal(config.workspacePath, path.resolve('from-argv-workspace'));
+});
+
+test('resolveConfig prefers BOOKMARKS_PLUS_WORKSPACE over CLAUDE_PROJECT_DIR (D5 guard -- the extension-owned signal outranks the Claude Code project-root proxy)', () => {
+  const config = resolveConfig(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: 'from-plus-workspace',
+    CLAUDE_PROJECT_DIR: 'from-claude-project-dir',
+  });
+
+  assert.equal(config.workspacePath, path.resolve('from-plus-workspace'));
+});
+
+test('resolveConfig prefers CLAUDE_PROJECT_DIR over BOOKMARKS_MCP_WORKSPACE (D1 guard -- a shell-inherited legacy override must not silently pin every session)', () => {
+  // Regression test for the shell-inheritance hole D1 names: a user who
+  // once exported BOOKMARKS_MCP_WORKSPACE in a shell profile (or left it
+  // over from a pre-#57 single-workspace setup) must not have it silently
+  // override the session's own CLAUDE_PROJECT_DIR. If a future reorder puts
+  // the legacy env var back above CLAUDE_PROJECT_DIR, this test catches it.
+  const config = resolveConfig(argvWith(), {
+    CLAUDE_PROJECT_DIR: 'from-claude-project-dir',
+    BOOKMARKS_MCP_WORKSPACE: 'from-legacy-env-workspace',
+  });
+
+  assert.equal(config.workspacePath, path.resolve('from-claude-project-dir'));
+});
+
+test('resolveConfig resolves a relative BOOKMARKS_PLUS_WORKSPACE path to an absolute workspacePath', () => {
+  const config = resolveConfig(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: 'relative/from-plus-workspace',
+  });
+
+  assert.ok(path.isAbsolute(config.workspacePath));
+  assert.equal(config.workspacePath, path.resolve('relative/from-plus-workspace'));
+});
+
+test('resolveConfig resolves a relative CLAUDE_PROJECT_DIR path to an absolute workspacePath', () => {
+  const config = resolveConfig(argvWith(), {
+    CLAUDE_PROJECT_DIR: 'relative/from-claude-project-dir',
+  });
+
+  assert.ok(path.isAbsolute(config.workspacePath));
+  assert.equal(config.workspacePath, path.resolve('relative/from-claude-project-dir'));
+});
+
+test('resolveConfig still throws a distinguishable error when all four sources -- argv[2], BOOKMARKS_PLUS_WORKSPACE, CLAUDE_PROJECT_DIR, and BOOKMARKS_MCP_WORKSPACE -- are absent', () => {
+  // This is a NEW case, not an edit of the pre-#57 "both absent" case above
+  // (:36-41 in the original two-tier design, left untouched per the spec).
+  // It restates the same invariant across all four tiers of the new chain,
+  // and additionally pins Task 2 step 2 (spec § 8 Phase 1): the error text
+  // must name all the new sources, not just the original two.
+  assert.throws(
+    () =>
+      resolveConfig(argvWith(), {
+        BOOKMARKS_PLUS_WORKSPACE: undefined,
+        CLAUDE_PROJECT_DIR: undefined,
+        BOOKMARKS_MCP_WORKSPACE: undefined,
+      }),
+    (error: unknown) => {
+      if (!(error instanceof Error) || !/workspace/i.test(error.message)) {
+        return false;
+      }
+      // Env var names are stable identifiers, not wording the implementer
+      // is free to paraphrase -- unlike the argv positional, which has no
+      // fixed name to check for.
+      return (
+        error.message.includes('BOOKMARKS_PLUS_WORKSPACE') &&
+        error.message.includes('CLAUDE_PROJECT_DIR') &&
+        error.message.includes('BOOKMARKS_MCP_WORKSPACE')
+      );
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// resolveWorkspaceState (spec § 4B.8) -- the sentinel-aware wrapper around
+// resolveConfig. It must not change resolveConfig's own signature, return
+// type, or throwing behavior (all covered above); it only adds detection of
+// the `disabled:<reason-slug>` sentinel (§ 4B.7) that the extension's
+// BOOKMARKS_PLUS_WORKSPACE tier can carry instead of a real path.
+// ---------------------------------------------------------------------------
+
+test('DISABLED_PREFIX is the reserved "disabled:" sentinel prefix', () => {
+  assert.equal(DISABLED_PREFIX, 'disabled:');
+});
+
+test('resolveWorkspaceState returns an ok state carrying the same Config resolveConfig would produce for a normal (non-sentinel) value', () => {
+  const argv = argvWith();
+  const env = { BOOKMARKS_PLUS_WORKSPACE: 'normal-workspace' };
+
+  const state = resolveWorkspaceState(argv, env);
+
+  assert.equal(state.kind, 'ok');
+  if (state.kind === 'ok') {
+    assert.deepEqual(state.config, resolveConfig(argv, env));
+  }
+});
+
+test('resolveWorkspaceState returns a disabled state with a reason mentioning multi-root when BOOKMARKS_PLUS_WORKSPACE is disabled:multi-root', () => {
+  const state = resolveWorkspaceState(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
+  });
+
+  assert.equal(state.kind, 'disabled');
+  if (state.kind === 'disabled') {
+    assert.match(state.reason, /multi-root/i);
+  }
+});
+
+test('resolveWorkspaceState returns a disabled state with a reason mentioning no folder being open when BOOKMARKS_PLUS_WORKSPACE is disabled:no-folder', () => {
+  const state = resolveWorkspaceState(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}no-folder`,
+  });
+
+  assert.equal(state.kind, 'disabled');
+  if (state.kind === 'disabled') {
+    assert.match(state.reason, /no folder|folder.*open/i);
+  }
+});
+
+test('resolveWorkspaceState treats an unrecognized disabled:<slug> as a disabled state with a generic reason, not as a literal workspace path (forward compatibility for #58)', () => {
+  // Critical: a future extension version may add a new disabled reason slug
+  // without this server shipping first. If an unknown slug were mistakenly
+  // resolved as a path instead, `kind` would come back 'ok' with
+  // `config.workspacePath` set to the nonsensical resolved form of the
+  // sentinel string itself -- exactly the failure this test guards against.
+  const state = resolveWorkspaceState(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}something-future`,
+  });
+
+  assert.equal(state.kind, 'disabled');
+  if (state.kind === 'disabled') {
+    assert.equal(typeof state.reason, 'string');
+    assert.ok(state.reason.length > 0, 'an unknown slug must still carry a legible generic reason');
+  }
 });

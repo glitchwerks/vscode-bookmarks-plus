@@ -5,8 +5,8 @@ import { parseMirror } from '../contract.js';
 import { readMirror } from '../mirrorFile.js';
 
 export function createListHandler(
-  config: Config,
-  deps: { readMirror: typeof readMirror },
+  config: Config | undefined,
+  deps: { readMirror: typeof readMirror; disabledReason?: string },
 ) {
   return {
     name: 'list_bookmarks' as const,
@@ -20,6 +20,20 @@ export function createListHandler(
     } as const,
     inputSchema: {},
     handler: async (_args: unknown): Promise<CallToolResult> => {
+      if (config === undefined) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text:
+                deps.disabledReason ??
+                'The Bookmarks Plus mirror is unavailable in this VS Code window.',
+            },
+          ],
+        };
+      }
+
       const raw = await deps.readMirror(config.mirrorPath);
       const result = parseMirror(raw);
 
