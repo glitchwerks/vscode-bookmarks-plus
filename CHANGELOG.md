@@ -13,6 +13,9 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   VS Code is closed are picked up on the next activation. Single-folder workspaces only.
 - A JSON schema for `.vscode/bookmarks.json`, giving completion and validation when the file is
   edited in VS Code.
+- `mcp-server/`: a standalone MCP server exposing bookmarks to Claude Desktop and Claude Code,
+  with `list_bookmarks` (read) and `add_bookmark` (append) tools. Built from source; see the
+  README's "Using bookmarks from Claude (MCP server)" section for configuration and limitations.
 
 ### Changed
 
