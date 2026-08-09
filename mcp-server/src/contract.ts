@@ -46,8 +46,10 @@ function isBookmarkItem(value: unknown): value is BookmarkItem {
     value.id.length > 0 &&
     (value.type === 'file' || value.type === 'folder') &&
     typeof value.uri === 'string' &&
+    value.uri.length > 0 &&
     (value.collectionId === null || typeof value.collectionId === 'string') &&
     typeof value.order === 'number' &&
+    Number.isFinite(value.order) &&
     (value.description === undefined || typeof value.description === 'string')
   );
 }
@@ -61,7 +63,9 @@ function isBookmarkCollection(value: unknown): value is BookmarkCollection {
     typeof value.id === 'string' &&
     value.id.length > 0 &&
     typeof value.name === 'string' &&
+    value.name.length > 0 &&
     typeof value.order === 'number' &&
+    Number.isFinite(value.order) &&
     (value.description === undefined || typeof value.description === 'string')
   );
 }
