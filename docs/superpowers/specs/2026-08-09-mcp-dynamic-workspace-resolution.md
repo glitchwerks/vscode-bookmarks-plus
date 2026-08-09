@@ -6,6 +6,8 @@ touches:
   - README.md
   - CHANGELOG.md
   - mcp-server/src/index.ts
+  # Deferred to the follow-up issue in § 4B.5, not touched by #57 itself:
+  # src/extension.ts, package.json (activationEvents)
 skills_relevant:
   - test-driven-development
   - simplicity-first
@@ -15,9 +17,9 @@ skills_relevant:
 
 **Issue:** [glitchwerks/vscode-bookmarks-plus#57](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/57) — state: open (fetched 2026-08-09).
 
-**Revision 2.** Rev 1 of this spec proposed a multi-path candidate-set design. The user then added a second constraint that disqualifies it, and verification of the MCP process model turned up a primary-source fact that makes the whole candidate-set apparatus unnecessary. § 12 records what changed and why. **Do not implement Rev 1's layered design.**
+**Revision 3.** Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 adds a second, extension-owned resolution source proposed by the user (§ 4B) and promotes it above `CLAUDE_PROJECT_DIR`. § 12 records the full history. **Do not implement Rev 1's layered design.**
 
-**Status: NEARLY UNBLOCKED.** One cheap empirical probe (§ 8 Phase 0) and two questions (§ 6) remain. The design is otherwise determined by primary sources rather than by preference.
+**Status: NEARLY UNBLOCKED.** One cheap empirical probe (§ 8 Phase 0, now five measurements) and two questions (§ 6) remain. The design is otherwise determined by primary sources rather than by preference.
 
 ## 0. Citation ground rules
 
@@ -79,12 +81,18 @@ Change `resolveConfig`'s source list. Nothing else.
 ```
 workspace =
   1. argv[2]                            explicit override — lives in the registration entry
-  2. env.CLAUDE_PROJECT_DIR             NEW — the session's own project root
-  3. env.BOOKMARKS_MCP_WORKSPACE        legacy override, demoted — see D1
+  2. env.BOOKMARKS_PLUS_WORKSPACE       NEW — injected by our own VS Code extension (§ 4B)
+  3. env.CLAUDE_PROJECT_DIR             NEW — the session's own project root (§ 2b)
+  4. env.BOOKMARKS_MCP_WORKSPACE        legacy override, demoted — see D1
   else → throw, as today
 ```
 
-Note the order: `BOOKMARKS_MCP_WORKSPACE` drops **below** `CLAUDE_PROJECT_DIR`. That is a deliberate C2 fix, not a cosmetic reshuffle — D1 explains why the obvious order is unsafe.
+Two things about this order are deliberate, not cosmetic:
+
+- `BOOKMARKS_MCP_WORKSPACE` drops **below** both new sources. D1 explains why the obvious order is unsafe.
+- `BOOKMARKS_PLUS_WORKSPACE` sits **above** `CLAUDE_PROJECT_DIR`. D5 explains why an extension-owned signal is the more direct measurement of the quantity C2 actually names — **conditional on D6**, without which the order must be reversed.
+
+Source 2 is inert until the extension ships its half (§ 4B.5): the server reads a variable nothing sets yet. That is the normal way to land a two-sided contract, and it means the extension change can merge later without a second `mcp-server` PR.
 
 Everything downstream is unchanged: `path.resolve`, `mirrorPath = <workspace>/.vscode/bookmarks.json`, `verifyDelayMs` (`mcp-server/src/config.ts:L19-L31`). `Config`'s shape does not change. `createServer` does not change. Neither tool's `inputSchema` changes. Resolution stays **once, at process start** — which under § 2(a) is once per session.
 
@@ -126,6 +134,111 @@ The researcher ranked `roots` first partly on this sentence (`docs/research/2026
 
 ---
 
+## 4B. The extension-injected variable (user proposal, Rev 3)
+
+Proposed verbatim: *"VSCode allows you to contribute to the environment when launching terminals and sessions. We should be able to inject it into the terminal each time it launches and then fetch it as an evironment variable."*
+
+The mechanism is `ExtensionContext.environmentVariableCollection`. **Recommendation: adopt it, at the top of the fallback chain below the `args` override, subject to D6 — and ship it as a follow-up issue, not in #57.**
+
+### 4B.1 Why it is more authoritative than `CLAUDE_PROJECT_DIR`
+
+The extension does not *infer* its workspace, it *is* the workspace: the value comes from `vscode.workspace.workspaceFolders`, with no proxy step. `CLAUDE_PROJECT_DIR` is Claude Code's project root, which merely approximates "the VS Code workspace whose Bookmarks view the user is looking at" — and that approximation is precisely what Rev 2's Phase 0 probe existed to test. An extension-owned signal:
+
+- measures the quantity C2 actually names (*"the claude session open in vscode… the bookmarks in that session"*) directly rather than by proxy;
+- **decouples the feature from Claude Code's versioning and behavior entirely** — no version floor, no dependence on a vendor env var's future semantics. Rev 2 conceded "if measurement 1 is wrong, the design's foundation is wrong." Under Rev 3 a wrong measurement 1 costs a fallback tier, not the design.
+- has first-party precedent: VS Code's built-in Git extension uses the same API to inject `GIT_ASKPASS`.
+
+Not a substitute, though — a **complement**. See 4B.4.
+
+### 4B.2 The API facts, and one that changes the design
+
+From VS Code's documentation of the API (https://code.visualstudio.com/updates/v1_46 § extension terminal environment contributions and https://code.visualstudio.com/docs/terminal/advanced, retrieved 2026-08-09):
+
+- Extensions contribute variables to integrated terminal environments via `replace` / `append` / `prepend`; the built-in Git extension does this for `GIT_ASKPASS`.
+- Collections can be **scoped to a workspace folder**, applying in addition to the global collection.
+- Collections are **removed when disposed or when the extension is uninstalled**.
+- **`unverified:`** "These collections are persisted across window reloads such that terminals created immediately after the window is loaded do not block on the extension host launching but instead use the last known version." Provenance: retrieved via search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, **not a direct page fetch** — re-fetch and confirm the exact wording before relying on it.
+
+That last bullet, if accurate, is a **C2 leak vector**, and it is the most important finding in this section:
+
+> A cached "last known version" of the variable can be applied to terminals **before the extension host activates**. A `claude` session launched in that window would serve the cached workspace's bookmarks — silently, and with no enumeration surface involved. Exactly the failure C2 forbids, arriving through a caching optimization.
+
+**How bad this is depends on the cache's scope, which the source does not state.** If the cache is keyed per workspace folder, the blast radius is only "the first-ever window on a new workspace has no cached value" — benign. If it is global, then opening window A on repo A and then window B on repo B could hand repo A's path to a terminal in window B — the full leak. Phase 0 measurement 6 settles which. D6 is the right call under either answer, so this uncertainty does not block.
+
+**Mitigation (D6): set `persistent = false`.** No cache, no stale value. The cost is that a terminal opened in the gap before activation simply lacks the variable — and lacking it is *safe*, because resolution falls through to `CLAUDE_PROJECT_DIR`, which is correct for that session. **A stale-but-present value is strictly worse than an absent one:** absent degrades to a correct source, stale silently serves the wrong workspace.
+
+Note the useful property: this mitigation is correct **whether or not the caching quote turns out to be exactly right.** It costs one tier of latency in a narrow window and removes an entire class of failure, so it does not need the uncertain claim to be true in order to be justified.
+
+### 4B.3 Two more implementation constraints, both non-obvious
+
+**Use `replace()`, never `append()`/`prepend()`.** A terminal in window A that runs `code /other/repo` launches a window whose extension host inherits `BOOKMARKS_PLUS_WORKSPACE=/repo/A` from its parent process environment. `replace()` overwrites it with the correct value; `append()` would compound two workspace paths into one variable.
+
+**The extension's activation timing is currently wrong for this.** `package.json:L15` declares `"activationEvents": []`, so activation is driven entirely by the contributed view — the extension does not run until the Bookmarks view is first revealed in that window. A terminal opened before that gets nothing. With `persistent = false` (D6) there is no cache to paper over it. **Add `onStartupFinished`** to the follow-up issue's scope: it activates the extension in every window shortly after load, without blocking startup. Cost: the extension activates in windows where the user never opens the Bookmarks view.
+
+### 4B.4 Coverage — does it reach more session types? (coordinator Q3)
+
+It reaches **more in one direction and fewer in another**, which is why both sources stay:
+
+| Session | `BOOKMARKS_PLUS_WORKSPACE` | `CLAUDE_PROJECT_DIR` |
+| --- | --- | --- |
+| `claude` in a VS Code integrated terminal | ✅ and authoritative | ✅ but a proxy |
+| `claude` in a VS Code terminal, launched from a **subdirectory** of the workspace | ✅ still the workspace root | ⚠️ likely the subdirectory — the R1 failure mode |
+| `claude` in a plain terminal **outside** VS Code | ❌ never injected | ✅ works |
+| Claude Code's **VS Code extension panel** (if it does not spawn through the terminal subsystem) | ❓ unknown — Phase 0 measurement 4 | ✅ expected |
+| Desktop app **Code tab** | ❌ | ❓ Phase 0 measurement 3 |
+| Desktop app **chat** surface | ❌ | ❌ |
+
+The second row is the strongest argument for adopting it: it fixes R1's main failure mode outright, in the exact case the user described.
+
+**Desktop chat remains unaddressed, unchanged.** It never spawns from a VS Code terminal, and it has no per-session project concept in the first place. § 6 Q1's recommended answer stands as written — this proposal does not change it.
+
+### 4B.5 Scope — extension-side, and a separate issue (coordinator Q2)
+
+**This does not violate #52's "`mcp-server` has NO dependency on `../src`" decision.** That rule is about *code* dependencies. An injected environment variable is a runtime handshake over an agreed name — architecturally the same shape as the `.vscode/bookmarks.json` mirror itself, which is already the sanctioned way these two components talk. No import crosses the boundary in either direction.
+
+It does expand the *file* scope: activation logic and `package.json` in the extension, plus tests in the extension's `@vscode/test-electron` suite — which #52's D4 deliberately kept `mcp-server` out of.
+
+**Recommendation: split.**
+
+- **#57 (this spec):** `mcp-server` reads `BOOKMARKS_PLUS_WORKSPACE` at its documented precedence. Inert until the extension sets it. Still a sub-10-line change, still 57/57 tests preserved.
+- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in 4B.7; extension-side tests.
+
+### 4B.7 Multi-root: the extension must set a sentinel, not stay silent
+
+The tempting instruction — "in a multi-root workspace, just don't set the variable" — is wrong, and the reason is visible in the shipped code rather than inferable from the API.
+
+`resolveMirrorLocation` **disables the mirror outright** when more than one folder is open:
+
+> `if (folders.length > 1) { return { kind: 'disabled', reason: 'multi-root workspaces are not supported by the bookmarks mirror yet' }; }`
+> — `src/bookmarkMirror.ts:L29-L34` (branch `issue-52-mcp-server`); the no-folder case at `:L25-L27` disables it too, and `src/extension.ts:L72-L75` acts on the result at activation.
+
+So in a multi-root window **there is no `.vscode/bookmarks.json` anywhere**. If the extension merely stays silent, tier 2 is absent and resolution falls through to `CLAUDE_PROJECT_DIR`, which cheerfully reports whichever folder Claude Code launched from — routing the ambiguous case to the *less* informed source. Reads would be harmless (empty list). **Writes would not:** `add_bookmark` would create a mirror file in that folder which the extension is guaranteed never to read, because the mirror is disabled in that window. A bookmark that silently goes nowhere is worse than a refusal.
+
+**Contract: the extension always sets the variable, to one of two things.**
+
+- Mirror enabled → the workspace root path.
+- Mirror disabled (multi-root, or no folder open) → a reserved sentinel, e.g. `BOOKMARKS_PLUS_WORKSPACE=disabled:multi-root`.
+
+The server recognizes the sentinel and **fails with a named error** ("the Bookmarks Plus mirror is disabled in this VS Code window: multi-root workspaces are not supported yet") instead of falling through. Silence is reserved for "the extension isn't running here at all," which is the only case where falling through to tier 3 is correct.
+
+This also strengthens D5: the extension variable can carry *mirror-enabled state*, which no other tier is in a position to know. Tier 3 can report a directory; only tier 2 can report that bookmarks are unavailable in this window.
+
+Splitting keeps #57 shippable today, lets the extension change land on its own schedule, and avoids a second `mcp-server` PR to add the variable later.
+
+### 4B.6 Degradation (coordinator Q4)
+
+`args` → `BOOKMARKS_PLUS_WORKSPACE` → `CLAUDE_PROJECT_DIR` → `BOOKMARKS_MCP_WORKSPACE` → throw.
+
+- **In VS Code, extension shipped:** tier 2 wins. Authoritative.
+- **In VS Code, before the extension half ships:** tier 2 absent, tier 3 wins. Identical to Rev 2 behavior — no regression during the split.
+- **Plain terminal outside VS Code:** tier 2 absent, tier 3 wins. Correct.
+- **Neither, e.g. another MCP client:** tier 4 or the explicit `args` path, exactly as today.
+- **VS Code terminal opened in the pre-activation gap:** tier 2 absent, tier 3 wins. Safe — this is the D6 fail-open property.
+
+Every tier's absence degrades to a *correct* source rather than a wrong one. The only ordering that breaks this is a persistent (cached) tier 2, which D6 removes.
+
+---
+
 ## 5. Decision points
 
 ### D1 — Precedence order. **Recommend: `argv[2]` > `CLAUDE_PROJECT_DIR` > `BOOKMARKS_MCP_WORKSPACE`. Status: this one matters — the intuitive order breaks C2.**
@@ -145,6 +258,18 @@ Cost of this order against the existing suite: **zero.** Verified test-by-test �
 Today the mirror's absence is already handled correctly and needs no new code: `readMirror` returns `undefined` on `ENOENT` (`mcp-server/src/mirrorFile.ts:L9-L12`), `list_bookmarks` reports an empty workspace, and `add_bookmark` creates the file. Bootstrapping works.
 
 Searching parent or child directories for a mirror would be a C2 violation with a friendly face: to search is to discover other workspaces, and whatever is discovered can end up in a message. If a user launches Claude Code from a directory that is not the workspace root, the correct outcome is an empty list plus a `mirrorPath` in the payload (`mcp-server/src/tools/list.ts:L34-L35`) showing exactly where the server looked — self-diagnosing, and it names only the current session's own path.
+
+### D5 — Does `BOOKMARKS_PLUS_WORKSPACE` outrank `CLAUDE_PROJECT_DIR`? **Recommend: yes, conditional on D6. Status: recommended.**
+
+Rationale in § 4B.1: the extension knows its workspace definitionally rather than by proxy, it fixes R1's launched-from-a-subdirectory failure, and it removes the design's dependence on a vendor env var's semantics.
+
+**The conditional is not decorative.** If D6 is rejected and the collection stays persistent, a cached stale value can outrank a live correct one (§ 4B.2) — in that case this order must be **reversed**, because `CLAUDE_PROJECT_DIR` is always live. Adopt D5 and D6 together or neither.
+
+Known tradeoff, documented rather than solved: in a VS Code terminal where the user `cd`s into a *different* repo and runs `claude` there, tier 2 reports the window's workspace while tier 3 reports the other repo. C2's wording — the bookmarks of "the claude session open in vscode" — favors the window's workspace, and the `args` override covers anyone who disagrees.
+
+### D6 — `persistent` on the environment variable collection. **Recommend: `false`. Status: recommended; gates D5.**
+
+§ 4B.2. A stale-but-present value is strictly worse than an absent one, because absent falls through to a correct source while stale silently serves another workspace's bookmarks.
 
 ### D4 — Keep the hard startup failure when nothing resolves? **Recommend: yes, unchanged.** (`mcp-server/src/config.ts:L15-L17`, surfaced by `main()`'s catch at `mcp-server/src/index.ts:L52-L59`.) The message needs updating to mention the new source, per § 8.
 
@@ -170,7 +295,9 @@ Recommended answer, pending yours: **Code-tab and CLI sessions are the target; t
 
 **R3 — Docs describe the retired model.** `README.md:L50-L127` documents one-registration-per-workspace as current behavior, including per-workspace `args` entries (`:L83`, `:L100`) and the argv-wins-over-env rule (`:L71`). The precedence rule stays true under D1; the per-workspace framing does not.
 
-**R4 — Multi-root VS Code workspaces have no single answer, and that is an inherited constraint, not a new gap.** `CLAUDE_PROJECT_DIR` is one path, while a multi-root VS Code workspace has several folders and no single mirror-bearing root. This does not regress anything: the `.vscode/bookmarks.json` mirror shipped in #51 / PR #54 (merged as `005d67f`) is single-root by design, so multi-root workspaces were already outside the mirror's scope before #57 existed. A reviewer will ask; the answer is "inherited constraint," and widening it belongs to a mirror-design issue, not this one.
+**R6 — A cached extension-injected variable could serve the wrong workspace.** § 4B.2, the one genuinely new risk Rev 3 introduces. Removed by D6 (`persistent = false`), which is why D5 and D6 are adopted as a pair.
+
+**R4 — Multi-root VS Code workspaces have no mirror at all, and the resolution chain must not paper over that.** Verified rather than assumed: `resolveMirrorLocation` returns `kind: 'disabled'` for `folders.length > 1` (`src/bookmarkMirror.ts:L29-L34`), so no `.vscode/bookmarks.json` exists in such a window. Reads degrade harmlessly to an empty list, but `add_bookmark` would happily *create* a mirror the extension will never read. § 4B.7's sentinel contract turns that into a named refusal. Widening multi-root support belongs to a mirror-design issue, not this one.
 
 **R5 — Other MCP clients set no `CLAUDE_PROJECT_DIR`.** Cline, Continue, VS Code's own native MCP client, etc. all fall through to the explicit override and behave exactly as they do today. No regression; just no improvement. (VS Code's native client has its own idiom — `.vscode/mcp.json` with `${workspaceFolder}` — deliberately out of scope per the research's negative axis, `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L19`.)
 
@@ -185,24 +312,30 @@ Add a temporary probe in `main()` that **appends `process.env.CLAUDE_PROJECT_DIR
 - **Write to a file, not stderr.** The stdio binding permits stderr logging but guarantees nothing about delivery: "The client **MAY** capture, forward, or ignore the server's `stderr` output" (https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio, fetched 2026-08-09). A file is independent of client behavior.
 - **Place it before the `resolveConfig` call**, not after. With no `args` path and the fallback not yet implemented, `resolveConfig` throws and `main()` exits at `mcp-server/src/index.ts:L52-L59` — a probe placed after it would never run.
 
-Build, register the server with no `args` path, then take **three** measurements and record all of them in the PR body:
+Build, register the server with no `args` path, then take **five** measurements and record all of them in the PR body:
 
-1. Claude Code **in VS Code** on this repo — does `CLAUDE_PROJECT_DIR` equal the VS Code workspace folder? (R1; this is the one that gates the design.)
-2. Claude Code from a **plain terminal**, for comparison.
-3. A **Desktop app Code tab** session — this measures the § 6 Q1 inference (that a Code tab session is a Claude Code session and inherits § 2(b)) rather than leaving it asserted.
+1. Claude Code in a **VS Code integrated terminal** on this repo — does `CLAUDE_PROJECT_DIR` equal the VS Code workspace folder? (R1.)
+2. Claude Code from a **plain terminal outside VS Code**, for comparison.
+3. A **Desktop app Code tab** session — measures the § 6 Q1 inference (that a Code tab session is a Claude Code session and inherits § 2(b)) rather than leaving it asserted.
+4. Claude Code's **VS Code extension panel**, if the user runs sessions that way — does the panel spawn through the terminal subsystem? This determines whether § 4B's injection reaches that surface (§ 4B.4, row 4). Probing it now is nearly free; discovering it after the extension work ships is not.
+5. Claude Code launched from a VS Code terminal **`cd`'d into a subdirectory** of the workspace — this is R1's main failure mode and § 4B.1's strongest argument. If `CLAUDE_PROJECT_DIR` reports the subdirectory here, that is the concrete evidence for D5.
 
-If measurement 1 is absent or wrong, **stop and re-open § 6** — the whole design rests on it. If measurement 3 is absent, the Q1 recommendation still stands but Desktop Code tab joins Desktop chat in the explicit-path-only bucket.
+6. **Cache-scope check, once the extension half exists** (§ 4B.2): open window A on repo A, let the extension activate, then open window B on repo B and read the probe file for a terminal created *before* B's Bookmarks view is revealed. If it records repo A's path, the persistence cache is global and R6 is the full leak; if it records nothing, the cache is per-workspace and R6 is benign. Either way `persistent = false` stays.
+
+Rev 3 lowers the stakes on measurement 1: under Rev 2 a wrong answer broke the design's foundation; now it costs one fallback tier and strengthens the case for § 4B. **Still stop and re-open § 6 if measurements 1 *and* 5 both disappoint** — that would mean neither tier is reliable for the target session type.
 
 **Phase 1 — the change itself.**
-1. `mcp-server/src/config.ts`: insert `env.CLAUDE_PROJECT_DIR` between the positional and the env var (`:L13`), per D1's order. Signature, return type, and all downstream derivation unchanged.
-2. Update the startup error text (`:L16`) to name all three sources and to say that Claude Code supplies `CLAUDE_PROJECT_DIR` automatically.
-3. `mcp-server/test/config.test.ts`: **add** tests — `CLAUDE_PROJECT_DIR` used when neither override is present; the `args` positional outranks it; **it outranks `BOOKMARKS_MCP_WORKSPACE`** (the D1 regression guard — this is the test that would catch a well-meaning future reorder reintroducing the shell-inheritance hole); relative `CLAUDE_PROJECT_DIR` resolved to absolute; still throws when all three are absent. Change no existing test (§ 10).
+1. `mcp-server/src/config.ts`: insert `env.BOOKMARKS_PLUS_WORKSPACE` then `env.CLAUDE_PROJECT_DIR` between the positional and the legacy env var (`:L13`), per § 3's order. Signature, return type, and all downstream derivation unchanged.
+2. Update the startup error text (`:L16`) to name all four sources, and to say that the VS Code extension and Claude Code supply tiers 2 and 3 automatically.
+3. `mcp-server/test/config.test.ts`: **add** tests — each tier used when the ones above it are absent; the `args` positional outranks all; `BOOKMARKS_PLUS_WORKSPACE` outranks `CLAUDE_PROJECT_DIR` (D5 guard); **`CLAUDE_PROJECT_DIR` outranks `BOOKMARKS_MCP_WORKSPACE`** (the D1 guard — the test that would catch a well-meaning future reorder reintroducing the shell-inheritance hole); relative values resolved to absolute; still throws when all four are absent. Change no existing test (§ 10).
 4. `README.md`: rewrite the MCP section (R3) around one user-scoped entry with no path, plus an "explicit path" subsection covering the `args` override, the Desktop-chat limitation (Q1), and a warning that a shell-exported `BOOKMARKS_MCP_WORKSPACE` pins every otherwise-unresolved session (D1).
 5. `CHANGELOG.md`: note that the workspace path is now optional under Claude Code.
 
 Test-first per the repo standard: the four new `config.test.ts` cases before the `config.ts` edit.
 
-**Not in this issue:** roots (D2), any multi-workspace capability, any tool-schema change.
+**Follow-up issue — the extension half (§ 4B.5).** For the router to file; this agent cannot create issues. Scope: `context.environmentVariableCollection.replace('BOOKMARKS_PLUS_WORKSPACE', <workspace root>)` with `persistent = false` (D6) and a user-visible `description`; add `onStartupFinished` to `package.json:L15`'s empty `activationEvents` (§ 4B.3); decline to set the variable at all in a multi-root workspace (R4); extension-side tests. Blocked on nothing in #57 — the two halves meet only at the variable name.
+
+**Not in this issue:** roots (D2), the extension half (above), any multi-workspace capability, any tool-schema change.
 
 ---
 
@@ -243,6 +376,9 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 ## 11. Open questions and unverified claims
 
 - **`unverified:` whether `CLAUDE_PROJECT_DIR` equals the VS Code workspace folder for a session started inside VS Code.** The single load-bearing empirical unknown. Phase 0 measurement 1 settles it; nothing else in the design is asserted on top of it.
+- **`unverified:` VS Code's persistence of environment variable collections** ("terminals created immediately after the window is loaded… use the last known version"). Provenance: search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, not a direct fetch. Re-fetch before relying on the exact wording. D6's mitigation is correct either way (§ 4B.2).
+- **`unverified:` whether that persistence cache is global or per-workspace-folder.** Determines whether R6 is a real leak or a benign first-run gap. Phase 0 measurement 6.
+- **`unverified:` whether Claude Code's VS Code extension panel spawns through the terminal subsystem**, i.e. whether § 4B's injection reaches it. Phase 0 measurement 4.
 - **`unverified:` that a Desktop app Code tab session inherits § 2(b)'s `CLAUDE_PROJECT_DIR` behavior.** Inferred from the Code tab being a Claude Code session, not quoted from any source. Phase 0 measurement 3 settles it. Only the Q1 scope answer depends on it, not the design.
 - **`unverified:` `anthropics/claude-code#75266`** (desktop-app-spawned MCP servers getting `cwd` = `$HOME`) was never fetched directly (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L73`). It does not matter here: this design reads an explicit env var and never trusts inherited `cwd`.
 - **Claude Code v2.1.203's release date** — needed only for a roots version floor (`:L72`). Moot under D2.
@@ -251,7 +387,25 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 
 ---
 
-## 12. What changed in Rev 2, and why
+## 12. Revision history
+
+### Rev 3 — the extension-injected variable
+
+| Rev 2 | Rev 3 | Cause |
+| --- | --- | --- |
+| `CLAUDE_PROJECT_DIR` is the only automatic source | `BOOKMARKS_PLUS_WORKSPACE` above it; both retained | § 4B.1 — an extension-owned signal measures C2's quantity directly instead of by proxy |
+| Design's foundation rests on Phase 0 measurement 1 | A wrong measurement 1 costs one fallback tier | Two independent automatic sources instead of one |
+| Phase 0: three measurements | Five — adds the extension panel and the subdirectory case | § 4B.4 rows 4 and 2 |
+| No extension-side work anywhere | Extension half split into a follow-up issue | § 4B.5 — different test harness, different release cadence, no blocking dependency |
+| — | New risk R6 + D6 (`persistent = false`) | § 4B.2 — a cached variable is a C2 leak vector that arrives through a caching optimization |
+
+Test impact: unchanged at **57/57 preserved**. The `mcp-server` change is still confined to `resolveConfig`'s source list.
+
+Lesson worth keeping: **when evaluating a new signal source, ask what happens when it is *stale*, not only when it is absent or wrong.** The VS Code API's persistence feature is a latency optimization that, for a workspace-identifying variable, silently converts "not yet available" into "confidently incorrect." Absent degrades to the next tier; stale does not.
+
+### Rev 2 — the process model
+
+
 
 | Rev 1 | Rev 2 | Cause |
 | --- | --- | --- |
