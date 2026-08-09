@@ -1,255 +1,266 @@
 ---
-title: "MCP server: dynamic workspace resolution (issue #57)"
+title: "MCP server: session-scoped workspace resolution (issue #57)"
 touches:
   - mcp-server/src/config.ts
-  - mcp-server/src/index.ts
-  - mcp-server/src/tools/list.ts
-  - mcp-server/src/tools/add.ts
-  - mcp-server/src/workspaces.ts
   - mcp-server/test/config.test.ts
-  - mcp-server/test/index.test.ts
-  - mcp-server/test/list.test.ts
-  - mcp-server/test/add.test.ts
-  - mcp-server/test/workspaces.test.ts
   - README.md
   - CHANGELOG.md
+  - mcp-server/src/index.ts
 skills_relevant:
   - test-driven-development
   - simplicity-first
 ---
 
-# Dynamic workspace resolution for the Bookmarks Plus MCP server
+# Session-scoped workspace resolution for the Bookmarks Plus MCP server
 
-**Issue:** [glitchwerks/vscode-bookmarks-plus#57](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/57) — "MCP server: replace fixed per-workspace config with dynamic workspace resolution" (state: open, no comments; fetched 2026-08-09 via `WebFetch`).
+**Issue:** [glitchwerks/vscode-bookmarks-plus#57](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/57) — state: open (fetched 2026-08-09).
 
-**Status: DRAFT — BLOCKED on user answers to Q1–Q5 (§ 6).** The design in § 4 is a recommendation, not a decision. Every decision point in § 5 carries an explicit status. Do not begin implementation before § 6 is answered — § 5's D1 and D3 change the tool schemas, and getting those wrong costs test rework twice.
+**Revision 2.** Rev 1 of this spec proposed a multi-path candidate-set design. The user then added a second constraint that disqualifies it, and verification of the MCP process model turned up a primary-source fact that makes the whole candidate-set apparatus unnecessary. § 12 records what changed and why. **Do not implement Rev 1's layered design.**
 
-## 0. Where the code being changed lives, and how to read the citations
+**Status: NEARLY UNBLOCKED.** One cheap empirical probe (§ 8 Phase 0) and two questions (§ 6) remain. The design is otherwise determined by primary sources rather than by preference.
 
-All `mcp-server/...` citations in this spec are line numbers **on branch `issue-52-mcp-server`, HEAD `b2fbb3f`** (worktree `I:/apps/vscode/bookmarks/.worktrees/issue-52-mcp-server`). That branch is not merged to `main`, so these paths do not resolve in a `main` checkout. Verified by reading each file on that branch on 2026-08-09.
+## 0. Citation ground rules
 
-The external prior-art report is `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md` (in the `main` checkout, untracked). Citations to it are `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:LN`.
+`mcp-server/...` line numbers are on branch **`issue-52-mcp-server`, HEAD `b2fbb3f`** (worktree `I:/apps/vscode/bookmarks/.worktrees/issue-52-mcp-server`), read 2026-08-09. That branch is unmerged; these paths do not resolve on `main`.
 
-**Before implementation starts: commit this spec and that research report onto the implementation branch.** Both files exist only as untracked files in the `main` working tree at `I:/apps/vscode/bookmarks/docs/`. The implementer will cut a worktree off `issue-52-mcp-server`, where neither file is present — so every `docs/research/…:LN` citation below silently dangles, and the spec itself is invisible from the branch. This is the same artifact-persistence trap recorded on #52; do not repeat it.
-
-The issue #52 implementation plan (`docs/superpowers/plans/2026-08-08-mcp-server-bookmarks.md`) exists **only in the `issue-52-mcp-server` worktree** and is pre-implementation, so it is cited here for *rationale provenance only*, never as evidence of shipped behavior. Behavior claims cite `mcp-server/src/*.ts` directly.
+**Before implementation starts: commit this spec and `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md` onto the implementation branch.** Both exist only as untracked files in the `main` working tree at `I:/apps/vscode/bookmarks/docs/`. The implementer will cut a worktree off `issue-52-mcp-server`, where neither is present — every `docs/research/…:LN` citation below would silently dangle. Same artifact-persistence trap already recorded on #52.
 
 ---
 
-## 1. The problem
+## 1. The two constraints
 
-Issue #52 shipped a server whose workspace is fixed at process start:
+**C1 — registration count.** Verbatim: *"We need a new approach then. This wont work. We cant have an mcp per workspace."*
 
-- `resolveConfig(argv, env)` takes `argv[2] ?? env.BOOKMARKS_MCP_WORKSPACE` and throws if neither is present (`mcp-server/src/config.ts:L13-L17`), then derives `mirrorPath` as `<workspace>/.vscode/bookmarks.json` (`:L29`).
-- `main()` calls it exactly once at startup and hands the resulting `Config` to `createServer(config)` (`mcp-server/src/index.ts:L51-L63`), which closes over that single value when registering both tools (`:L21`, `:L32`).
-- Neither tool accepts a workspace-selecting input: `list_bookmarks` declares `inputSchema: {}` (`mcp-server/src/tools/list.ts:L21`) and `add_bookmark` declares only `uri`/`type`/`collectionId`/`collectionName`/`description` (`mcp-server/src/tools/add.ts:L156-L162`).
+**C2 — context scoping.** Verbatim: *"The other constraint is context. The goal of this is to give the claude session open in vscode access to the bookmarks in that session. If it has bookmarks from many sessions it gets flooded with context it doesnt need."*
 
-Consequence: one `mcpServers` registration entry serves exactly one workspace. The user rejected this in the words quoted in the dispatch brief: *"We need a new approach then. This wont work. We cant have an mcp per workspace."*
+C2 is the stronger constraint and it reshapes the problem. This is not "help the server pick the right workspace from several." It is: **the session running in VS Code workspace A must never see, and never pay tokens for, workspace B's data — not its bookmarks, not its collection names, not even its path in an error message.** Any design that retains a set of known workspaces has an enumeration surface, and any enumeration surface is a leak under C2.
 
-This was not an implementation slip. It was #52's stated acceptance criterion — "Workspace path is supplied via MCP server config/args — no auto-discovery… one workspace per server config" (quoted in `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L3`). #57 supersedes that criterion.
-
-**Assumption being challenged, explicitly:** #52 assumed a workspace-per-registration model was acceptable because the human operator vets the path once at registration time. That assumption bought a real safety property — the server can only ever touch a directory a human approved. Any dynamic design gives that property up unless it is deliberately re-established (see § 5 D3 and § 7 R1). "Make it dynamic" is not free.
+C2 also narrows the target: *"the claude session open in vscode."* The primary client is Claude Code running against a VS Code workspace. See § 6 Q1.
 
 ---
 
-## 2. Reframe: the constraint is *registration count*, not *zero configuration*
+## 2. The load-bearing fact: the process model (verified)
 
-The user's constraint is that there must not be one MCP server registration per workspace. It is **not** stated as "the server must require no configuration." These come apart, and the difference is the cheapest lever available:
+The coordinator asked whether each Claude session gets its own server process or shares one. **Verified from primary sources, not assumed.**
 
-> Letting the existing `argv` / `BOOKMARKS_MCP_WORKSPACE` mechanism accept **N paths instead of 1** satisfies the user's literal constraint with zero MCP-protocol dependency, zero client-capability dependency, and no dependence on the unresolved Claude Desktop question (§ 6 Q1).
+**(a) stdio MCP servers are client-launched subprocesses, one per client connection.**
 
-This matters for sequencing: it means **the Claude Desktop `roots` unknown does not block the design.** It only decides whether the client-roots layer ships in phase 1 or is deferred.
+> "In the **stdio** transport, the client launches the MCP server as a subprocess. The two ends communicate over the subprocess's standard streams"
+> — MCP specification, stdio transport binding, https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio (fetched 2026-08-09)
 
-The honest caveat, stated so this reframe does not read as a dodge: a user annoyed by per-workspace registration is plausibly also annoyed by editing a config file for every new project. Multi-path static config satisfies the letter of the constraint and may not satisfy the intent. That is precisely why the roots layer stays in the plan as a real phase (§ 4 layer 2, § 8 phase 2) rather than a "maybe later" — but it is stacked *on top of* a floor that works without it.
+Lifecycle is per-connection: shutdown is "closing the input stream to the child process (the server)… waiting for the server to exit," and on unexpected exit "the client **SHOULD** restart it" (same page). There is no shared-broker model — the process is born with the connection and dies with it.
+
+**(b) Claude Code sets `CLAUDE_PROJECT_DIR` in the spawned MCP server's own environment.**
+
+> "Claude Code sets `CLAUDE_PROJECT_DIR` in the spawned server's environment to the project root, so your server can resolve project-relative paths without depending on the working directory. This is the same directory hooks receive in their `CLAUDE_PROJECT_DIR` variable. Read it from inside your server process, for example `process.env.CLAUDE_PROJECT_DIR` in Node"
+> — https://code.claude.com/docs/en/mcp § "Option 3: Add a local stdio server" (fetched 2026-08-09)
+
+Note the second sentence: the docs explicitly instruct servers to read it from inside the process, which is exactly what we need. (A separate caveat on the same page — that `${CLAUDE_PROJECT_DIR}` needs a `:-.` default when expanded in `args`, because the variable lives in the *server's* env, not Claude Code's — does not apply to us: we read `process.env`, we do not expand it in config.)
+
+**(c) A user-scoped registration loads in every project.**
+
+> "| [User](#user-scope) | All your projects | No | `~/.claude.json` |"
+> — https://code.claude.com/docs/en/mcp § "MCP installation scopes" (fetched 2026-08-09)
+
+### What (a)+(b)+(c) mean together
+
+**This is not a "pick the right workspace from N options" problem. It is a "make one already-correctly-scoped instance easier to register" problem.**
+
+One user-scoped registration entry, with **no workspace path in it at all**, spawns a separate server subprocess for every Claude Code session, each with `CLAUDE_PROJECT_DIR` already set to that session's project root. C1 is satisfied (one entry, forever). C2 is satisfied **structurally** — the process is never told about any other workspace, so there is nothing to leak, no policy to enforce, and no code path to get wrong.
+
+The context-flooding risk in the current shipped design was never actually present either: it would only have appeared if we had adopted Rev 1's candidate-set model. The real defect in the shipped design is narrower than it looked — it is **registration ergonomics only**: `resolveConfig` *requires* an explicit path (`mcp-server/src/config.ts:L13-L17`), so the user must add a config entry naming each workspace, even though the client already handed the process the answer in its environment.
 
 ---
 
-## 3. What the research settled, and what it did not
+## 3. The design
 
-From `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md`:
-
-**Settled:**
-- The MCP `roots` primitive exists in the already-pinned SDK (`@modelcontextprotocol/sdk` 1.30.0) — `listRoots()`, `RootsListChangedNotificationSchema`, capability gating are all present at that tag (`:L40`).
-- But the high-level `McpServer` class this project uses (`mcp-server/src/index.ts:L16`) **does not surface roots**; a caller must reach through `server.server.*` to the low-level `Server` (`:L40`).
-- The reference filesystem server's lifecycle is the pattern to copy: request roots inside `oninitialized` (post-connect, never at startup), re-request on `roots/list_changed`, fall back to CLI-supplied directories when the client lacks the capability or `listRoots()` throws, hard-error only when *no* source produced anything (`:L29-L33`).
-- Claude Code CLI answers `roots/list` with launch dir + `--add-dir` set, and sends `list_changed`, **since v2.1.203** — after two closed bug reports where it advertised the capability and silently failed (`:L43-L45`).
-- Anthropic's own docs point servers that scope filesystem access toward `roots/list` rather than `CLAUDE_PROJECT_DIR` (`:L46`).
-
-**Not settled — do not design as if these were answered:**
-- Whether Claude Desktop (the standalone chat app) implements client-side `roots` at all. No primary source either way; the researcher recommends empirical verification (`:L61`).
-- Which returned root is "the bookmarks workspace" when `roots/list` returns zero, one, or several — no external prior art, this is our design work (`:L62`).
-- A root is *Claude Code's session directory set*, not *the VS Code workspace with the extension open*. They coincide in the common case and desync for worktrees, monorepo subdirs, and sessions launched from `$HOME` (`:L47`). **This caveat applies to every candidate**, including the recommended one.
-
-**A consequence the research did not draw, which the user should weigh (§ 6 Q1):** Claude Desktop has no "open folder" concept at all. If it has no roots *and* the model in that client has no filesystem context, then *no* dynamic mechanism can work there — not roots, not a per-call path argument (the model would have nothing to fill it with), not `cwd` inheritance. For Desktop the realistic options reduce to: a configured path list, or a new discovery surface written by the extension (§ 9 A3). This reframes Q1 from a capability question into a semantics question.
-
----
-
-## 4. Recommended design (pending § 6)
-
-**Core structural change:** workspace resolution moves from *once per process* to *once per tool call*. `Config`-as-a-value becomes settings-plus-provider.
+Change `resolveConfig`'s source list. Nothing else.
 
 ```
-ServerSettings                          resolved once at startup
-  configuredWorkspaces: string[]        argv positionals + BOOKMARKS_MCP_WORKSPACE (comma-separated)
-  verifyDelayMs: number                 unchanged semantics
-
-WorkspaceRegistry                       mutable, lives for the process
-  configured: string[]                  from ServerSettings, never emptied
-  fromRoots: string[]                   populated at oninitialized, replaced on roots/list_changed
-  candidates(): string[]                configured ∪ fromRoots, de-duplicated, absolute
-
-resolveWorkspace(registry, requested?)  called per tool invocation
-  → { workspacePath, mirrorPath } | AmbiguityError | NoCandidatesError
+workspace =
+  1. argv[2]                            explicit override — lives in the registration entry
+  2. env.CLAUDE_PROJECT_DIR             NEW — the session's own project root
+  3. env.BOOKMARKS_MCP_WORKSPACE        legacy override, demoted — see D1
+  else → throw, as today
 ```
 
-**Resolution algorithm** (this is the whole design; § 5 D1–D5 are the choices baked into it):
+Note the order: `BOOKMARKS_MCP_WORKSPACE` drops **below** `CLAUDE_PROJECT_DIR`. That is a deliberate C2 fix, not a cosmetic reshuffle — D1 explains why the obvious order is unsafe.
 
-1. If the call supplied `workspacePath`, it must **match a member of `candidates()`** (after `path.resolve` normalisation). No match → tool error naming the candidate set. It is a *selector*, never a free-form path (see § 7 R1).
-2. Else if `candidates()` is empty → tool error explaining that no workspace is configured and the client advertised no usable roots. Actionable text, not a stack trace.
-3. Else if `candidates()` has exactly one entry → use it, **whether or not `.vscode/bookmarks.json` exists yet**. This preserves the ability to bootstrap a workspace's first bookmark through `add_bookmark`.
-4. Else narrow to candidates where `<candidate>/.vscode/bookmarks.json` exists. If exactly one survives → use it.
-5. Else → tool error enumerating the surviving candidates and instructing the model to re-call with `workspacePath: "<one of these>"`.
+Everything downstream is unchanged: `path.resolve`, `mirrorPath = <workspace>/.vscode/bookmarks.json`, `verifyDelayMs` (`mcp-server/src/config.ts:L19-L31`). `Config`'s shape does not change. `createServer` does not change. Neither tool's `inputSchema` changes. Resolution stays **once, at process start** — which under § 2(a) is once per session.
 
-Mirror presence is a **ranking signal, not a membership filter** — that is what makes step 3 and step 4 coexist without a bootstrap dead-end.
+Registration becomes, for every workspace on the machine, one entry:
 
-Fail-loud at every ambiguity. The server never guesses which workspace the user meant.
+```json
+{ "mcpServers": { "bookmarks-plus": {
+  "command": "node",
+  "args": ["C:/path/to/vscode-bookmarks-plus/mcp-server/dist/index.js"]
+} } }
+```
 
-**Layering:**
+### The C2 guarantee, stated as invariants the implementation must hold
 
-- **Layer 0 (floor, no protocol dependency):** multi-path static config. Satisfies the user's constraint on its own.
-- **Layer 1 (disambiguator):** optional `workspacePath` selector argument on both tools.
-- **Layer 2 (auto-population, additive):** client roots feed `registry.fromRoots`, following the reference server's lifecycle (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L29-L33`). If the client lacks `roots` or `listRoots()` throws, layers 0+1 still work. Roots **augment** the candidate set here rather than replacing configured directories the way the reference filesystem server does (`:L31`) — deliberate divergence, see § 5 D4.
+1. **A server process resolves exactly one `workspacePath`, at startup, and never changes it.** No mutable registry, no re-resolution, no per-call resolution.
+2. **No tool accepts a workspace-selecting argument.** `list_bookmarks` keeps `inputSchema: {}` (`mcp-server/src/tools/list.ts:L21`); `add_bookmark` keeps its five existing fields (`mcp-server/src/tools/add.ts:L156-L162`).
+3. **The process never learns of any workspace other than its own.** It reads one env var and one file path. It does not scan, glob, or enumerate directories — see § 5 D3.
+4. **No error message can name another workspace,** because none is ever in scope. This is what makes the guarantee structural rather than a matter of careful message-writing.
 
-**Architecture constraint that keeps existing tests standing:** roots resolution fires at `oninitialized`, i.e. after `connect()`. `createServer()` today is synchronous and performs no I/O, and `mcp-server/test/index.test.ts:L47-L76` asserts exactly that (server constructed, `isConnected() === false`, exactly two tools registered, no transport). Keep `createServer()` I/O-free; put roots wiring in a separate `attachRootsSync(server, registry)` that is unit-testable on its own and mutates the registry the handlers read **at call time**.
+Invariants 1-4 are all satisfied by *not adding* the machinery Rev 1 proposed. The strongest form of "no cross-workspace exposure" is a process that has no representation of a second workspace.
+
+---
+
+## 4. Why `CLAUDE_PROJECT_DIR` and not `roots` — a deliberate divergence from the docs and the research
+
+The same docs paragraph that gives us (b) also says:
+
+> "`CLAUDE_PROJECT_DIR` is the stable project root and doesn't change when you add or remove working directories mid-session. A server that limits its own filesystem access to a set of allowed directories should implement the MCP `roots/list` request instead. Claude Code answers `roots/list` with the session's launch directory plus every additional working directory you've granted with `--add-dir`, `/add-dir`, or the `additionalDirectories` setting."
+> — https://code.claude.com/docs/en/mcp (fetched 2026-08-09)
+
+The researcher ranked `roots` first partly on this sentence (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L46`). **That recommendation targets a different problem than ours, and under C2 it is the wrong primitive here.**
+
+- The advice is addressed to *sandboxing* servers — ones that police access across *a set of allowed directories*. That is precisely the multi-directory shape C2 forbids.
+- Roots is a **set**, and it grows with `--add-dir`. Under C2, a second directory entering the set is a defect, not a feature: it would either flood the session with a second workspace's bookmarks or force a disambiguation prompt that names it.
+- The property the docs frame as a *limitation* of `CLAUDE_PROJECT_DIR` — "doesn't change when you add or remove working directories mid-session" — is exactly the property C2 wants. Stability is the feature.
+- Cost avoided: roots would force reaching through `server.server.*` past the `McpServer` convenience API (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L40`), an `oninitialized` + notification lifecycle that cannot be tested without a live client (`:L29-L33`), and a documented Claude Code version floor of v2.1.203 after two silent-failure bugs (`:L43-L45`).
+
+**Recommendation: do not implement roots.** Not "defer" — the ranking is reversed on the merits, for this use case, with the citation above. Recorded as D2; the user can overturn it.
 
 ---
 
 ## 5. Decision points
 
-Each carries a recommendation and a status. Statuses marked BLOCKED must be resolved before implementation.
+### D1 — Precedence order. **Recommend: `argv[2]` > `CLAUDE_PROJECT_DIR` > `BOOKMARKS_MCP_WORKSPACE`. Status: this one matters — the intuitive order breaks C2.**
 
-### D1 — Do the tools gain a `workspacePath` argument? **Recommend: yes, optional, selector-only. BLOCKED on Q2.**
+The obvious order — both explicit sources above the new one — has a hole. `BOOKMARKS_MCP_WORKSPACE` is a plain environment variable, and a spawned subprocess inherits the user's shell environment. The current README actively instructs users to set it (`README.md:L71`, `:L109`). A user who exported it once — in a shell profile, or as a leftover from the pre-#57 single-workspace setup — would have **every session in every workspace silently resolve to that one pinned path**. That is exactly the cross-workspace serving C2 forbids, delivered by the precedence rule rather than by an enumeration surface. § 3's invariants 1-4 do not catch it: they constrain what the process *learns*, and this is about what it *resolves to*.
 
-Optional on both `list_bookmarks` and `add_bookmark`. Absent → algorithm steps 2-5 apply. Present → step 1 (must match a candidate).
+The symmetric problem, so this is not flipped blindly: putting `CLAUDE_PROJECT_DIR` above the env var means a user who deliberately sets `BOOKMARKS_MCP_WORKSPACE` inside an `mcpServers` entry's `env` block gets it ignored under Claude Code. **From inside the process, "set in the registration entry" and "inherited from the shell" are indistinguishable** — there is no way to honor one and reject the other.
 
-Cost: breaks the `inputSchema` assertion at `mcp-server/test/list.test.ts:L279-L281` (`assert.deepEqual(Object.keys(list.inputSchema), [])`). That test's *title* says "no required input" (`:L265`) — the assertion is stricter than its stated intent. Update the assertion to "no **required** keys," preserving the intent.
+Resolution: make the **`args` positional the sole documented explicit override.** It lives in the registration entry, is unambiguous about intent, and cannot be inherited. `CLAUDE_PROJECT_DIR` second. `BOOKMARKS_MCP_WORKSPACE` third, retained for backward compatibility and documented as legacy/last-resort with an explicit warning that a shell-exported value will pin every session that has no `args` path and no project dir.
 
-Alternative rejected: making it required. Per `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L54-L56`, a practitioner reported the per-call-path pattern "works flawlessly" but "adds burden to every tool call," with no protocol guarantee the model supplies it correctly. Optional-with-fallback gets the escape hatch without paying that cost on every call.
+Cost of this order against the existing suite: **zero.** Verified test-by-test — every `config.test.ts` case passes an explicit `env` object literal rather than `process.env`, so no test can inherit an ambient `CLAUDE_PROJECT_DIR`, and the two order-sensitive cases both omit it: `:L14-L26` (argv wins over the env var) and `:L28-L34` (env var used when no positional). Both still pass under the new order.
 
-### D2 — How are multiple static paths expressed? **Recommend: repeated positionals + comma-separated env var. Status: open, low stakes, reversible.**
+### D2 — Implement MCP `roots`? **Recommend: no. Status: recommended, see § 4. User may overturn.**
 
-`node dist/index.js /path/a /path/b` and `BOOKMARKS_MCP_WORKSPACE=/path/a,/path/b`.
+### D3 — When the resolved directory has no `.vscode/bookmarks.json`, do we search for one? **Recommend: no, never. Status: firm.**
 
-Separator choice is `,` deliberately, not `path.delimiter`: `path.delimiter` is `;` on Windows and `:` on POSIX, and `:` is unusable here because Windows paths contain drive-letter colons. A platform-dependent separator would make one documented example wrong on the other OS. `,` means the same thing everywhere and appears in neither platform's conventional paths. The primary development machine here is Windows, so the cross-platform-consistent choice costs nothing locally.
+Today the mirror's absence is already handled correctly and needs no new code: `readMirror` returns `undefined` on `ENOENT` (`mcp-server/src/mirrorFile.ts:L9-L12`), `list_bookmarks` reports an empty workspace, and `add_bookmark` creates the file. Bootstrapping works.
 
-Today `argv[2]` wins over the env var entirely (`mcp-server/src/config.ts:L13`); under the multi-path model, **union the two sources instead of overriding** — an override rule on a set is a footgun. This is a documented behavior change for anyone who currently sets both.
+Searching parent or child directories for a mirror would be a C2 violation with a friendly face: to search is to discover other workspaces, and whatever is discovered can end up in a message. If a user launches Claude Code from a directory that is not the workspace root, the correct outcome is an empty list plus a `mirrorPath` in the payload (`mcp-server/src/tools/list.ts:L34-L35`) showing exactly where the server looked — self-diagnosing, and it names only the current session's own path.
 
-### D3 — Is `workspacePath` a free-form path or a selector from the candidate set? **Recommend: selector. Status: strongly recommended, confirm via Q2.**
-
-See § 7 R1 — this is the single highest-consequence line in the spec.
-
-### D4 — Do roots *replace* or *augment* configured paths? **Recommend: augment. Status: open.**
-
-The reference filesystem server replaces (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L31`). Diverge, because the two sources mean different things here: configured paths are *human-vetted bookmarks workspaces*; roots are *whatever directories the client session happens to hold* (`:L47`). Replacing would let an unrelated `--add-dir` evict the user's real workspace from the allowlist. Augmenting keeps the vetted set as a floor.
-
-### D5 — Does the roots layer ship in phase 1 or phase 2? **Recommend: phase 2. BLOCKED on Q1/Q3.**
-
-Layer 0+1 is shippable, testable without a real client, and satisfies the stated constraint. The roots layer needs an empirical capability check against real clients (§ 8 phase 2 step 1) which cannot be done from a test suite.
-
-### D6 — Does `list_bookmarks` keep returning a single workspace's bookmarks? **Recommend: yes. Status: open, see § 9 A2.**
+### D4 — Keep the hard startup failure when nothing resolves? **Recommend: yes, unchanged.** (`mcp-server/src/config.ts:L15-L17`, surfaced by `main()`'s catch at `mcp-server/src/index.ts:L52-L59`.) The message needs updating to mention the new source, per § 8.
 
 ---
 
-## 6. Clarifying questions — answer these before implementation
+## 6. Remaining questions
 
-**Q1. Which clients must this support?** Claude Code CLI only, or Claude Code + Claude Desktop? And — the more useful form of the question — **in Claude Desktop, which has no open-folder concept, what should "the relevant workspace" even mean?** If the answer is "in Desktop you just point it at a path (or a few) in the config," then Desktop's `roots` support is moot regardless of whether it exists, and the unresolved research gap (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L61`) drops off the critical path entirely.
+**Q1. Is Claude Desktop's *chat* surface still a target, or is "Claude Code in VS Code" the whole target?** Your C2 wording — *"the claude session open in vscode"* — reads as the latter, and there is a structural reason to accept it: the Desktop chat app has no per-session project concept at all, so per-session scoping is impossible there **by construction**, not by missing support. Verified as far as the docs go: Desktop loads `claude_desktop_config.json` servers "into local Code tab sessions" and the same server "is available in both the Desktop chat surface and local Code tab sessions" (https://code.claude.com/docs/en/desktop § "MCP servers from the Claude Desktop chat app", fetched 2026-08-09) — the *Code tab* is a Claude Code session and therefore gets § 2(b) for free; the *chat* surface has no documented project root or roots support either way.
 
-**Q2. Is an optional per-call `workspacePath` selector acceptable** (D1/D3)? It is client-agnostic and has no protocol dependency. The cost is that the model must supply the right value when more than one candidate exists — mitigated by the enumerated-candidates error in algorithm step 5, which tells the model exactly what to re-call with.
+One caveat on that reasoning: "a Code tab session is a Claude Code session and therefore gets § 2(b) for free" is an **inference**, not a quotation — everything else in § 2 is quoted. Phase 0 measurement 3 tests it directly rather than leaving it asserted.
 
-**Q3. Ship the roots layer now, or ship layer 0+1 first and add roots after?** (D5.) Roots buys "new project just works without editing config" for Claude Code ≥ v2.1.203. It costs reaching through `server.server.*` past the convenience API (`:L40`), plus a lifecycle you cannot fully test without a live client.
+Recommended answer, pending yours: **Code-tab and CLI sessions are the target; the Desktop chat surface is supported only via the explicit `args` path (D1), which inherently means one workspace per entry there.** Documented as a limitation, not solved. This retires the unresolved research gap at `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L61` — Desktop chat's roots support stops mattering, because roots is not being implemented (D2) and Desktop chat has no session-workspace to scope to regardless.
 
-**Q4. Is a minimum Claude Code version acceptable as a documented requirement?** Roots is only reliable from v2.1.203 onward; before that Claude Code advertised the capability and never answered, hanging callers 5+ seconds (`:L43-L45`). If we ship roots, README must state the floor. No release *date* for v2.1.203 was found (`:L72`) — if a date is needed, pull it from the GitHub releases API, not `CHANGELOG.md`.
-
-**Q5. If Desktop must resolve dynamically, is an extension-side change in scope?** The only mechanism that could work there is the extension publishing a machine-level registry of known bookmarks workspaces (§ 9 A3). That expands #57 out of `mcp-server/` and into the extension. Default assumption unless you say otherwise: **out of scope.**
+**Q2. Should the README recommend user scope for the registration?** User scope is what makes one entry cover every project (§ 2(c)). It also means the server is offered in *every* project, including ones with no bookmarks — harmless (empty list, cheap) but worth your call versus per-project `.mcp.json` entries that are committed and shared with a team.
 
 ---
 
 ## 7. Risks
 
-**R1 — `add_bookmark` with a free-form path is a directory-polluter.** `writeMirrorAtomic` calls `mkdir(dirname(path), { recursive: true })` before writing (`mcp-server/src/mirrorFile.ts:L16-L18`). Under a free-form `workspacePath`, a model that supplies a plausible-but-wrong path silently creates `.vscode/bookmarks.json` inside an unrelated repository, where nothing will ever consume it and the user will never see it. **This risk does not exist today** — it is created by this redesign, and it is the price of giving up #52's human-vets-the-path property (§ 1). Mitigation is D3: the argument selects from `candidates()`; it never introduces a new path. Reads could safely be laxer; writes must not be. This is also the strongest reason to keep the configured-path list after roots works.
+**R1 — `CLAUDE_PROJECT_DIR` may not equal the VS Code workspace folder.** It is Claude Code's project root, and the two desync when a session is launched from a subdirectory, a parent directory, or a different checkout than the folder VS Code has open (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L47`). Mitigations, in order: the Phase 0 probe measures the common case before we commit (§ 8); the explicit override (D1) covers the rest; and D3's failure mode is a visibly empty list naming the path searched, not silent wrong data. **This risk is inherent to any client-side mechanism** — roots has it too, and worse, since roots also carries `--add-dir` noise.
 
-**R2 — A client root is not a bookmarks workspace.** Restating `:L47` as a live risk: Claude Code answers with its own session dirs. Worktrees are the concrete case in this very repo — the code under discussion lives at `.worktrees/issue-52-mcp-server/mcp-server/…`, a real directory Claude Code would plausibly report as a root and which is *not* a bookmarks-enabled workspace (`:L33`). Mitigation: the mirror-presence ranking in algorithm step 4, plus fail-loud ambiguity.
+**R2 — Rev 1's directory-pollution risk is gone.** It existed only because a model-supplied path would flow into `writeMirrorAtomic`'s `mkdir(dirname, { recursive: true })` (`mcp-server/src/mirrorFile.ts:L16-L18`). With no workspace argument on any tool (invariant 2), the only paths that ever reach that call come from the process's own startup environment. Recorded so a future reviewer sees it was considered and designed out, not overlooked.
 
-**R3 — Stale registry after `roots/list_changed` is missed.** Claude Code did not send that notification before v2.1.203 (`:L44`). If it is missed, `fromRoots` goes stale and a newly-added directory is rejected. Mitigation: configured paths are never evicted (D4), so the floor still works; the ambiguity error names what the server *does* know, making staleness visible instead of silent.
+**R3 — Docs describe the retired model.** `README.md:L50-L127` documents one-registration-per-workspace as current behavior, including per-workspace `args` entries (`:L83`, `:L100`) and the argv-wins-over-env rule (`:L71`). The precedence rule stays true under D1; the per-workspace framing does not.
 
-**R4 — Untested lifecycle.** `oninitialized` and the notification handler cannot be exercised by the existing `node --test` suite without a live client. Mitigation: unit-test `attachRootsSync` against a fake `Server` shape and record the real-client check as a manual verification step (§ 8 phase 2 step 1) rather than pretending a unit test covers it.
+**R4 — Multi-root VS Code workspaces have no single answer, and that is an inherited constraint, not a new gap.** `CLAUDE_PROJECT_DIR` is one path, while a multi-root VS Code workspace has several folders and no single mirror-bearing root. This does not regress anything: the `.vscode/bookmarks.json` mirror shipped in #51 / PR #54 (merged as `005d67f`) is single-root by design, so multi-root workspaces were already outside the mirror's scope before #57 existed. A reviewer will ask; the answer is "inherited constraint," and widening it belongs to a mirror-design issue, not this one.
 
-**R5 — Two docs surfaces already describe the old model.** `README.md:L50-L127` documents the one-workspace-per-registration model as current behavior, including the argv-wins-over-env rule (`:L71`) and per-workspace config entries (`:L83`, `:L100`, `:L109`). All of it needs rework, and D2 changes the precedence rule it documents.
-
----
-
-## 8. Provisional phasing (finalise after § 6)
-
-Test-first throughout, per the repo's TDD standard. Phase 1 is shippable on its own.
-
-**Phase 1 — layer 0 + layer 1 (no protocol dependency).**
-1. `mcp-server/src/workspaces.ts`: `WorkspaceRegistry` + `resolveWorkspace`, with the five-step algorithm. New test file; this is where the new coverage lands.
-2. `mcp-server/src/config.ts`: `resolveConfig` → `resolveSettings`, returning `{ configuredWorkspaces: string[], verifyDelayMs }`. Drops `workspacePath`/`mirrorPath`; keeps `verifyDelayMs` parsing byte-for-byte.
-3. `mcp-server/src/tools/list.ts` + `add.ts`: factories take `(settings, registry, deps)`; each handler resolves at call time. `addOnce` takes the resolved `mirrorPath` as a parameter — **its read → mutate → atomic write → verify → one-retry body does not change** (`mcp-server/src/tools/add.ts:L92-L145`).
-4. Optional `workspacePath` in both `inputSchema`s (D1).
-5. `mcp-server/src/index.ts`: `main()` builds settings + registry, passes both into `createServer`. `createServer` stays synchronous and I/O-free.
-6. README + CHANGELOG rework (R5).
-
-**Phase 2 — layer 2 (roots), only if Q3 says now.**
-1. **Manual, first:** connect the server to a real Claude Code session and a real Claude Desktop session, log `server.server.getClientCapabilities()`, record both results in the PR body. This is the empirical answer to the research gap (`:L61`) and it gates the rest of the phase.
-2. `attachRootsSync(server, registry)`: `oninitialized` → capability check → `listRoots()` in a try/catch that logs and degrades rather than throwing → validate each root resolves to a real directory → populate `fromRoots`. Register the `list_changed` handler to re-run the same path.
-3. Unit-test against a fake `Server` (capability present / absent / `listRoots()` rejects / returns non-directories).
-4. README: minimum Claude Code version (Q4).
+**R5 — Other MCP clients set no `CLAUDE_PROJECT_DIR`.** Cline, Continue, VS Code's own native MCP client, etc. all fall through to the explicit override and behave exactly as they do today. No regression; just no improvement. (VS Code's native client has its own idiom — `.vscode/mcp.json` with `${workspaceFolder}` — deliberately out of scope per the research's negative axis, `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L19`.)
 
 ---
 
-## 9. Alternatives considered and not recommended
+## 8. Implementation
 
-**A1 — `CLAUDE_PROJECT_DIR` / inherited `cwd`.** Anthropic's own docs steer scoping servers to `roots` over `CLAUDE_PROJECT_DIR` (`:L46`), and there is an unverified report that desktop-app-spawned MCP servers get `cwd` set to `$HOME` (`:L47`, flagged as not directly fetched at `:L73`). Nothing here beats layer 0+1, and it inherits R2 in full.
+**Phase 0 — the probe (do this first; it is ~15 minutes and it gates the rest).**
 
-**A2 — `list_bookmarks` aggregates across all candidate workspaces.** Genuinely appealing: reads are safe, and aggregation makes disambiguation unnecessary for the read path. Rejected for phase 1 because it restructures the `list_bookmarks` payload and costs list-tool tests, against this spec's preservation goal (§ 10). Reconsider as a follow-up.
+Add a temporary probe in `main()` that **appends `process.env.CLAUDE_PROJECT_DIR` and `process.cwd()` to a known file** (e.g. `os.tmpdir()/bookmarks-mcp-probe.log`). Two placement rules, both load-bearing:
 
-**A3 — Extension-published workspace registry** (e.g. the extension maintains `~/.bookmarks-plus/workspaces.json` of workspaces it has mirrors in; the server reads it and exposes selection by *name*). This is the only option that would let a Claude Desktop session pick a workspace without the model knowing filesystem paths. Costs: a new cross-process surface, a new staleness problem, and scope expansion out of `mcp-server/` into the extension. Promote to a decision point only if Q1/Q5 say Desktop must resolve dynamically.
+- **Write to a file, not stderr.** The stdio binding permits stderr logging but guarantees nothing about delivery: "The client **MAY** capture, forward, or ignore the server's `stderr` output" (https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio, fetched 2026-08-09). A file is independent of client behavior.
+- **Place it before the `resolveConfig` call**, not after. With no `args` path and the fallback not yet implemented, `resolveConfig` throws and `main()` exits at `mcp-server/src/index.ts:L52-L59` — a probe placed after it would never run.
 
-**A4 — Required `workspacePath` on every call, no static config.** Simplest schema, worst ergonomics, and it hands R1 a loaded weapon: with no candidate set there is nothing to validate against. Rejected.
+Build, register the server with no `args` path, then take **three** measurements and record all of them in the PR body:
+
+1. Claude Code **in VS Code** on this repo — does `CLAUDE_PROJECT_DIR` equal the VS Code workspace folder? (R1; this is the one that gates the design.)
+2. Claude Code from a **plain terminal**, for comparison.
+3. A **Desktop app Code tab** session — this measures the § 6 Q1 inference (that a Code tab session is a Claude Code session and inherits § 2(b)) rather than leaving it asserted.
+
+If measurement 1 is absent or wrong, **stop and re-open § 6** — the whole design rests on it. If measurement 3 is absent, the Q1 recommendation still stands but Desktop Code tab joins Desktop chat in the explicit-path-only bucket.
+
+**Phase 1 — the change itself.**
+1. `mcp-server/src/config.ts`: insert `env.CLAUDE_PROJECT_DIR` between the positional and the env var (`:L13`), per D1's order. Signature, return type, and all downstream derivation unchanged.
+2. Update the startup error text (`:L16`) to name all three sources and to say that Claude Code supplies `CLAUDE_PROJECT_DIR` automatically.
+3. `mcp-server/test/config.test.ts`: **add** tests — `CLAUDE_PROJECT_DIR` used when neither override is present; the `args` positional outranks it; **it outranks `BOOKMARKS_MCP_WORKSPACE`** (the D1 regression guard — this is the test that would catch a well-meaning future reorder reintroducing the shell-inheritance hole); relative `CLAUDE_PROJECT_DIR` resolved to absolute; still throws when all three are absent. Change no existing test (§ 10).
+4. `README.md`: rewrite the MCP section (R3) around one user-scoped entry with no path, plus an "explicit path" subsection covering the `args` override, the Desktop-chat limitation (Q1), and a warning that a shell-exported `BOOKMARKS_MCP_WORKSPACE` pins every otherwise-unresolved session (D1).
+5. `CHANGELOG.md`: note that the workspace path is now optional under Claude Code.
+
+Test-first per the repo standard: the four new `config.test.ts` cases before the `config.ts` edit.
+
+**Not in this issue:** roots (D2), any multi-workspace capability, any tool-schema change.
 
 ---
 
-## 10. Preservation analysis — how much of the green 57 survives
+## 9. Alternatives considered and rejected
 
-Baseline: 57 tests across 7 files (counted 2026-08-09 by matching `test(` declarations on branch `issue-52-mcp-server`).
+**A1 — Rev 1's multi-path candidate set + per-call `workspacePath` selector.** **Disqualified by C2.** Disambiguating between candidates requires telling the model what the candidates are; enumerating other workspaces' paths in a tool error is precisely the cross-session context bleed C2 forbids, and it scales with the number of registered workspaces. It also solved a problem that § 2 shows does not exist: the client already scopes each process.
+
+**A2 — MCP `roots`.** § 4. Wrong primitive for a single-workspace requirement; costs a client version floor, an untestable lifecycle, and an escape from the convenience API.
+
+**A3 — A launcher/wrapper script that derives the workspace from VS Code's environment.** Unnecessary: § 2(b) shows Claude Code already passes the project root into the server's environment directly, so a wrapper would only re-read what `process.env` already has. It would also add a second executable to install and to keep in sync with the server.
+
+**A4 — Extension-published workspace registry** (`~/.bookmarks-plus/workspaces.json`). Rev 1 floated this for the Desktop-dynamic case. **Now actively undesirable**: a machine-wide list of every bookmarks workspace is the exact enumeration surface C2 argues against, plus a staleness problem and scope expansion into the extension.
+
+**A5 — Aggregate reads across workspaces.** Directly contrary to C2. Dropped without qualification.
+
+---
+
+## 10. Test impact — revised
+
+**Rev 1 estimated 21 tests untouched, ~25 needing fixture edits, 3 relocated, 1 rewritten, 3 replaced. That estimate is superseded: all 57 tests are preserved verbatim.**
+
+Because `resolveConfig`'s signature, return type, and `Config`'s shape are unchanged, and no tool schema or handler changes:
 
 | File | Tests | Disposition |
 | --- | --- | --- |
-| `contract.test.ts` | 10 | **Untouched.** `contract.ts` is pure parse/serialize; nothing workspace-aware. |
-| `mirrorFile.test.ts` | 7 | **Untouched.** `readMirror`/`writeMirrorAtomic` are already path-parameterised (`mcp-server/src/mirrorFile.ts:L5`, `:L16`). |
-| `schemaDrift.test.ts` | 4 | **Untouched.** Verified by reading it: all four assertions compare the authored JSON Schema against `contract.ts`'s `MAX_SUPPORTED_VERSION` and fixtures. No tool-schema coupling. |
-| `add.test.ts` | 17 | **Bodies preserved.** Only the local `makeConfig` helper changes to supply a fixed single-candidate registry. The RMW-verify-retry assertions — the most valuable tests in the suite — are untouched. |
-| `list.test.ts` | 8 | 7 preserved via the same helper change. **1 deliberate break:** `:L279-L281` pins `Object.keys(inputSchema)` as `[]`; D1 adds an optional key. Rewrite to assert *no required keys*, matching the test's own title at `:L265`. `:L284-L297` (payload surfaces the resolved workspace/mirror path) survives as-is and becomes *more* meaningful. |
-| `index.test.ts` | 1 | Preserved, provided `createServer` stays synchronous and I/O-free (§ 4). Only the `makeConfig` fixture shape changes. |
-| `config.test.ts` | 10 | **Most affected**, itemised below. |
+| `contract.test.ts` | 10 | Untouched |
+| `mirrorFile.test.ts` | 7 | Untouched |
+| `schemaDrift.test.ts` | 4 | Untouched (verified by reading: asserts only authored-schema vs `contract.ts`'s `MAX_SUPPORTED_VERSION` and fixtures) |
+| `add.test.ts` | 17 | Untouched — no fixture-helper change is needed now |
+| `list.test.ts` | 8 | Untouched — including `:L279-L281`, which pins `Object.keys(inputSchema)` as `[]`. Rev 1 called this a deliberate break; under invariant 2 it stays green and becomes a **regression guard** for C2: if a future change adds a workspace argument to `list_bookmarks`, this test fails and should be read as C2 being violated. Worth a comment saying so. |
+| `index.test.ts` | 1 | Untouched — `createServer` stays synchronous and I/O-free, which Rev 1 had to engineer for and Rev 2 gets for free |
+| `config.test.ts` | 10 | Untouched. The throw-when-nothing-present test (`:L36-L41`) still passes: it calls `resolveConfig(argvWith(), {})` with an empty env object, so no `CLAUDE_PROJECT_DIR` is present. Verified by reading the test. |
 
-`config.test.ts`, test by test (all 10 accounted for):
-
-- `:L65`, `:L71`, `:L79`, `:L87` — the 4 `verifyDelayMs` tests (default 400, parse, explicit `0` is not "missing", reject non-numeric). **Survive essentially verbatim** against `resolveSettings`.
-- `:L43-L48`, `:L50-L57` — relative positional / relative env var resolve to an **absolute** path. **Preserved and moved** to `workspaces.test.ts`, generalised to "every configured path is normalised to absolute." More load-bearing under multi-path, not less: absolute normalisation is what makes the selector match in algorithm step 1 reliable.
-- `:L59-L63` — `mirrorPath` derived as `<workspace>/.vscode/bookmarks.json`. **Preserved and moved** to `workspaces.test.ts`; it becomes an assertion about `resolveWorkspace`'s return value.
-- `:L14-L26`, `:L28-L34` — the 2 precedence tests (positional wins over env; env used when no positional). **Replaced.** D2 makes the two sources union rather than override.
-- `:L36-L41` — throws when neither source is present. **Replaced.** Startup no longer throws on an empty set; the error moves to tool-call time (algorithm step 2), so the replacement assertion lives in `workspaces.test.ts`.
-
-**Net: 21 tests untouched outright; ~25 preserved with a fixture-helper edit; 3 preserved but relocated to `workspaces.test.ts`; 1 deliberately rewritten; 3 replaced by new resolution tests.** This is a change to *how the workspace is chosen*, not to *what the server does with it* — no rewrite is warranted, and any plan that produces one has gone wrong.
+**Net: 57/57 preserved, ~4 tests added.** If an implementation of this spec modifies an existing test, that is a signal it has drifted from the design — treat it as a review finding, not a cleanup.
 
 ---
 
 ## 11. Open questions and unverified claims
 
-- **Claude Desktop's `roots` support is unknown** and is not resolved by this spec. Recorded as a manual verification step (§ 8 phase 2 step 1), not an assumption.
-- **`unverified:` Claude Code v2.1.203's release date.** Not present in the fetched `CHANGELOG.md` (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L72`). Needed only if Q4 says a version floor goes in the README.
-- **`unverified:` `anthropics/claude-code#75266`** ("cwd set to `$HOME` for desktop-app-spawned MCP servers") was seen only in search-result titles, never fetched (`:L73`). It is cited in A1 as a reason not to *rely* on inherited `cwd` — a directional signal, not a settled fact. Nothing in the recommended design depends on it.
-- **Issue #57's body was read via `WebFetch` summarisation**, not verbatim through the GitHub API — this planning agent has neither `Bash` nor `mcp__github__*`. The rejected-assumption quote in § 1 comes from the dispatch brief, which quotes the user directly.
-- **Milestone / follow-up issues are not created by this spec** (same tooling limitation). Requests for them are handed back to the router as prose.
+- **`unverified:` whether `CLAUDE_PROJECT_DIR` equals the VS Code workspace folder for a session started inside VS Code.** The single load-bearing empirical unknown. Phase 0 measurement 1 settles it; nothing else in the design is asserted on top of it.
+- **`unverified:` that a Desktop app Code tab session inherits § 2(b)'s `CLAUDE_PROJECT_DIR` behavior.** Inferred from the Code tab being a Claude Code session, not quoted from any source. Phase 0 measurement 3 settles it. Only the Q1 scope answer depends on it, not the design.
+- **`unverified:` `anthropics/claude-code#75266`** (desktop-app-spawned MCP servers getting `cwd` = `$HOME`) was never fetched directly (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L73`). It does not matter here: this design reads an explicit env var and never trusts inherited `cwd`.
+- **Claude Code v2.1.203's release date** — needed only for a roots version floor (`:L72`). Moot under D2.
+- **Issue #57's body** was read via `WebFetch` summarisation; this planning agent has neither `Bash` nor `mcp__github__*`. Both user constraints in § 1 are quoted from the dispatch briefs, which quote the user directly.
+- **No issues or milestones were created** (same tooling limitation). Follow-ups are returned to the router as prose.
+
+---
+
+## 12. What changed in Rev 2, and why
+
+| Rev 1 | Rev 2 | Cause |
+| --- | --- | --- |
+| Layer 0: N configured workspace paths | Single workspace per process, from the session's own environment | C2: a candidate set is an enumeration surface |
+| Layer 1: optional per-call `workspacePath` selector | No tool-schema change at all | C2: disambiguation requires naming other workspaces |
+| Layer 2: MCP `roots`, recommended by the research | Not implemented; ranking reversed with rationale | Roots is a *set* primitive; § 4 |
+| "Registration count, not zero config" reframe | Superseded — zero config per workspace turns out to be achievable | § 2(b): the client already passes the project root in |
+| Process model assumed, flagged as needing verification | Verified from the MCP spec and Claude Code docs | Coordinator required it; it inverted the design |
+| ~4 files of new/changed source, new `workspaces.ts` module | One 1-line source change plus docs | The problem was registration ergonomics, not workspace selection |
+| 21/57 tests untouched | 57/57 untouched | No signature or schema changes |
+
+The generalisable lesson, recorded because it cost a full revision: **verify the runtime's process and environment model before designing a resolution mechanism.** Rev 1 designed an in-process selection algorithm for a choice the client had already made outside the process, and the fix for the "wrong workspace" problem turned out to be reading one environment variable the platform documents and hands you unprompted.
