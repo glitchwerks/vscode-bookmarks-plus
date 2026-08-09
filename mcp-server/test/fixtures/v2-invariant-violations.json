@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "items": [
+    {
+      "id": "item-1",
+      "type": "file",
+      "uri": "file:///workspace/duplicate.ts",
+      "collectionId": "collection-1",
+      "order": 0
+    },
+    {
+      "id": "item-2",
+      "type": "file",
+      "uri": "file:///workspace/duplicate.ts",
+      "collectionId": "collection-1",
+      "order": 5
+    },
+    {
+      "id": "item-3",
+      "type": "file",
+      "uri": "file:///workspace/orphan.ts",
+      "collectionId": "missing-collection",
+      "order": 0
+    }
+  ],
+  "collections": [
+    {
+      "id": "collection-1",
+      "name": "Core",
+      "order": 0
+    }
+  ]
+}

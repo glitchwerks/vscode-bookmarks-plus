@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": "item-1",
+      "type": "file",
+      "uri": "file:///workspace/src/index.ts",
+      "collectionId": "collection-1",
+      "order": 0
+    },
+    {
+      "id": "item-2",
+      "type": "folder",
+      "uri": "file:///workspace/src/utils",
+      "collectionId": null,
+      "order": 0
+    }
+  ],
+  "collections": [
+    {
+      "id": "collection-1",
+      "name": "Core",
+      "order": 0
+    }
+  ]
+}

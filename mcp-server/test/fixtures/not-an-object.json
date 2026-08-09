@@ -1,0 +1,9 @@
+[
+  {
+    "id": "item-1",
+    "type": "file",
+    "uri": "file:///workspace/src/index.ts",
+    "collectionId": null,
+    "order": 0
+  }
+]
