@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -57,6 +60,22 @@ export function createServer(
 
 async function main(): Promise<void> {
   let state: WorkspaceState;
+
+  // TEMPORARY — Phase 0 probe, issue #57. Remove before PR is marked ready.
+  try {
+    fs.appendFileSync(
+      path.join(os.tmpdir(), 'bookmarks-plus-mcp-probe.json'),
+      `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR ?? null,
+        BOOKMARKS_PLUS_WORKSPACE: process.env.BOOKMARKS_PLUS_WORKSPACE ?? null,
+        cwd: process.cwd(),
+      })}\n`,
+    );
+  } catch {
+    // Ignore probe failures so server startup remains unaffected.
+  }
+
   try {
     state = resolveWorkspaceState(process.argv, process.env);
   } catch (error: unknown) {
