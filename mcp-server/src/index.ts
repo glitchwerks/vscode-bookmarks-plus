@@ -1,13 +1,70 @@
 #!/usr/bin/env node
-// Placeholder entry point for `bookmarks-plus-mcp` (issue #52).
-//
-// The real stdio server bootstrap and tool registration land in Task 7 of
-// docs/superpowers/plans/2026-08-08-mcp-server-bookmarks.md. This stub exists
-// only so the build produces `dist/index.js` at the package's `bin` target
-// and the two-tsconfig scaffold has a source file to compile against.
-//
-// Global Constraint 1: the server must never write to stdout — it is the
-// JSON-RPC channel. Use stderr (console.error/console.warn) for all
-// logging, here and in every later task.
-console.error('bookmarks-plus-mcp: not yet implemented (see issue #52)');
-process.exitCode = 1;
+import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+
+import { resolveConfig, type Config } from './config.js';
+import { readMirror, writeMirrorAtomic } from './mirrorFile.js';
+import { createAddHandler } from './tools/add.js';
+import { createListHandler } from './tools/list.js';
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export function createServer(config: Config): McpServer {
+  const server = new McpServer({
+    name: 'bookmarks-plus-mcp',
+    version: '0.0.0',
+  });
+
+  const listTool = createListHandler(config, { readMirror });
+  server.registerTool(
+    listTool.name,
+    {
+      description: listTool.description,
+      annotations: listTool.annotations,
+      inputSchema: listTool.inputSchema,
+    },
+    listTool.handler,
+  );
+
+  const addTool = createAddHandler(config, {
+    readMirror,
+    writeMirrorAtomic,
+    sleep,
+    uuid: randomUUID,
+  });
+  server.registerTool(
+    addTool.name,
+    {
+      description: addTool.description,
+      annotations: addTool.annotations,
+      inputSchema: addTool.inputSchema,
+    },
+    addTool.handler,
+  );
+
+  return server;
+}
+
+async function main(): Promise<void> {
+  let config: Config;
+  try {
+    config = resolveConfig(process.argv, process.env);
+  } catch (error: unknown) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+    return;
+  }
+
+  const server = createServer(config);
+  await server.connect(new StdioServerTransport());
+}
+
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  void main();
+}
