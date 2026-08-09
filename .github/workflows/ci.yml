@@ -30,3 +30,15 @@ jobs:
 
       - name: Run tests
         run: xvfb-run -a npm test
+
+      - name: Install mcp-server dependencies
+        working-directory: mcp-server
+        run: npm ci
+
+      - name: Lint mcp-server
+        working-directory: mcp-server
+        run: npm run lint
+
+      - name: Test mcp-server
+        working-directory: mcp-server
+        run: npm test

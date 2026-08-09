@@ -5,5 +5,9 @@ dist/
 .vscode-test/
 .worktrees/
 
+# mcp-server standalone package (own node_modules/dist tree)
+mcp-server/node_modules/
+mcp-server/dist/
+
 # Agent scratch files (per standards/scratch-files.md)
 .tmp/

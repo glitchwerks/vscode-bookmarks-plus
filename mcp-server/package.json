@@ -4,8 +4,25 @@
   "private": true,
   "type": "module",
   "description": "MCP server exposing Bookmarks Plus's workspace bookmarks to Claude Desktop / Claude Code (issue #52).",
+  "bin": {
+    "bookmarks-plus-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json && node scripts/copy-schema.mjs",
+    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node --test \"dist/test/**/*.test.js\"",
+    "lint": "eslint src test --ext ts --no-error-on-unmatched-pattern",
+    "prepublishOnly": "npm run build"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^7.1.0",
+    "@typescript-eslint/parser": "^7.1.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
   }
 }
