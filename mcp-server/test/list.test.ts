@@ -291,6 +291,18 @@ test('the tool registration exposes list_bookmarks as read-only with no required
     idempotentHint: true,
     openWorldHint: false,
   });
+  // C2 regression guard (spec § 3, invariant 2: "No tool accepts a
+  // workspace-selecting argument"). If a future change adds a
+  // workspace-selecting argument to list_bookmarks' input schema, this
+  // assertion will fail with a non-empty key list. Read that failure as
+  // the no-cross-workspace-exposure invariant being violated, not as this
+  // test being stale and needing an update to match the new schema.
+  //
+  // Known blind spot: the guard is nested inside `if (list.inputSchema
+  // !== undefined)`, so it only fires when inputSchema exists but gained
+  // keys. It stays silent if inputSchema were removed from the tool
+  // definition entirely — it does not catch a deleted schema, only an
+  // added argument.
   if (list.inputSchema !== undefined) {
     assert.deepEqual(Object.keys(list.inputSchema), []);
   }

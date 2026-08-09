@@ -157,6 +157,11 @@ export function createAddHandler(
       idempotentHint: false,
       openWorldHint: false,
     } as const,
+    // C2 regression guard: this schema intentionally has NO workspace-selecting field.
+    // add_bookmark is scoped to its own session's workspace by construction — the caller
+    // never tells it which workspace to act on. If a future change adds a workspace
+    // argument here, that is a signal the no-cross-workspace-exposure invariant (spec
+    // § 3, invariant C2) has been violated, not that this schema was stale or incomplete.
     inputSchema: {
       uri: z.string(),
       type: z.enum(['file', 'folder']),
