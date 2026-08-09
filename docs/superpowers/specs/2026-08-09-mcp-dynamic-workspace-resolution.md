@@ -19,7 +19,7 @@ skills_relevant:
 
 **Revision 3.** Rev 1 proposed a multi-path candidate-set design; a second user constraint disqualified it and verification of the MCP process model made the whole apparatus unnecessary. Rev 3 adds a second, extension-owned resolution source proposed by the user (§ 4B) and promotes it above `CLAUDE_PROJECT_DIR`. § 12 records the full history. **Do not implement Rev 1's layered design.**
 
-**Status: NEARLY UNBLOCKED.** One cheap empirical probe (§ 8 Phase 0, now five measurements) and two questions (§ 6) remain. The design is otherwise determined by primary sources rather than by preference.
+**Rev 4 — status: UNBLOCKED.** Both § 6 questions are answered (Q1 as recommended, Q2 against the recommendation — see § 6 and § 4C). The Phase 0 probe (§ 8) is now an implementation task rather than a gate on drafting: no remaining decision depends on its outcome, only the strength of the tier-2/tier-3 ordering rationale does. Task breakdown in § 13. Ready for `project-reviewer`.
 
 ## 0. Citation ground rules
 
@@ -64,11 +64,13 @@ Note the second sentence: the docs explicitly instruct servers to read it from i
 > "| [User](#user-scope) | All your projects | No | `~/.claude.json` |"
 > — https://code.claude.com/docs/en/mcp § "MCP installation scopes" (fetched 2026-08-09)
 
-### What (a)+(b)+(c) mean together
+### What (a)+(b) mean together
 
 **This is not a "pick the right workspace from N options" problem. It is a "make one already-correctly-scoped instance easier to register" problem.**
 
-One user-scoped registration entry, with **no workspace path in it at all**, spawns a separate server subprocess for every Claude Code session, each with `CLAUDE_PROJECT_DIR` already set to that session's project root. C1 is satisfied (one entry, forever). C2 is satisfied **structurally** — the process is never told about any other workspace, so there is nothing to leak, no policy to enforce, and no code path to get wrong.
+A registration entry with **no workspace path in it at all** spawns a separate server subprocess for every Claude Code session, each already carrying that session's project root in its environment. C2 is satisfied **structurally** — the process is never told about any other workspace, so there is nothing to leak, no policy to enforce, and no code path to get wrong.
+
+**C1 is satisfied by the entry being path-free, not by there being only one of them.** This distinction is what lets the user's Q2 answer (project scope, § 4C) coexist with C1 — fact (c) above records that user scope *could* have made it literally one entry, but that is not the property C1 actually required. What the user rejected was maintaining a *bespoke, path-bearing* entry per workspace. A byte-identical, path-free entry copied into each project is a different thing: nothing to look up, nothing to keep in sync, nothing that breaks when a folder moves.
 
 The context-flooding risk in the current shipped design was never actually present either: it would only have appeared if we had adopted Rev 1's candidate-set model. The real defect in the shipped design is narrower than it looked — it is **registration ergonomics only**: `resolveConfig` *requires* an explicit path (`mcp-server/src/config.ts:L13-L17`), so the user must add a config entry naming each workspace, even though the client already handed the process the answer in its environment.
 
@@ -96,14 +98,16 @@ Source 2 is inert until the extension ships its half (§ 4B.5): the server reads
 
 Everything downstream is unchanged: `path.resolve`, `mirrorPath = <workspace>/.vscode/bookmarks.json`, `verifyDelayMs` (`mcp-server/src/config.ts:L19-L31`). `Config`'s shape does not change. `createServer` does not change. Neither tool's `inputSchema` changes. Resolution stays **once, at process start** — which under § 2(a) is once per session.
 
-Registration becomes, for every workspace on the machine, one entry:
+Registration becomes a byte-identical, path-free entry — committed to `.mcp.json` in each project that wants it (§ 4C):
 
 ```json
 { "mcpServers": { "bookmarks-plus": {
   "command": "node",
-  "args": ["C:/path/to/vscode-bookmarks-plus/mcp-server/dist/index.js"]
+  "args": ["${BOOKMARKS_PLUS_MCP:-C:/path/to/vscode-bookmarks-plus/mcp-server/dist}/index.js"]
 } } }
 ```
+
+No workspace path appears anywhere in it. The only machine-specific value is where the server itself was built, which § 4C.2 handles.
 
 ### The C2 guarantee, stated as invariants the implementation must hold
 
@@ -201,7 +205,7 @@ It does expand the *file* scope: activation logic and `package.json` in the exte
 **Recommendation: split.**
 
 - **#57 (this spec):** `mcp-server` reads `BOOKMARKS_PLUS_WORKSPACE` at its documented precedence. Inert until the extension sets it. Still a sub-10-line change, still 57/57 tests preserved.
-- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in 4B.7; extension-side tests.
+- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in 4B.7, importing or mirroring `MIRROR_DISABLED_SENTINEL` from `mcp-server/src/config.ts` with a pointer back to it (§ 13 Task 3 — the two halves' agreement on that string is not testable from `mcp-server/` alone, so it must be tested here); extension-side tests.
 
 ### 4B.7 Multi-root: the extension must set a sentinel, not stay silent
 
@@ -236,6 +240,37 @@ Splitting keeps #57 shippable today, lets the extension change land on its own s
 - **VS Code terminal opened in the pre-activation gap:** tier 2 absent, tier 3 wins. Safe — this is the D6 fail-open property.
 
 Every tier's absence degrades to a *correct* source rather than a wrong one. The only ordering that breaks this is a persistent (cached) tier 2, which D6 removes.
+
+---
+
+## 4C. Registration scope: project, per the user (Rev 4)
+
+User's answer, verbatim: *"Should be project scoped since it may only be opened in certain projects."* This **overrides** the Rev 2/3 recommendation of user scope. It is a registration and documentation decision only — it changes nothing in the resolution chain, the precedence order, `persistent = false`, or the sentinel contract.
+
+The reasoning is sound and worth recording rather than merely complying with: user scope makes the server available in *every* project on the machine, including the majority that have no bookmarks. Opt-in beats opt-out for a feature that is only sometimes wanted.
+
+### 4C.1 Does project scope reintroduce C1?
+
+**No — and the reason is the § 2 distinction, not a technicality.** What C1 rejected was *"an mcp per workspace"* where each entry hardcoded that workspace's absolute path, so every new project meant looking up a path and writing a bespoke entry. Under this design the entry is **byte-identical everywhere and contains no workspace path**. Adding a project is a file copy (or `claude mcp add --scope project`), and it can be committed so anyone who clones the repo gets it automatically. The maintenance burden C1 objected to — per-workspace values to author and keep correct — is gone regardless of scope.
+
+The honest residual cost: the user still performs a per-project action once. That is real friction and it is the price of opt-in. It is not the friction C1 named.
+
+### 4C.2 The committed-`.mcp.json` wrinkle, and its fix
+
+`.mcp.json` is designed to be committed and shared, but our entry needs an absolute path to a locally-built `mcp-server/dist/index.js`, which differs per machine. Documented solution:
+
+> "Claude Code supports environment variable expansion in `.mcp.json` files, allowing teams to share configurations while maintaining flexibility for machine-specific paths… `${VAR:-default}`: expands to `VAR` if set, otherwise uses `default`… Environment variables can be expanded in: `command`… `args`"
+> — https://code.claude.com/docs/en/mcp § "Environment variable expansion in `.mcp.json`" (fetched 2026-08-09)
+
+So § 3's entry stays portable: each developer sets `BOOKMARKS_PLUS_MCP` once per machine, and the `:-default` keeps the file loadable without it. If a missing variable has no default, "the config still loads: Claude Code reports a missing-variable warning for that server in `claude mcp list`" (same page) — a legible failure, not a silent one.
+
+The README should offer both paths: commit `.mcp.json` with expansion (team/multi-machine), or `claude mcp add --scope project` for a quick local-only entry.
+
+### 4C.3 Two consequences of project scope the README must state
+
+**Approval prompt.** "For security reasons, Claude Code prompts for approval in interactive sessions before using project-scoped servers from `.mcp.json` files. To reset those approval choices, run `claude mcp reset-project-choices`" (https://code.claude.com/docs/en/mcp § Project scope, fetched 2026-08-09). First use in each project requires an approval click. User-scope entries would not have. Worth one line so it does not read as a bug.
+
+**Do not define the same server name at both scopes.** Q1 puts the Desktop **Code tab** in the target set, and there the precedence inverts: "When the top level of `~/.claude.json` (user scope) and `.mcp.json` define the same stdio server name, the Code tab uses the `~/.claude.json` definition, departing from the CLI [scope hierarchy]" (https://code.claude.com/docs/en/desktop § "MCP servers from the Claude Desktop chat app", fetched 2026-08-09). A user who experiments with user scope, then switches to project scope without removing the old entry, gets **different servers in the CLI and the Code tab** — a genuinely confusing failure. README should say: pick one scope, and remove the other entry if you switch.
 
 ---
 
@@ -275,15 +310,13 @@ Known tradeoff, documented rather than solved: in a VS Code terminal where the u
 
 ---
 
-## 6. Remaining questions
+## 6. Questions — both resolved (Rev 4)
 
-**Q1. Is Claude Desktop's *chat* surface still a target, or is "Claude Code in VS Code" the whole target?** Your C2 wording — *"the claude session open in vscode"* — reads as the latter, and there is a structural reason to accept it: the Desktop chat app has no per-session project concept at all, so per-session scoping is impossible there **by construction**, not by missing support. Verified as far as the docs go: Desktop loads `claude_desktop_config.json` servers "into local Code tab sessions" and the same server "is available in both the Desktop chat surface and local Code tab sessions" (https://code.claude.com/docs/en/desktop § "MCP servers from the Claude Desktop chat app", fetched 2026-08-09) — the *Code tab* is a Claude Code session and therefore gets § 2(b) for free; the *chat* surface has no documented project root or roots support either way.
+**Q1 — target clients. ANSWERED, as recommended.** Verbatim: *"Yes, vscode launched is whole target."* VS Code-launched Claude Code — Code tab and integrated-terminal CLI sessions — is the whole target. **The Desktop chat surface is a documented limitation, not a gap to close**, since it has no per-session project concept by construction. This retires the unresolved Claude Desktop roots question at `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L61` permanently.
 
-One caveat on that reasoning: "a Code tab session is a Claude Code session and therefore gets § 2(b) for free" is an **inference**, not a quotation — everything else in § 2 is quoted. Phase 0 measurement 3 tests it directly rather than leaving it asserted.
+**Q2 — registration scope. ANSWERED, against the recommendation: project scope.** Verbatim: *"Should be project scoped since it may only be opened in certain projects."* Fully treated in § 4C. No technical design change.
 
-Recommended answer, pending yours: **Code-tab and CLI sessions are the target; the Desktop chat surface is supported only via the explicit `args` path (D1), which inherently means one workspace per entry there.** Documented as a limitation, not solved. This retires the unresolved research gap at `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L61` — Desktop chat's roots support stops mattering, because roots is not being implemented (D2) and Desktop chat has no session-workspace to scope to regardless.
-
-**Q2. Should the README recommend user scope for the registration?** User scope is what makes one entry cover every project (§ 2(c)). It also means the server is offered in *every* project, including ones with no bookmarks — harmless (empty list, cheap) but worth your call versus per-project `.mcp.json` entries that are committed and shared with a team.
+Supporting detail for Q1, retained because the README's limitation wording depends on it: Desktop loads `claude_desktop_config.json` servers "into local Code tab sessions," and such a server "is available in both the Desktop chat surface and local Code tab sessions" (https://code.claude.com/docs/en/desktop § "MCP servers from the Claude Desktop chat app", fetched 2026-08-09). The **Code tab** is a Claude Code session and so is expected to inherit § 2(b) — an **inference**, not a quotation, and the only one in the design; Phase 0 measurement 3 tests it directly. The **chat** surface has no documented project root or roots support either way, and needs none: it is now explicitly out of target.
 
 ---
 
@@ -328,7 +361,7 @@ Rev 3 lowers the stakes on measurement 1: under Rev 2 a wrong answer broke the d
 1. `mcp-server/src/config.ts`: insert `env.BOOKMARKS_PLUS_WORKSPACE` then `env.CLAUDE_PROJECT_DIR` between the positional and the legacy env var (`:L13`), per § 3's order. Signature, return type, and all downstream derivation unchanged.
 2. Update the startup error text (`:L16`) to name all four sources, and to say that the VS Code extension and Claude Code supply tiers 2 and 3 automatically.
 3. `mcp-server/test/config.test.ts`: **add** tests — each tier used when the ones above it are absent; the `args` positional outranks all; `BOOKMARKS_PLUS_WORKSPACE` outranks `CLAUDE_PROJECT_DIR` (D5 guard); **`CLAUDE_PROJECT_DIR` outranks `BOOKMARKS_MCP_WORKSPACE`** (the D1 guard — the test that would catch a well-meaning future reorder reintroducing the shell-inheritance hole); relative values resolved to absolute; still throws when all four are absent. Change no existing test (§ 10).
-4. `README.md`: rewrite the MCP section (R3) around one user-scoped entry with no path, plus an "explicit path" subsection covering the `args` override, the Desktop-chat limitation (Q1), and a warning that a shell-exported `BOOKMARKS_MCP_WORKSPACE` pins every otherwise-unresolved session (D1).
+4. `README.md`: rewrite the MCP section (R3) around a **project-scoped, path-free** entry (§ 4C), covering: the `${VAR:-default}` expansion for the build path (§ 4C.2), the first-use approval prompt (§ 4C.3), the do-not-define-at-both-scopes warning (§ 4C.3), the `args` explicit override, the Desktop-chat limitation (Q1), and a warning that a shell-exported `BOOKMARKS_MCP_WORKSPACE` pins every otherwise-unresolved session (D1). Drop all "one entry covers every project" framing.
 5. `CHANGELOG.md`: note that the workspace path is now optional under Claude Code.
 
 Test-first per the repo standard: the four new `config.test.ts` cases before the `config.ts` edit.
@@ -387,7 +420,72 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 
 ---
 
+## 13. Task breakdown
+
+> **For agentic workers:** REQUIRED SUB-SKILL — use `superpowers:subagent-driven-development` or `superpowers:executing-plans` to work this task-by-task. Test-first throughout: within each task, the test step precedes the source step.
+
+All paths are relative to the repo root on the implementation branch. `mcp-server`'s verification command is `npm test` from `mcp-server/`, which runs `tsc && node scripts/copy-schema.mjs && node --test dist/test` (the sequence `mcp-server/test/schemaDrift.test.ts:L49-L57` documents and depends on). Baseline before any change: **57 passing.**
+
+### Task 0 — Land the artifacts on the branch
+
+- [ ] Copy `docs/superpowers/specs/2026-08-09-mcp-dynamic-workspace-resolution.md` and `docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md` from the `main` working tree onto the implementation branch and commit them (§ 0). Without this, every `docs/research/…:LN` citation in this spec dangles.
+- [ ] Confirm `npm test` in `mcp-server/` is green at 57 before touching anything. A redesign that starts from an unverified baseline cannot prove it preserved one.
+
+### Task 1 — Phase 0 probe (evidence, not a gate)
+
+- [ ] Add a temporary probe in `mcp-server/src/index.ts` `main()` that appends `process.env.CLAUDE_PROJECT_DIR`, `process.env.BOOKMARKS_PLUS_WORKSPACE`, and `process.cwd()` to a file under `os.tmpdir()`. **Place it above the `resolveConfig` call** (`:L52-L59`) — after it, the throw prevents it from ever running. **Write to a file, not stderr** (§ 8).
+- [ ] Register the server project-scoped with no workspace in `args`; take measurements 1-5 from § 8 (VS Code integrated terminal; plain terminal; Desktop Code tab; Claude Code VS Code panel; VS Code terminal `cd`'d into a subdirectory).
+- [ ] Record all results in the PR body. Measurement 5 is the evidence for D5; measurement 4 tells the follow-up issue whether injection reaches the panel.
+- [ ] Remove the probe before the PR is marked ready.
+
+### Task 2 — `resolveConfig` precedence (the whole server-side change)
+
+- [ ] `mcp-server/test/config.test.ts`: **add** cases (change no existing case) — `BOOKMARKS_PLUS_WORKSPACE` used when `argv[2]` is absent; `argv[2]` outranks it; **`BOOKMARKS_PLUS_WORKSPACE` outranks `CLAUDE_PROJECT_DIR`** (D5 guard); **`CLAUDE_PROJECT_DIR` outranks `BOOKMARKS_MCP_WORKSPACE`** (D1 guard — the shell-inheritance hole); relative values in both new sources resolved to absolute; still throws when all four are absent.
+- [ ] Run `npm test`; confirm the new cases fail for the right reason and all 57 originals still pass.
+- [ ] `mcp-server/src/config.ts:L13`: insert the two new sources in § 3's order. Do not change the signature, the return type, or `Config`'s shape.
+- [ ] `mcp-server/src/config.ts:L16`: update the error text to name all four sources.
+- [ ] `npm test` green: 57 + new.
+
+### Task 3 — The multi-root sentinel (§ 4B.7)
+
+- [ ] `mcp-server/test/config.test.ts`: add a case asserting the reserved sentinel value produces a **named, distinguishable error** rather than being treated as a path.
+- [ ] Define the sentinel as an **exported constant** in `mcp-server/src/config.ts` — e.g. `export const MIRROR_DISABLED_SENTINEL = 'disabled:multi-root';` — not an inline string literal. This is the point of the task: the sentinel is a cross-component contract, and only one half of it lives in this repo's `mcp-server/`. A named export makes a rename a compile-visible change on at least one side; a bare literal makes it a comment nobody greps.
+- [ ] Implement the sentinel check in `resolveConfig`. Error text must name the reason ("the Bookmarks Plus mirror is disabled in this VS Code window: multi-root workspaces are not supported yet"), matching `src/bookmarkMirror.ts:L32`'s wording.
+- [ ] Add a comment at the constant recording that the extension half must produce this exact value, and naming the follow-up issue.
+- [ ] **Note the deliberate asymmetry:** until the extension half ships, this check guards a value nothing produces. That is intended (§ 3, "inert until the extension ships its half") — but it means the two halves' agreement on the string is **not** covered by any test in this repo. The follow-up issue's scope must include importing or mirroring `MIRROR_DISABLED_SENTINEL` with a pointer back to it, and that is where the agreement gets tested.
+
+### Task 4 — C2 regression guard
+
+- [ ] Add a comment at `mcp-server/test/list.test.ts:L279-L281` explaining that the empty-`inputSchema` assertion is a **C2 guard**: if a future change adds a workspace argument to `list_bookmarks`, this failing test means the no-cross-workspace-exposure invariant (§ 3, invariant 2) was violated, not that the test is stale.
+- [ ] Same for `add_bookmark`'s five-field schema at `mcp-server/src/tools/add.ts:L156-L162`.
+
+### Task 5 — Documentation
+
+- [ ] `README.md:L50-L127`: rewrite per Phase 1 step 4 — project-scoped path-free entry, `${VAR:-default}` build path, approval prompt, both-scopes warning, `args` override, Desktop-chat limitation, `BOOKMARKS_MCP_WORKSPACE` shell-export warning.
+- [ ] `CHANGELOG.md`: the workspace path is now optional under VS Code-launched Claude Code.
+- [ ] Verify no remaining text in either file describes the one-registration-per-workspace model.
+
+### Task 6 — Close out
+
+- [ ] `npm test` green; `npm run lint`; `npm run build`.
+- [ ] Confirm **no existing test was modified** (`git diff mcp-server/test/` should show additions and comments only). A modified existing test is a signal the implementation drifted from § 10 — treat it as a review finding.
+- [ ] PR body: `Closes #57`, the Task 1 measurements, and a line stating the follow-up extension issue is not blocked by this PR.
+
+### Not in this issue
+
+The extension half (§ 4B.5/4B.7 — the follow-up issue), MCP `roots` (D2), any multi-workspace capability, any tool-schema change.
+
+---
+
 ## 12. Revision history
+
+### Rev 4 — registration scope
+
+Q1 answered as recommended; Q2 answered **against** the recommendation (project scope, not user scope). Purely a registration/documentation change — the resolution chain, precedence, `persistent = false`, and the sentinel contract are all untouched. New material: § 4C (including the C1 re-check, the `${VAR:-default}` portability fix, the approval prompt, and the both-scopes precedence-inversion warning), § 13's task breakdown, and § 2's reworked C1 reasoning.
+
+The lesson worth keeping: **when a user overrides a recommendation, re-check the constraint the recommendation was serving rather than just complying.** User scope had been justified partly as "C1 satisfied — one entry forever." Project scope means N entries, which *looks* like the rejected state. Re-reading C1 showed the objection was to bespoke *path-bearing* entries, not to entry count — so the property that mattered survives, and it survives because of a different design choice (the path-free entry) than the one being overridden.
+
+
 
 ### Rev 3 — the extension-injected variable
 
