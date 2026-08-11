@@ -277,6 +277,26 @@ test('a v3 file returns the upgrade-the-server error', async () => {
   assert.match(message, /mcp[- ]?server/i);
 });
 
+test('a readMirror rejection (e.g. EACCES) resolves as a tool error instead of rejecting the handler\'s promise (CodeRabbit regression: list.ts:38 -- readMirror\'s await has no error boundary)', async () => {
+  const { workspacePath, mirrorPath } = await makeWorkspace();
+  const config = makeConfig(workspacePath, mirrorPath);
+  const permissionError = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+  const failingReadMirror = async (): Promise<string | undefined> => {
+    throw permissionError;
+  };
+  const list = createListHandler(config, { readMirror: failingReadMirror });
+
+  await assert.doesNotReject(
+    () => list.handler({}),
+    'a non-ENOENT readMirror failure must resolve as a CallToolResult, not reject the returned promise',
+  );
+
+  const result = await list.handler({});
+  assert.equal(result.isError, true);
+  const message = extractMessage(result);
+  assert.ok(message.length > 0, 'a read failure must still surface a legible tool error message');
+});
+
 test('the tool registration exposes list_bookmarks as read-only with no required input', async () => {
   const { workspacePath, mirrorPath } = await makeWorkspace();
   const config = makeConfig(workspacePath, mirrorPath);

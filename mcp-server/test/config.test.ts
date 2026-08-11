@@ -140,6 +140,22 @@ test('resolveConfig prefers CLAUDE_PROJECT_DIR over BOOKMARKS_MCP_WORKSPACE (D1 
   assert.equal(config.workspacePath, path.resolve('from-claude-project-dir'));
 });
 
+test('resolveConfig falls through to the next-lower tier when a higher-precedence tier is an empty string, rather than resolving to the server process\'s own cwd (CodeRabbit regression: config.ts:33 -- the "??" tier chain only skips undefined, not "")', () => {
+  // BOOKMARKS_PLUS_WORKSPACE="" (or an equivalent empty-string tier) must be
+  // treated the same as an absent tier and skipped in favor of the next
+  // lower-precedence tier. The bug: `??` only guards against `undefined`, so
+  // an empty string passes the guard, path.resolve('') then returns
+  // process.cwd(), and the mirror path silently becomes
+  // "<server cwd>/.vscode/bookmarks.json" instead of falling through to
+  // CLAUDE_PROJECT_DIR here.
+  const config = resolveConfig(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: '',
+    CLAUDE_PROJECT_DIR: 'from-claude-project-dir',
+  });
+
+  assert.equal(config.workspacePath, path.resolve('from-claude-project-dir'));
+});
+
 test('resolveConfig resolves a relative BOOKMARKS_PLUS_WORKSPACE path to an absolute workspacePath', () => {
   const config = resolveConfig(argvWith(), {
     BOOKMARKS_PLUS_WORKSPACE: 'relative/from-plus-workspace',
@@ -248,4 +264,17 @@ test('resolveWorkspaceState treats an unrecognized disabled:<slug> as a disabled
     assert.equal(typeof state.reason, 'string');
     assert.ok(state.reason.length > 0, 'an unknown slug must still carry a legible generic reason');
   }
+});
+
+test('resolveWorkspaceState treats a disabled sentinel on BOOKMARKS_PLUS_WORKSPACE as disabled even when a real, valid CLAUDE_PROJECT_DIR is also present -- the isolation invariant: a disabled sentinel must win over any lower-precedence tier fallback', () => {
+  // No existing test combines sentinel recognition with tier precedence:
+  // nothing asserts that a disabled:<slug> sentinel on the higher-precedence
+  // BOOKMARKS_PLUS_WORKSPACE tier is not silently bypassed in favor of a
+  // real, resolvable path sitting on a lower-precedence tier.
+  const state = resolveWorkspaceState(argvWith(), {
+    BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}no-folder`,
+    CLAUDE_PROJECT_DIR: 'a-real-lower-tier-workspace',
+  });
+
+  assert.equal(state.kind, 'disabled');
 });

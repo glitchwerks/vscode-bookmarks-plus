@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
@@ -12,13 +14,30 @@ import { createListHandler } from './tools/list.js';
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function readPackageVersion(): string {
+  let directory = path.dirname(fileURLToPath(import.meta.url));
+
+  for (let depth = 0; depth < 5; depth += 1) {
+    const packageJsonPath = path.join(directory, 'package.json');
+    if (existsSync(packageJsonPath)) {
+      const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
+        version: string;
+      };
+      return packageJson.version;
+    }
+    directory = path.dirname(directory);
+  }
+
+  throw new Error('Unable to locate mcp-server/package.json.');
+}
+
 export function createServer(
   config: Config | undefined,
   options?: { disabledReason?: string },
 ): McpServer {
   const server = new McpServer({
     name: 'bookmarks-plus-mcp',
-    version: '0.0.0',
+    version: readPackageVersion(),
   });
 
   const listTool = createListHandler(config, {
@@ -74,7 +93,7 @@ async function main(): Promise<void> {
 
 if (
   process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
 ) {
   void main();
 }

@@ -268,13 +268,41 @@ test('unknown fields on untouched items survive the write', async () => {
   assert.equal(coloredItem?.color, 'red', 'an unknown field on an untouched item must survive');
 });
 
-test('a new item gets order = the count of existing siblings', async () => {
-  // Deliberately built so only the siblingCount formula survives:
-  // siblingCount for 'target-collection' = 2 (orders 0 and 5, gaps allowed
-  // since parseMirror does not enforce contiguity); max(order)+1 would give
-  // 6; counting every item regardless of collection would give 4. Two
-  // decoy items belong to a different collection to make those formulas
-  // diverge from siblingCount.
+test("a document-level unknown field is stripped from the written mirror, unlike per-item unknown fields (CodeRabbit regression: contract.ts:124 -- toCanonicalV2 only sets `version`, it does not strip fields outside the strict v2 schema)", async () => {
+  // v2-unknown-fields.json carries a top-level "generator" field alongside
+  // v2's known top-level keys. The read path is deliberately tolerant of it
+  // (contract.test.ts / the "unknown fields on untouched items survive the
+  // write" test just below assert the same tolerance for per-ITEM unknown
+  // fields), but the WRITE path is schema-strict (schemaDrift.test.ts
+  // enforces additionalProperties: false on the full document) -- so
+  // toCanonicalV2 (or whatever calls it before serialize()) must strip a
+  // document-level unknown field before writing, not carry it through.
+  const { workspacePath, mirrorPath } = await makeWorkspace();
+  await seedMirror(mirrorPath, 'v2-unknown-fields.json');
+  const config = makeConfig(workspacePath, mirrorPath);
+  const { sleep } = fastSleep();
+  const add = createAddHandler(config, { readMirror, writeMirrorAtomic, sleep, uuid: randomUUID });
+
+  const result = await add.handler({ uri: 'file:///workspace/strip-check.ts', type: 'file' });
+
+  assert.notEqual(result.isError, true, extractMessage(result));
+  const raw = await fs.readFile(mirrorPath, 'utf8');
+  const written = JSON.parse(raw) as Record<string, unknown>;
+
+  assert.equal(
+    Object.hasOwn(written, 'generator'),
+    false,
+    'a document-level unknown field must be stripped by the write path to satisfy the strict v2 schema',
+  );
+});
+
+test('a new item gets order = max(existing sibling orders) + 1 (CodeRabbit regression: add.ts:130 -- previously order = the count of existing siblings, which left a gapped/non-contiguous collection out of sort order)', async () => {
+  // Deliberately built so only the max(order)+1 formula survives:
+  // max(order)+1 for 'target-collection' = 6 (existing sibling orders 0 and
+  // 5, gaps allowed since parseMirror does not enforce contiguity);
+  // siblingCount would give 2; counting every item regardless of collection
+  // would give 4. Two decoy items belong to a different collection so those
+  // other formulas remain distinguishable from max(order)+1 here.
   const { workspacePath, mirrorPath } = await makeWorkspace();
   await seedMirrorContent(mirrorPath, {
     version: 2,
@@ -323,7 +351,11 @@ test('a new item gets order = the count of existing siblings', async () => {
   assert.notEqual(result.isError, true, extractMessage(result));
   const after = await readMirrorJson(mirrorPath);
   const newItem = after.items.find((item) => item.uri === 'file:///workspace/new.ts');
-  assert.equal(newItem?.order, 2);
+  assert.equal(
+    newItem?.order,
+    6,
+    'order must normalize to max(existing sibling orders) + 1, so the new item sorts last',
+  );
 });
 
 test('an exact duplicate (uri, collectionId) is rejected without writing', async () => {
@@ -634,6 +666,68 @@ test('verifyDelayMs = 0 skips verification entirely', async () => {
     writeCalls.length,
     1,
     'verifyDelayMs = 0 must succeed after a single write, with no retry cycle',
+  );
+});
+
+test('a retry whose duplicate-check fires only because attempt 1\'s own write is now visible is reported as success, not a false "already exists" error (CodeRabbit regression: add.ts:198)', async () => {
+  // Attempt 1 writes the item successfully, but its post-write verification
+  // re-read races a concurrent external rewrite of the mirror and observes
+  // survived === false, triggering a retry. Attempt 2 then re-reads the
+  // mirror to build its own write and, because attempt 1's item is
+  // genuinely already on disk by then, the pre-write duplicate check
+  // (add.ts:115-122) fires on the very item attempt 1 already wrote. The
+  // current code reports that as an "already exists" error even though the
+  // original write succeeded; the confirmed fix treats this specific case
+  // (retry's duplicate-check firing on attempt 1's own item) as verified
+  // success.
+  const { workspacePath, mirrorPath } = await makeWorkspace();
+  const config = makeConfig(workspacePath, mirrorPath, { verifyDelayMs: 400 });
+  const { sleep } = fastSleep();
+
+  const preContent = JSON.stringify({ version: 2, items: [], collections: [] });
+  const postContent = JSON.stringify({
+    version: 2,
+    items: [
+      {
+        id: 'fixed-uuid',
+        type: 'file',
+        uri: 'file:///workspace/raced-duplicate.ts',
+        collectionId: null,
+        order: 0,
+      },
+    ],
+    collections: [],
+  });
+
+  let readCount = 0;
+  const fakeReadMirror = async (): Promise<string | undefined> => {
+    readCount += 1;
+    // 1st read: the handler's initial read, before attempt 1's write.
+    // 2nd read: attempt 1's post-write verification read -- races a
+    //   concurrent external rewrite and observes the pre-write state, i.e.
+    //   survived === false, which is what triggers the retry.
+    // 3rd+ read: attempt 2's own fresh read, by which point attempt 1's
+    //   write is genuinely visible on disk.
+    return readCount <= 2 ? preContent : postContent;
+  };
+  const fakeWriteMirrorAtomic = async (_path: string, _content: string): Promise<void> => {
+    // No-op: the fake readMirror sequence above is what drives the race,
+    // not the write itself, so nothing needs to be recorded here.
+  };
+
+  const add = createAddHandler(config, {
+    readMirror: fakeReadMirror,
+    writeMirrorAtomic: fakeWriteMirrorAtomic,
+    sleep,
+    uuid: () => 'fixed-uuid',
+  });
+
+  const result = await add.handler({ uri: 'file:///workspace/raced-duplicate.ts', type: 'file' });
+
+  assert.notEqual(
+    result.isError,
+    true,
+    `expected the race to be recognized as a verified success, got error: ${extractMessage(result)}`,
   );
 });
 

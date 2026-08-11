@@ -34,7 +34,20 @@ export function createListHandler(
         };
       }
 
-      const raw = await deps.readMirror(config.mirrorPath);
+      let raw: string | undefined;
+      try {
+        raw = await deps.readMirror(config.mirrorPath);
+      } catch (error: unknown) {
+        // readMirror already swallows ENOENT (returning undefined); any
+        // rejection that reaches here is a real I/O failure (e.g. EACCES,
+        // EISDIR). Surface it as a normal tool error instead of letting it
+        // reject the handler's promise.
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Failed to read the bookmarks mirror file: ${detail}` }],
+        };
+      }
       const result = parseMirror(raw);
 
       if (result.kind === 'error') {

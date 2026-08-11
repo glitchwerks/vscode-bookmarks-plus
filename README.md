@@ -58,7 +58,7 @@ connection to the extension and works whether or not VS Code is running.
 
 From the repo root:
 
-```
+```sh
 cd mcp-server
 npm ci && npm run build
 ```

@@ -67,7 +67,7 @@ Note the second sentence: the docs explicitly instruct servers to read it from i
 
 **(c) A user-scoped registration loads in every project.**
 
-> "| [User](#user-scope) | All your projects | No | `~/.claude.json` |"
+> "| [User](https://code.claude.com/docs/en/mcp#user-scope) | All your projects | No | `~/.claude.json` |"
 > — https://code.claude.com/docs/en/mcp § "MCP installation scopes" (fetched 2026-08-09)
 
 ### What (a)+(b) mean together
@@ -456,7 +456,7 @@ Build, register the server with no `args` path, then take **five** measurements 
 
 Test-first per the repo standard: the four new `config.test.ts` cases before the `config.ts` edit.
 
-**Follow-up issue — the extension half (§ 4B.5).** For the router to file; this agent cannot create issues. Scope: `context.environmentVariableCollection.replace('BOOKMARKS_PLUS_WORKSPACE', <workspace root>)` with `persistent = false` (D6) and a user-visible `description`; add `onStartupFinished` to `package.json:L15`'s empty `activationEvents` (§ 4B.3); decline to set the variable at all in a multi-root workspace (R4); extension-side tests. Blocked on nothing in #57 — the two halves meet only at the variable name.
+**Follow-up issue — the extension half (§ 4B.5).** For the router to file; this agent cannot create issues. Scope: `context.environmentVariableCollection.replace('BOOKMARKS_PLUS_WORKSPACE', <workspace root>)` with `persistent = false` (D6) and a user-visible `description`; add `onStartupFinished` to `package.json:L15`'s empty `activationEvents` (§ 4B.3); per the § 4B.7 sentinel contract, set the variable to `disabled:multi-root` when a multi-root window is open and `disabled:no-folder` when no workspace folder is open, rather than declining to set it at all (R4); extension-side tests. Blocked on nothing in #57 — the two halves meet only at the variable name.
 
 **Not in this issue:** roots (D2), the extension half (above), any multi-workspace capability, any tool-schema change.
 

@@ -14,15 +14,24 @@ export type WorkspaceState =
   | { kind: 'ok'; config: Config }
   | { kind: 'disabled'; reason: string };
 
+/**
+ * Treats an empty-string tier value the same as an absent (`undefined`)
+ * tier value, so a tier explicitly set to `""` falls through to the next
+ * lower-precedence tier instead of resolving to the process's own cwd.
+ */
+function nonEmpty(value: string | undefined): string | undefined {
+  return value === undefined || value === '' ? undefined : value;
+}
+
 export function resolveConfig(
   argv: string[],
   env: Record<string, string | undefined>,
 ): Config {
   const workspace =
-    argv[2] ??
-    env.BOOKMARKS_PLUS_WORKSPACE ??
-    env.CLAUDE_PROJECT_DIR ??
-    env.BOOKMARKS_MCP_WORKSPACE;
+    nonEmpty(argv[2]) ??
+    nonEmpty(env.BOOKMARKS_PLUS_WORKSPACE) ??
+    nonEmpty(env.CLAUDE_PROJECT_DIR) ??
+    nonEmpty(env.BOOKMARKS_MCP_WORKSPACE);
 
   if (workspace === undefined) {
     throw new Error(
@@ -60,17 +69,21 @@ export function resolveWorkspaceState(
     if (slug === MULTI_ROOT_REASON_SLUG) {
       return {
         kind: 'disabled',
-        reason: 'multi-root workspaces are not supported by the bookmarks mirror yet',
+        reason: 'Multi-root workspaces are not yet supported by the Bookmarks Plus mirror.',
       };
     }
 
     if (slug === NO_FOLDER_REASON_SLUG) {
-      return { kind: 'disabled', reason: 'no workspace folder is open' };
+      return {
+        kind: 'disabled',
+        reason: 'No workspace folder is open in this VS Code window.',
+      };
     }
 
     return {
       kind: 'disabled',
-      reason: 'The Bookmarks Plus mirror is unavailable in this VS Code window.',
+      reason:
+        'The Bookmarks Plus mirror is unavailable because this VS Code window reported an unrecognized disabled state.',
     };
   }
 

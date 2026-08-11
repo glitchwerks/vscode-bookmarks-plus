@@ -45,7 +45,7 @@ Every claim that depends on actual runtime behavior has already been re-anchored
 
 ## Architecture
 
-```
+```text
   Claude Desktop / Claude Code
             │  stdio (JSON-RPC 2.0)
             ▼
@@ -155,7 +155,7 @@ The research found no prior art for this race — the first-party `memory` serve
 
 **The concrete race, traced against the extension's actual mechanism** — write debounce `DEFAULT_MIRROR_WRITE_DELAY_MS = 250` (`src/bookmarkStore.ts:21`), watcher debounce `WATCHER_DEBOUNCE_MS = 150` (`src/extension.ts:26`, applied at `:112-114`), hash recorded after a successful write (`src/bookmarkStore.ts:364`), echo suppression comparing that hash on both read paths (`src/bookmarkStore.ts:308` in `syncWithMirror`, `:336` in `reloadFromMirror`):
 
-```
+```text
 t=0     user adds bookmark B in VS Code → persist() → mirror write scheduled for t≈250
 t=100   MCP server writes the file: {A, M}
 t≈100   extension's watcher fires → reload scheduled for t≈250
@@ -232,7 +232,7 @@ Every task inherits these.
 
 ## File Structure
 
-```
+```text
 mcp-server/
   package.json              NEW  type: module, bin, own deps, own scripts
   package-lock.json         NEW

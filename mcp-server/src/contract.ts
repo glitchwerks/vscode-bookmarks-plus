@@ -120,7 +120,18 @@ export function parseMirror(raw: string | undefined): ParseResult {
 }
 
 export function toCanonicalV2(data: BookmarkData): BookmarkData {
-  return { ...data, version: MAX_SUPPORTED_VERSION };
+  // Only the strict v2 document shape (version, items, collections) is kept.
+  // Any document-level field outside that shape (e.g. a `generator` field
+  // written by another tool) is intentionally dropped here so the write path
+  // satisfies the schema's `additionalProperties: false` at the document
+  // level. Per-item unknown fields are untouched -- items/collections are
+  // passed through by reference, not deep-cloned -- since the read path
+  // tolerates those and only the document level is schema-strict on write.
+  return {
+    version: MAX_SUPPORTED_VERSION,
+    items: data.items,
+    collections: data.collections,
+  };
 }
 
 export function serialize(data: BookmarkData): string {

@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import type { Config } from '../config.js';
 import {
+  MAX_SUPPORTED_VERSION,
   parseMirror,
   serialize,
   toCanonicalV2,
@@ -103,7 +104,7 @@ export function createAddHandler(
 
     const data: BookmarkData =
       parsed.kind === 'empty'
-        ? { version: 2, items: [], collections: [] }
+        ? { version: MAX_SUPPORTED_VERSION, items: [], collections: [] }
         : parsed.data;
     const collection = resolveCollection(args, data.collections);
 
@@ -122,12 +123,15 @@ export function createAddHandler(
     }
 
     const description = args.description?.trim();
+    const siblingOrders = data.items
+      .filter((candidate) => candidate.collectionId === collectionId)
+      .map((candidate) => candidate.order);
     const item: BookmarkItem = {
       id: deps.uuid(),
       type: args.type,
       uri: args.uri,
       collectionId,
-      order: data.items.filter((candidate) => candidate.collectionId === collectionId).length,
+      order: siblingOrders.length === 0 ? 0 : Math.max(...siblingOrders) + 1,
       ...(description === undefined || description.length === 0 ? {} : { description }),
     };
 
@@ -186,9 +190,23 @@ export function createAddHandler(
       if (!firstAttempt.survived) {
         const secondAttempt = await addOnce(args, config);
         if (isToolError(secondAttempt)) {
-          return secondAttempt;
+          const retryCheck = parseMirror(await deps.readMirror(config.mirrorPath));
+          const firstWriteIsPresent =
+            retryCheck.kind === 'ok' &&
+            retryCheck.data.items.some(
+              (candidate) =>
+                candidate.uri === firstAttempt.item.uri &&
+                candidate.collectionId === firstAttempt.item.collectionId,
+            );
+
+          if (!firstWriteIsPresent) {
+            return secondAttempt;
+          }
+
+          successfulAttempt = { ...firstAttempt, survived: true };
+        } else {
+          successfulAttempt = secondAttempt;
         }
-        successfulAttempt = secondAttempt;
       }
 
       if (!successfulAttempt.survived) {

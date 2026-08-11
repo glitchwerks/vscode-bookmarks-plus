@@ -1,3 +1,5 @@
+# MCP Dynamic Workspace Resolution
+
 ## Idea
 
 Redesign `mcp-server/src/config.ts`'s workspace resolution so that **one** MCP server registration in Claude Desktop/Code's config can dynamically serve whichever VS Code workspace/folder is relevant to the current session, instead of pinning a workspace path at server-startup config (today: a positional CLI arg or `BOOKMARKS_MCP_WORKSPACE` env var, fixed per `mcpServers` entry — confirmed by reading `mcp-server/src/config.ts` and `mcp-server/src/index.ts` on `.worktrees/issue-52-mcp-server`, and by the original acceptance criteria in `glitchwerks/vscode-bookmarks-plus#52`: "Workspace path is supplied via MCP server config/args — no auto-discovery... one workspace per server config").
