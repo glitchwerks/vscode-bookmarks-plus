@@ -266,6 +266,26 @@ test('resolveWorkspaceState treats an unrecognized disabled:<slug> as a disabled
   }
 });
 
+test('resolveWorkspaceState treats an empty-string argv[2] the same as an absent positional argument, so the BOOKMARKS_PLUS_WORKSPACE sentinel branch still runs (CodeRabbit regression: config.ts:61 -- "argv[2] !== undefined" treats "" as present, bypassing the disabled-sentinel check entirely)', () => {
+  // A "" positional argument is falsy-but-defined: `argv[2] !== undefined`
+  // is true for "", so the current guard skips straight into
+  // resolveConfig(argv, env) instead of checking BOOKMARKS_PLUS_WORKSPACE
+  // for the disabled: sentinel first. resolveConfig then falls through its
+  // own nonEmpty(argv[2]) check (config.test.ts:143's regression already
+  // covers that "" is treated as absent *there*) to
+  // BOOKMARKS_PLUS_WORKSPACE, and resolves the literal sentinel string
+  // "disabled:multi-root" as if it were a real workspace path -- producing a
+  // bogus 'ok' state instead of the 'disabled' state the extension intended.
+  const state = resolveWorkspaceState(argvWith(''), {
+    BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
+  });
+
+  assert.equal(state.kind, 'disabled');
+  if (state.kind === 'disabled') {
+    assert.match(state.reason, /multi-root/i);
+  }
+});
+
 test('resolveWorkspaceState treats a disabled sentinel on BOOKMARKS_PLUS_WORKSPACE as disabled even when a real, valid CLAUDE_PROJECT_DIR is also present -- the isolation invariant: a disabled sentinel must win over any lower-precedence tier fallback', () => {
   // No existing test combines sentinel recognition with tier precedence:
   // nothing asserts that a disabled:<slug> sentinel on the higher-precedence

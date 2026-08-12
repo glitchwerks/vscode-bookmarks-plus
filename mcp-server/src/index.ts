@@ -14,21 +14,27 @@ import { createListHandler } from './tools/list.js';
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+const UNKNOWN_VERSION = '0.0.0-unknown';
+
 function readPackageVersion(): string {
   let directory = path.dirname(fileURLToPath(import.meta.url));
 
   for (let depth = 0; depth < 5; depth += 1) {
     const packageJsonPath = path.join(directory, 'package.json');
     if (existsSync(packageJsonPath)) {
-      const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
-        version: string;
-      };
-      return packageJson.version;
+      try {
+        const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
+          version: string;
+        };
+        return packageJson.version;
+      } catch {
+        return UNKNOWN_VERSION;
+      }
     }
     directory = path.dirname(directory);
   }
 
-  throw new Error('Unable to locate mcp-server/package.json.');
+  return UNKNOWN_VERSION;
 }
 
 export function createServer(
@@ -91,9 +97,19 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
-if (
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
-) {
+function isEntrypoint(): boolean {
+  const entrypoint = process.argv[1];
+  if (entrypoint === undefined) {
+    return false;
+  }
+
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entrypoint)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
   void main();
 }

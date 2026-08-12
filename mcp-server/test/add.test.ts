@@ -729,6 +729,116 @@ test('a retry whose duplicate-check fires only because attempt 1\'s own write is
     true,
     `expected the race to be recognized as a verified success, got error: ${extractMessage(result)}`,
   );
+  // Pin (CodeRabbit's exact suggested strengthening for this test): the
+  // returned bookmark's id must be the one this handler's own attempt
+  // actually created. In this fixture the surviving item's id happens to
+  // coincide with firstAttempt's id regardless of whether the matching
+  // predicate keys on uri+collectionId or on id, so this assertion is
+  // expected to stay green both before and after the add.ts:190-206 fix --
+  // see the adjacent "moved to a different collection between reads" test
+  // below for the fixture that actually distinguishes the two predicates
+  // and goes red under the current bug.
+  assert.equal(extractPayload(result).id, 'fixed-uuid');
+});
+
+test('a retry-recovery must identify the surviving item by id, not by uri+collectionId, once the item has moved to a different collection between the duplicate-check read and the recovery read (CodeRabbit regression: add.ts:190-206 -- "isn\'t unique across concurrent adds")', async () => {
+  // Attempt 1 writes id 'fixed-uuid' (uri U, collectionId null), but its
+  // verification read races a concurrent rewrite and observes the pre-write
+  // (empty) state, so survived === false and a retry fires.
+  //
+  // Attempt 2's own read (the duplicate-check read inside addOnce, which
+  // happens BEFORE any write -- add.ts:116-123) sees a DIFFERENT item, from
+  // a different concurrent writer, sitting at the exact same (uri,
+  // collectionId) pair: id 'other-writer-uuid'. The duplicate check fires on
+  // that unrelated item and attempt 2 returns an "already exists" error.
+  //
+  // The recovery block's fresh read (a separate deps.readMirror call) then
+  // observes yet another state: attempt 1's own item ('fixed-uuid') has
+  // landed and survived, but it has since been moved into a real collection
+  // (collectionId no longer null) -- e.g. the user filed it while this retry
+  // cycle was in flight. At this point:
+  //   - matching by uri+collectionId (add.ts's current predicate) finds NO
+  //     item with collectionId === null at that uri anymore -- a false
+  //     negative -- so the handler wrongly reports the "already exists"
+  //     error even though attempt 1's write genuinely survived.
+  //   - matching by id finds 'fixed-uuid' regardless of which collection it
+  //     now lives in, and correctly reports success with that id.
+  const { workspacePath, mirrorPath } = await makeWorkspace();
+  const config = makeConfig(workspacePath, mirrorPath, { verifyDelayMs: 400 });
+  const { sleep } = fastSleep();
+
+  const uri = 'file:///workspace/raced-and-recategorized.ts';
+  const preContent = JSON.stringify({ version: 2, items: [], collections: [] });
+  const duplicateCheckContent = JSON.stringify({
+    version: 2,
+    items: [
+      {
+        id: 'other-writer-uuid',
+        type: 'file',
+        uri,
+        collectionId: null,
+        order: 0,
+      },
+    ],
+    collections: [],
+  });
+  const recoveryContent = JSON.stringify({
+    version: 2,
+    items: [
+      {
+        id: 'fixed-uuid',
+        type: 'file',
+        uri,
+        collectionId: 'moved-into-this-collection',
+        order: 0,
+      },
+    ],
+    collections: [],
+  });
+
+  let readCount = 0;
+  const fakeReadMirror = async (): Promise<string | undefined> => {
+    readCount += 1;
+    // 1st read: attempt 1's initial (pre-write) read.
+    // 2nd read: attempt 1's post-write verification read -- races a
+    //   concurrent rewrite and observes the pre-write state, triggering the
+    //   retry (survived === false).
+    // 3rd read: attempt 2's own pre-write duplicate-check read -- sees the
+    //   OTHER writer's item at the same (uri, collectionId).
+    // 4th+ read: the recovery block's fresh read -- sees attempt 1's own
+    //   item, now moved to a different collection.
+    if (readCount <= 2) {
+      return preContent;
+    }
+    if (readCount === 3) {
+      return duplicateCheckContent;
+    }
+    return recoveryContent;
+  };
+  const fakeWriteMirrorAtomic = async (_path: string, _content: string): Promise<void> => {
+    // No-op: the fake readMirror sequence above drives the race, not the
+    // write itself.
+  };
+
+  const add = createAddHandler(config, {
+    readMirror: fakeReadMirror,
+    writeMirrorAtomic: fakeWriteMirrorAtomic,
+    sleep,
+    uuid: () => 'fixed-uuid',
+  });
+
+  const result = await add.handler({ uri, type: 'file' });
+
+  assert.notEqual(
+    result.isError,
+    true,
+    `expected the retry-recovery to recognize attempt 1's own write by id, got error: ${extractMessage(result)}`,
+  );
+  assert.equal(
+    extractPayload(result).id,
+    'fixed-uuid',
+    'the retry-recovery must identify the surviving item by id, not by uri+collectionId (which no longer matches once the item moved collections between reads)',
+  );
 });
 
 // ---------------------------------------------------------------------------

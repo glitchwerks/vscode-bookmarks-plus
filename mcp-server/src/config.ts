@@ -58,7 +58,7 @@ export function resolveWorkspaceState(
   argv: string[],
   env: Record<string, string | undefined>,
 ): WorkspaceState {
-  if (argv[2] !== undefined) {
+  if (nonEmpty(argv[2]) !== undefined) {
     return { kind: 'ok', config: resolveConfig(argv, env) };
   }
 
