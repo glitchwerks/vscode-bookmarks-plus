@@ -6,6 +6,7 @@ import {
   MAX_SUPPORTED_VERSION,
   parseMirror,
   serialize,
+  toCanonicalV2,
   type BookmarkCollection,
   type BookmarkData,
   type BookmarkItem,
@@ -135,11 +136,7 @@ export function createAddHandler(
     };
 
     data.items.push(item);
-    const serialized = serialize({
-      version: MAX_SUPPORTED_VERSION,
-      items: data.items,
-      collections: data.collections,
-    });
+    const serialized = serialize(toCanonicalV2(data));
     await deps.writeMirrorAtomic(resolvedConfig.mirrorPath, serialized);
 
     if (resolvedConfig.verifyDelayMs === 0) {

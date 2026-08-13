@@ -267,10 +267,10 @@ test('createServer falls back to a placeholder version instead of throwing when 
     }, 'createServer must not throw when the nearest package.json exists but fails to parse -- reported version is diagnostic-only metadata');
 
     const info = (server?.server as unknown as ServerWithInfo)._serverInfo;
-    assert.equal(typeof info?.version, 'string');
-    assert.ok(
-      (info?.version ?? '').length > 0,
-      'a non-empty fallback version string must still be reported to clients',
+    assert.equal(
+      info?.version,
+      '0.0.0-unknown',
+      'a malformed nearest package.json must produce the fallback UNKNOWN_VERSION constant, not the real manifest version -- an exact match (not merely non-empty) is required so a future change to the upward-walk depth that lets it fall through to the real package.json is caught here',
     );
   } finally {
     await fs.rm(nestedRoot, { recursive: true, force: true });
@@ -304,10 +304,10 @@ test('createServer falls back to a placeholder version instead of throwing when 
     }, 'createServer must not throw when no package.json is found within the 5-directory search -- reported version is diagnostic-only metadata');
 
     const info = (server?.server as unknown as ServerWithInfo)._serverInfo;
-    assert.equal(typeof info?.version, 'string');
-    assert.ok(
-      (info?.version ?? '').length > 0,
-      'a non-empty fallback version string must still be reported to clients',
+    assert.equal(
+      info?.version,
+      '0.0.0-unknown',
+      'exhausting the 5-directory search must produce the fallback UNKNOWN_VERSION constant, not the real manifest version -- an exact match (not merely non-empty) is required so a future change to the walk depth that lets it fall through to the real package.json is caught here',
     );
   } finally {
     await fs.rm(nestedRoot, { recursive: true, force: true });

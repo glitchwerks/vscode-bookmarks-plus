@@ -252,7 +252,14 @@ test('adding to a v1 file writes version 2 and preserves existing items', async 
   }
 });
 
-test('unknown fields on untouched items survive the write', async () => {
+test('unknown fields on untouched items are stripped from the write, mirroring toCanonicalV2 (policy: add_bookmark routes its write payload through toCanonicalV2 before serializing, same as the other write path, so unknown fields are dropped rather than preserved)', async () => {
+  // v2-unknown-fields.json's item-1 carries an unrecognized "color" field.
+  // schemas/bookmarks.schema.json's bookmarkItem sets additionalProperties:
+  // false, so any write that carries "color" through produces a mirror the
+  // strict schema itself rejects. contract.test.ts's "toCanonicalV2 strips
+  // unknown fields from items, not just from the top-level document" test
+  // pins the same expectation directly against toCanonicalV2; this test pins
+  // it through the add_bookmark handler's write path specifically.
   const { workspacePath, mirrorPath } = await makeWorkspace();
   await seedMirror(mirrorPath, 'v2-unknown-fields.json');
   const config = makeConfig(workspacePath, mirrorPath);
@@ -265,7 +272,12 @@ test('unknown fields on untouched items survive the write', async () => {
   const after = await readMirrorJson(mirrorPath);
 
   const coloredItem = after.items.find((item) => item.id === 'item-1');
-  assert.equal(coloredItem?.color, 'red', 'an unknown field on an untouched item must survive');
+  assert.ok(coloredItem, 'item-1 must still be present after the write');
+  assert.equal(
+    Object.hasOwn(coloredItem ?? {}, 'color'),
+    false,
+    'an unknown field on an untouched item must be dropped by the write path, not preserved',
+  );
 });
 
 test("a document-level unknown field is stripped from the written mirror, unlike per-item unknown fields (CodeRabbit regression: contract.ts:124 -- toCanonicalV2 only sets `version`, it does not strip fields outside the strict v2 schema)", async () => {

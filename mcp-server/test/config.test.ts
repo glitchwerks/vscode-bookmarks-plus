@@ -314,7 +314,7 @@ test('resolveWorkspaceState treats a disabled sentinel on BOOKMARKS_PLUS_WORKSPA
 test('resolveConfig throws when argv[2] itself is a disabled: sentinel, instead of resolving it as a literal path', () => {
   assert.throws(
     () => resolveConfig(argvWith(`${DISABLED_PREFIX}no-folder`), {}),
-    (error: unknown) => error instanceof Error && error.message.length > 0,
+    (error: unknown) => error instanceof Error && /disabled-sentinel/i.test(error.message),
   );
 });
 
@@ -324,7 +324,7 @@ test('resolveConfig throws when BOOKMARKS_PLUS_WORKSPACE is a disabled: sentinel
       resolveConfig(argvWith(), {
         BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
       }),
-    (error: unknown) => error instanceof Error && error.message.length > 0,
+    (error: unknown) => error instanceof Error && /disabled-sentinel/i.test(error.message),
   );
 });
 
@@ -334,7 +334,7 @@ test('resolveConfig throws when CLAUDE_PROJECT_DIR is a disabled: sentinel and h
       resolveConfig(argvWith(), {
         CLAUDE_PROJECT_DIR: `${DISABLED_PREFIX}no-folder`,
       }),
-    (error: unknown) => error instanceof Error && error.message.length > 0,
+    (error: unknown) => error instanceof Error && /disabled-sentinel/i.test(error.message),
   );
 });
 
@@ -344,6 +344,6 @@ test('resolveConfig throws when BOOKMARKS_MCP_WORKSPACE is a disabled: sentinel 
       resolveConfig(argvWith(), {
         BOOKMARKS_MCP_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
       }),
-    (error: unknown) => error instanceof Error && error.message.length > 0,
+    (error: unknown) => error instanceof Error && /disabled-sentinel/i.test(error.message),
   );
 });
