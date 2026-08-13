@@ -39,6 +39,10 @@ export function resolveConfig(
     );
   }
 
+  if (workspace.startsWith(DISABLED_PREFIX)) {
+    throw new Error('A disabled-sentinel value reached resolveConfig directly.');
+  }
+
   const workspacePath = path.resolve(workspace);
   const verifyDelayValue = env.BOOKMARKS_MCP_VERIFY_DELAY_MS;
   const verifyDelayMs = verifyDelayValue === undefined ? 400 : Number(verifyDelayValue);

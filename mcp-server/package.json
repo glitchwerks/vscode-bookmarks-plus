@@ -10,7 +10,7 @@
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json && node scripts/copy-schema.mjs",
-    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node --test dist/test/*.test.js",
+    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node --test dist/test",
     "lint": "eslint src test --ext ts --no-error-on-unmatched-pattern",
     "prepublishOnly": "npm run build"
   },

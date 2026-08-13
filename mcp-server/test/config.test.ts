@@ -298,3 +298,52 @@ test('resolveWorkspaceState treats a disabled sentinel on BOOKMARKS_PLUS_WORKSPA
 
   assert.equal(state.kind, 'disabled');
 });
+
+// ---------------------------------------------------------------------------
+// resolveConfig must itself guard against the DISABLED_PREFIX sentinel
+// (CodeRabbit PRRT_kwDOTgt-j86YFTm0, config.ts:34) -- resolveWorkspaceState
+// only intercepts the sentinel on its own early-return path (a defined,
+// non-empty argv[2] skips straight to resolveConfig, and any *other* caller
+// may invoke resolveConfig directly). If a `disabled:`-prefixed value ever
+// reaches resolveConfig itself -- through any of the four precedence tiers,
+// not only BOOKMARKS_PLUS_WORKSPACE -- it must fail loudly instead of
+// silently calling path.resolve('disabled:...') and returning a bogus
+// mirror path rooted at the server's own working directory.
+// ---------------------------------------------------------------------------
+
+test('resolveConfig throws when argv[2] itself is a disabled: sentinel, instead of resolving it as a literal path', () => {
+  assert.throws(
+    () => resolveConfig(argvWith(`${DISABLED_PREFIX}no-folder`), {}),
+    (error: unknown) => error instanceof Error && error.message.length > 0,
+  );
+});
+
+test('resolveConfig throws when BOOKMARKS_PLUS_WORKSPACE is a disabled: sentinel and argv[2] is absent, instead of resolving it as a literal path', () => {
+  assert.throws(
+    () =>
+      resolveConfig(argvWith(), {
+        BOOKMARKS_PLUS_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
+      }),
+    (error: unknown) => error instanceof Error && error.message.length > 0,
+  );
+});
+
+test('resolveConfig throws when CLAUDE_PROJECT_DIR is a disabled: sentinel and higher-precedence tiers are absent', () => {
+  assert.throws(
+    () =>
+      resolveConfig(argvWith(), {
+        CLAUDE_PROJECT_DIR: `${DISABLED_PREFIX}no-folder`,
+      }),
+    (error: unknown) => error instanceof Error && error.message.length > 0,
+  );
+});
+
+test('resolveConfig throws when BOOKMARKS_MCP_WORKSPACE is a disabled: sentinel and all higher-precedence tiers are absent', () => {
+  assert.throws(
+    () =>
+      resolveConfig(argvWith(), {
+        BOOKMARKS_MCP_WORKSPACE: `${DISABLED_PREFIX}multi-root`,
+      }),
+    (error: unknown) => error instanceof Error && error.message.length > 0,
+  );
+});
