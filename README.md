@@ -47,6 +47,134 @@ server — can read and change them.
   it to share a bookmark set with your team, or add `.vscode/bookmarks.json` to `.gitignore` to
   keep it private — bookmarks were private-per-user before this file existed.
 
+## Using bookmarks from Claude (MCP server)
+
+`mcp-server/` is a standalone Node/TypeScript package that exposes a workspace's
+`.vscode/bookmarks.json` mirror to Claude Desktop and Claude Code over the Model Context
+Protocol (stdio). It reads and writes the same mirror file described above — it has no other
+connection to the extension and works whether or not VS Code is running.
+
+### Build
+
+From the repo root:
+
+```sh
+cd mcp-server
+npm ci && npm run build
+```
+
+This produces `mcp-server/dist/index.js`, the entry point the server config below points at.
+
+### Configure
+
+The server resolves the workspace it should serve from up to four sources, checked in this
+order, stopping at the first one present:
+
+1. **An explicit path** — the `args` positional argument in the registration entry.
+2. **`BOOKMARKS_PLUS_WORKSPACE`** — set automatically by the Bookmarks Plus VS Code extension.
+   Not shipped yet (tracked as issue #58); until it lands, nothing sets this variable and this
+   tier is always skipped.
+3. **`CLAUDE_PROJECT_DIR`** — set automatically by Claude Code in the environment of any MCP
+   server it spawns for a project (an integrated VS Code terminal, or `claude` run from inside a
+   project directory). This is what lets the recommended registration below carry no workspace
+   path at all.
+4. **`BOOKMARKS_MCP_WORKSPACE`** — a legacy environment variable, checked last. See the
+   migration note below if you configured the server this way previously.
+
+If none of the four resolve, the server refuses to start.
+
+#### Recommended: project-scoped, path-free (Claude Code)
+
+Register the server per-project in a committed `.mcp.json`, with **no workspace path in
+`args`** — tier 3 above resolves it automatically:
+
+```json
+{
+  "mcpServers": {
+    "bookmarks-plus": {
+      "command": "node",
+      "args": ["${BOOKMARKS_PLUS_MCP:-/absolute/fallback/path/to/mcp-server/dist/index.js}"]
+    }
+  }
+}
+```
+
+The entry is byte-identical across every project that wants it, so it can be committed and
+shared. Each developer sets `BOOKMARKS_PLUS_MCP` once per machine, to the absolute path of their
+local `mcp-server/dist/index.js`; the `${VAR:-default}` form keeps the file loadable even for a
+developer who hasn't set it, falling back to the given default path. `claude mcp add --scope
+project` can generate the same `.mcp.json` entry for you instead of hand-writing it.
+
+**First use prompts for approval.** Claude Code asks for one-time approval before using a
+project-scoped server defined in `.mcp.json`. This is expected, not a bug — reset your choices
+with `claude mcp reset-project-choices` if needed.
+
+**Don't register the same server name at both project and user scope.** If `bookmarks-plus` is
+defined in both `.mcp.json` (project scope) and `~/.claude.json` (user scope), the CLI and
+Claude Desktop's Code tab can resolve to different definitions: the Code tab uses the
+`~/.claude.json` (user-scope) entry, departing from the CLI's own scope precedence. If you
+previously tried a user-scope entry and are switching to the project-scoped form above, remove
+the old one — otherwise the CLI and the Code tab will silently point at different workspaces.
+
+#### Explicit workspace path
+
+To pin a specific workspace regardless of auto-detection, pass it as the `args` positional
+argument (tier 1, highest precedence — this is unchanged from before):
+
+```json
+{
+  "mcpServers": {
+    "bookmarks-plus": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/vscode-bookmarks-plus/mcp-server/dist/index.js",
+        "/absolute/path/to/your/workspace"
+      ]
+    }
+  }
+}
+```
+
+**This is the only supported form for Claude Desktop's standalone chat interface.** Desktop
+chat has no per-session project concept — it never spawns from a VS Code terminal, so none of
+the automatic resolution above applies there. This is a permanent limitation of the design, not
+a gap to be closed later; Desktop chat users must always configure an explicit workspace path.
+
+#### Legacy: `BOOKMARKS_MCP_WORKSPACE` — behavior change
+
+`BOOKMARKS_MCP_WORKSPACE` used to be the documented way to configure the server without an
+`args` path: set it in the entry's `env` block, or export it from a shell profile. It still
+works, but it is now checked *after* `CLAUDE_PROJECT_DIR` (tier 4 of 4, not tier 2). Under
+Claude Code, that means a `BOOKMARKS_MCP_WORKSPACE` value is now **silently overridden** by the
+auto-detected project directory whenever one is available — the two only agree by coincidence.
+
+If you configured the server this way before, switch to the path-free entry above. If you
+specifically need a fixed workspace that Claude Code's own project detection cannot override,
+use the explicit `args` path form instead — `BOOKMARKS_MCP_WORKSPACE` is no longer a reliable
+way to pin a workspace under Claude Code.
+
+### Tools
+
+- **`list_bookmarks`** — read-only. Lists the workspace's collections and bookmarked
+  files/folders, including descriptions.
+- **`add_bookmark`** — appends a new bookmark, optionally into an existing collection. Rejects
+  an exact duplicate `(uri, collection)` pair and assigns `order` the same way the extension
+  does. It **cannot edit or remove** existing bookmarks or collections — that is out of scope
+  for this server.
+
+### Limitations
+
+- **Last write wins.** If VS Code is running and changes bookmarks at the same moment as the
+  MCP server, one change is lost. `add_bookmark` verifies its own write after a short delay
+  (`BOOKMARKS_MCP_VERIFY_DELAY_MS`, default 400ms) and reports when it did not survive — it
+  cannot prevent the loss, only detect it.
+- **Single-folder workspaces only.** In a multi-root workspace the extension disables the mirror
+  file entirely, so the MCP server's writes are never picked up.
+- **Claude Desktop chat has no automatic workspace resolution.** It must use the explicit `args`
+  path form described above — see "Explicit workspace path".
+- **No push notifications.** The server re-reads the mirror file fresh on every tool call; it
+  does not watch the file or notify the client when bookmarks change.
+
 ## Requirements
 
 Requires VS Code 1.85.0 or later. The repo-name badge uses the built-in `vscode.git` extension when it's enabled; the extension works without it, just without badges.
@@ -61,3 +189,5 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
 - `npm run compile` — bundle `src/extension.ts` to `dist/extension.js` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
 - Press F5 in VS Code (or use the "Run Extension" launch config) to open an Extension Development Host with the extension loaded
+- `mcp-server/` has its own `package.json`, build, and test suite — not run by the commands
+  above. See "Using bookmarks from Claude (MCP server)" for its build steps.

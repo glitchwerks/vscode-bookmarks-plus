@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "items": [
+    {
+      "id": "item-1",
+      "type": "file",
+      "uri": "file:///workspace/a.ts",
+      "collectionId": null,
+      "order": 0
+    }
+  ],
+  "collections": []
+}
