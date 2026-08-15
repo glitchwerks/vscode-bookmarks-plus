@@ -41,6 +41,8 @@ A few design-rationale claims below still cite `docs/superpowers/plans/2026-08-0
 
 Every claim that depends on actual runtime behavior has already been re-anchored to `src/*.ts:Lx`. **Task 1 Step 1 finishes the job** for the remaining rationale-only references and decides that file's fate. Do not skip it — leaving this plan depending on an untracked file makes those references dangle the moment #52's PR merges.
 
+**Resolved 2026-08-14 (issue #60).** `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md` was deleted — its design rationale (the sync-marker mechanism, the four mirror invariants, D1-D4, the LWW policy) was checked against the shipped code, `src/bookmarkStore.ts`'s own comments, the README mirror section, and this plan, and found already captured in all of them; the one item not yet tracked (D3's "file a follow-up issue" for multi-root mirror support) was filed as **#62**. The durable anchor for anything attributed to that file remains **#51 / PR #54**.
+
 ---
 
 ## Architecture
@@ -310,12 +312,12 @@ Scripts:
 
 The two configs write into the same `dist/`, so `build` and `test` produce different layouts there. Make `build` and the `prepublishOnly` hook run `rimraf dist` (or `node -e "fs.rmSync('dist',{recursive:true,force:true})"`) first, so a publish never ships a `dist/` left over from a test run. Test fixtures are JSON, so `copy-schema.mjs` should also copy `test/fixtures/**` into `dist/test/fixtures/` — `tsc` does not copy non-TS files.
 
-- [ ] **Step 1: Finish re-anchoring this plan's citations (do this first, before any code).**
+- [x] **Step 1: Finish re-anchoring this plan's citations (do this first, before any code).**
 
   **The pull is already done and the bulk of this work is complete** — every behavior claim now cites a verified `src/*.ts:Lx` from the current tree, and the two debounce constants D3 depends on are confirmed (`src/bookmarkStore.ts:21` = 250, `src/extension.ts:26` = 150). What remains:
 
-  - Sweep for any surviving `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md:Lx` reference. Re-target **behavior claims** to `src/<file>.ts:Lx-Ly` and **design-rationale claims** (the LWW policy, the subordinate-mirror principle, the four mirror invariants, Q5's handoff) to `PR #54` / `#51`. CLAUDE.md is explicit that issues and PRs are durable and file paths are not.
-  - **Decide the #51 plan file's fate and record it.** It closed with PR #54, so CLAUDE.md's lifecycle rule says delete it. If you keep it under the "lifecycle yields to persistence" carve-out, then *commit* it and state the keep-decision in the PR body. What is not acceptable is leaving this plan silently depending on an untracked file nobody decided about.
+  - ~~Sweep for any surviving `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md:Lx` reference.~~ **Done (issue #60, 2026-08-14):** no surviving line citations existed by the time of the sweep — every behavior claim in this plan already anchors to `src/*.ts:Lx`, and every design-rationale claim already anchors to `PR #54` / `#51`.
+  - ~~Decide the #51 plan file's fate and record it.~~ **Done (issue #60, 2026-08-14): deleted.** See the "Before you start" section above for the disposition and what was verified before deletion.
 
 - [ ] **Step 2:** Write `package.json`, the **three** tsconfigs per the table above, and `.eslintrc.json` (with `"no-console": ["error", { "allow": ["error", "warn"] }]` — Global Constraint 1). Verify both configs compile before moving on: `npx tsc -p tsconfig.build.json --noEmit` and `npx tsc -p tsconfig.test.json --noEmit`.
 - [ ] **Step 3:** Write `scripts/copy-schema.mjs` — copies `../schemas/bookmarks.schema.json` into `dist/`, and `test/fixtures/**` into `dist/test/fixtures/` when that directory exists. Fail loudly if the schema source is missing.
@@ -568,7 +570,7 @@ Each has a stated default this plan already implements. None block implementatio
 
 **3. Citation check.** After the router's `git pull --ff-only`, every behavior claim in this plan was re-verified against the real post-#54 tree and now carries a genuine `src/*.ts:Lx` anchor — including the two constants D3's default delay depends on (`src/bookmarkStore.ts:21` = 250, `src/extension.ts:26` = 150, both confirmed, no longer `unverified:`) and the `order` formula (`src/bookmarkStore.ts:130`, `:136`, which corrected this plan's original `max(order)+1` to the extension's actual `siblingCount`). README claims cite `README.md` by section. The research report is cited by line range throughout. Local files #54 did not change (`package.json`, `tsconfig.json`, `.github/workflows/ci.yml`) are cited by `file:line`.
 
-The untracked `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md` is no longer cited by line anywhere. It survives only as the attributed source of the Q5 quotation, where the durable anchor is stated as #51 / PR #54. **Task 1 Step 1 remains** to sweep for any reference reintroduced during implementation and to decide that file's keep-or-delete fate.
+The untracked `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md` was no longer cited by line anywhere at merge time. It survived only as the attributed source of the Q5 quotation, where the durable anchor is stated as #51 / PR #54. **Task 1 Step 1 is resolved** (issue #60, 2026-08-14): the file was deleted; see the "Before you start" section above.
 
 One claim is explicitly marked `unverified:` — what `vsce package --no-dependencies` includes in the absence of a `.vscodeignore` (Task 1 Step 5), with `npx vsce ls` prescribed as the empirical check rather than a guess.
 
