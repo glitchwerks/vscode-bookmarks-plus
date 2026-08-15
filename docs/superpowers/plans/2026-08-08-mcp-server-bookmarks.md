@@ -41,7 +41,7 @@ A few design-rationale claims below still cite `docs/superpowers/plans/2026-08-0
 
 Every claim that depends on actual runtime behavior has already been re-anchored to `src/*.ts:Lx`. **Task 1 Step 1 finishes the job** for the remaining rationale-only references and decides that file's fate. Do not skip it — leaving this plan depending on an untracked file makes those references dangle the moment #52's PR merges.
 
-**Resolved 2026-08-14 (issue #60).** `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md` was deleted — its design rationale (the sync-marker mechanism, the four mirror invariants, D1-D4, the LWW policy) was checked against the shipped code, `src/bookmarkStore.ts`'s own comments, the README mirror section, and this plan, and found already captured in all of them; the one item not yet tracked (D3's "file a follow-up issue" for multi-root mirror support) was surfaced in the #60 PR body for the router to file. The durable anchor for anything attributed to that file remains **#51 / PR #54**.
+**Resolved 2026-08-14 (issue #60).** `docs/superpowers/plans/2026-08-04-bookmark-descriptions-file-mirror.md` was deleted — its design rationale (the sync-marker mechanism, the four mirror invariants, D1-D4, the LWW policy) was checked against the shipped code, `src/bookmarkStore.ts`'s own comments, the README mirror section, and this plan, and found already captured in all of them; the one item not yet tracked (D3's "file a follow-up issue" for multi-root mirror support) was filed as **#62**. The durable anchor for anything attributed to that file remains **#51 / PR #54**.
 
 ---
 
@@ -312,7 +312,7 @@ Scripts:
 
 The two configs write into the same `dist/`, so `build` and `test` produce different layouts there. Make `build` and the `prepublishOnly` hook run `rimraf dist` (or `node -e "fs.rmSync('dist',{recursive:true,force:true})"`) first, so a publish never ships a `dist/` left over from a test run. Test fixtures are JSON, so `copy-schema.mjs` should also copy `test/fixtures/**` into `dist/test/fixtures/` — `tsc` does not copy non-TS files.
 
-- [ ] **Step 1: Finish re-anchoring this plan's citations (do this first, before any code).**
+- [x] **Step 1: Finish re-anchoring this plan's citations (do this first, before any code).**
 
   **The pull is already done and the bulk of this work is complete** — every behavior claim now cites a verified `src/*.ts:Lx` from the current tree, and the two debounce constants D3 depends on are confirmed (`src/bookmarkStore.ts:21` = 250, `src/extension.ts:26` = 150). What remains:
 
