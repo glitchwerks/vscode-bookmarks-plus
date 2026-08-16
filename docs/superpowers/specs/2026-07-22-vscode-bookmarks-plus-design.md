@@ -14,7 +14,7 @@ VSCode Bookmarks Plus is a VS Code extension that bookmarks **files and folders*
 
 Key scoping decisions:
 
-- **Per-workspace scope.** Bookmarks are stored per workspace and work for both single-root and multi-root workspaces.
+- **Per-workspace scope, extended with a global scope (issue #55).** Workspace bookmarks are still stored per workspace and work for both single-root and multi-root workspaces — this original decision and its rationale are unchanged. A second, workspace-independent scope was added alongside it, not in place of it, so a bookmark can be "always available" rather than tied to one workspace. See [§2 Architecture](#2-architecture) for the storage detail and [§3 Data model](#3-data-model) for how a scope is recorded.
 - **Language/tooling:** TypeScript, scaffolded with `yo code`, bundled with esbuild.
 - **Target:** publish to the VS Code Marketplace. This requires a publisher id, a 128x128 `icon.png`, a README with a screenshot, a `CHANGELOG.md`, a `LICENSE`, and semantic versioning in `package.json` (see [§8 Packaging / publishing](#8-packaging--publishing)).
 
@@ -22,13 +22,23 @@ Key scoping decisions:
 
 Three core pieces make up the extension:
 
-- **`BookmarkStore`** — wraps `context.workspaceState`. It is the single source of truth and owns all reads and writes of the bookmark tree. It is the *only* thing that touches `workspaceState`; no other component reads or writes it directly.
+- **`BookmarkStore`** — wraps a `vscode.Memento`. It is the single source of truth for whichever store owns it, and is the *only* thing that touches that Memento; no other component reads or writes it directly. **Revised by issue #55 (2026-08-15).** Two instances of the same class now exist side by side: the original wraps `context.workspaceState` exactly as before, and a second wraps `context.globalState`. See "Global scope" below.
 - **`BookmarksTreeDataProvider`** — implements `vscode.TreeDataProvider` and `TreeDragAndDropController`. Drag-and-drop supports reordering within a parent and reassigning an item to a different collection. Collections render as parent nodes; ungrouped items render at the root.
 - **Commands** — registered via `contributes.commands` / `contributes.menus`, exposed through the Explorer context menu and the command palette.
 
 Supporting UI surface:
 
-- A new Activity Bar container with one view, `bookmarksView`.
+- A new Activity Bar container with one view, `bookmarksView`. **Unchanged by issue #55** — global bookmarks render inside this same view as a pinned root row rather than a second view (see [§4](#4-ui--tree-view)). A second view was considered and rejected because it does not conform to issue #55's acceptance criteria (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
+### Global scope (issue #55)
+
+A bookmark now belongs to one of two scopes, `'workspace'` or `'global'` (see [§3 Data model](#3-data-model) for the `BookmarkScope` type and where it is recorded). The two scopes are backed by two independent `BookmarkStore` instances rather than a second class or a scope field on the stored data:
+
+- **Workspace store** — unchanged: wraps `context.workspaceState`, one instance per workspace, mirrored to `.vscode/bookmarks.json` when exactly one workspace folder is open.
+- **Global store** — new: wraps `context.globalState`, one instance per VS Code installation, shared across every workspace the user opens. It has **no mirror file** — there is no unambiguous single-workspace location for one — so the MCP server, which reads only the mirror file, has no path to global bookmarks and stays unaffected by this change by construction, not by an explicit exclusion it has to implement (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+- **No Settings Sync.** `setKeysForSync` is never called on the global store's `Memento`. Cross-machine synchronization of global bookmarks is out of scope for v1 — a user's global bookmarks stay on the machine they were added on.
+
+Command handlers resolve which of the two stores to write to from the scope carried on the tree node being acted on, via an injected `ScopedStores { workspace: BookmarkStore; global: BookmarkStore }`, rather than a duplicated command ID per scope. See [§5 Commands](#5-commands).
 
 ### Event ownership and mutation path
 
@@ -98,6 +108,16 @@ interface BookmarkData {
 
 **Known limitation — no cross-window conflict detection.** `workspaceState` has no built-in mechanism for detecting concurrent edits from two VS Code windows on the same workspace; two windows editing bookmarks at once use last-write-wins semantics on `workspaceState.update()`. This is out of scope for v1.
 
+**Scope is not part of the persisted schema (issue #55).** `BookmarkItem` and `BookmarkCollection` above are deliberately unchanged — there is no `scope` field on either, and no new `BookmarkData` schema version or migration rung was introduced for it. A bookmark's scope is a property of *which `BookmarkStore` instance holds the record*, not of the record itself; see [§2 Architecture](#2-architecture) for the two-store layout. The type
+
+```ts
+export type BookmarkScope = 'workspace' | 'global';
+```
+
+is carried on the transient tree-rendering node (`BookmarkNode`, defined alongside `BookmarksTreeDataProvider`, not in this section's storage types), and is a **required** field on that node's `'item'` and `'collection'` members — not optional. Requiring it, rather than defaulting an absent field to `'workspace'`, means a node with a forgotten scope tag fails to compile instead of silently routing a write into the wrong store at runtime (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
+**Duplicate URIs across scopes are intentionally allowed.** Duplicate-bookmark detection stays scoped to one store's own data and never checks the other store. The same URI may therefore be bookmarked once in the workspace store and once in the global store with no error — a global bookmark of a folder ("always available") and a workspace bookmark of the same folder ("part of this project") record different things, and a cross-store check would require one store to know about the other, breaking the single-owner invariant in [§2](#2-architecture) (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
 Git-repo information is deliberately **not** stored on `BookmarkItem`. It is resolved at render time via the `vscode.git` extension API (`repository.rootUri`) — `vscode.git` ships bundled with VS Code by default but can be disabled by the user, so it is treated as a soft dependency (see [§4](#4-ui--tree-view) and [§6](#6-error-handling)). Resolving at render time rather than storing it means a repo rename or move can't leave a stale badge in stored data.
 
 ## 4. UI / tree view
@@ -114,11 +134,19 @@ The view title bar has three buttons:
   - **Default:** collection → item
   - **Grouped by repo:** repo-root node → collection → item
 - `bookmarks.refresh` — manually invalidates the in-memory stat/repo cache described in [§2](#2-architecture) and forces a redraw (see also [§5](#5-commands)).
-- `bookmarks.newCollection` — prompts for a name and adds a new top-level collection (see [§5](#5-commands)).
+- `bookmarks.newCollection` — prompts for a name and adds a new top-level collection (see [§5](#5-commands)). Workspace-scoped only; a global collection is created from the Global row's own inline button (see "Global row" below).
 
 **Drag-and-drop is disabled in group-by-repo mode.** Reordering and re-grouping (both are `BookmarkStore.moveItem()` calls) are only available in the default (collection → item) mode. The `bookmarks.toggleGroupByRepo` button's tooltip notes this — grouped-by-repo is a read-oriented view; switch back to default mode to reorder or move items between collections.
 
 **Broken items in group-by-repo mode.** An item whose `fs.stat` lookup fails has no resolvable repo root, so it cannot be placed under a real repo-root group. Broken items render under a synthetic top-level "Unknown" group in group-by-repo mode, alongside the real repo-root groups.
+
+### Global row (issue #55)
+
+`bookmarksView` gains a single pinned **"Global"** root row — always rendered first among the view's root children, even when both stores are empty — rather than a second view. Its children are the global store's collections and ungrouped items, rendered with the same default (collection → item) logic already used for the workspace section. This conforms to issue #55's acceptance criteria, which call for `bookmarksView` to render "a pinned Global section … alongside the existing workspace-scoped groups/collections" (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)); a second view was considered and rejected for the same reason (see [§2](#2-architecture)).
+
+**Global bookmarks do not participate in group-by-repo mode.** The Global row stays pinned and always renders its own subtree in the default (collection → item) layout, regardless of which mode the workspace section is in. Only the workspace section's shape changes when `bookmarks.toggleGroupByRepo` is flipped; the existing group-by-repo logic for workspace bookmarks (see "Broken items in group-by-repo mode" above) is unaffected. Folding global items into the same repo groups as workspace items was considered and rejected — it would break the "pinned, always visible" property, since a global bookmark outside any repo would otherwise vanish into the "Unknown" bucket alongside broken workspace items (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
+**Cross-scope drag-and-drop is refused.** The drag payload carries its scope (`{ scope, ids }` rather than a bare list of ids), and a drop is rejected whenever the payload's scope differs from the drop target's scope. A drop with no target (empty space) defaults to the workspace root, as before, and refuses a global-scoped payload there; dropping a global-scoped payload onto the Global row itself (ungrouping within global) is allowed. Allowing a cross-scope move as an implicit copy was considered and rejected for v1 — it would need its own duplicate policy, and there is no cross-scope transaction to build it on (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
 
 Context menus:
 
@@ -135,13 +163,23 @@ Context menus:
 | `bookmarks.addFolder` | Explorer context menu on a folder | Gated by the `explorerResourceIsFolder` when-clause; command-palette registration is cut from v1 scope — see note below |
 | `bookmarks.remove` | Tree item context menu + command palette | |
 | `bookmarks.reveal` | Folder-bookmark tree item click; "Reveal in Explorer" context menu (file or folder) + command palette | Calls `revealInExplorer`. File-bookmark clicks bypass this command — they open directly via `vscode.open` (see [§9 point 3](#9-implementation-notes-resolved-ambiguities)) |
-| `bookmarks.newCollection` | View title button + tree context menu + command palette | Prompts for a name |
+| `bookmarks.newCollection` | View title button + tree context menu + command palette | Prompts for a name; workspace-scoped only — a global collection is created from `bookmarks.newGlobalCollection` on the Global row's inline button instead (issue #55) |
 | `bookmarks.renameCollection` | Collection context menu + command palette | Prompts for a new name |
 | `bookmarks.deleteCollection` | Collection context menu + command palette | Confirm dialog; ungroups items, does not delete them |
 | `bookmarks.toggleGroupByRepo` | View title button + command palette | Flips render mode (see [§4](#4-ui--tree-view)); disabled effect while in group-by-repo mode is DnD, not the toggle itself |
 | `bookmarks.refresh` | View title button + command palette | Invalidates the in-memory stat/repo cache and forces a redraw (see [§2](#2-architecture), [§4](#4-ui--tree-view)) |
+| `bookmarks.addFileGlobal` | Explorer context menu on a file | Issue #55, global scope; command-palette registration is cut from v1 scope — see note below |
+| `bookmarks.addFolderGlobal` | Explorer context menu on a folder | Issue #55, global scope; gated by the `explorerResourceIsFolder` when-clause; command-palette registration is cut from v1 scope — see note below |
+| `bookmarks.newGlobalCollection` | Inline button on the Global row + tree context menu | Issue #55; prompts for a name; writes to the global store only (see [§4](#4-ui--tree-view)) |
+| `bookmarks.addToWorkspace` | Context menu on a global, folder-type bookmark whose target is outside the current workspace | Issue #56; see note below |
 
 **Command-palette scope cut for `addFile`/`addFolder`.** These two commands are Explorer-context-menu only in v1 — deliberately not registered on the command palette. Invoking either from the palette has no unambiguous URI source (there's no "current file" concept in the palette the way there is a right-clicked Explorer node), and resolving that ambiguity is not worth the complexity for v1. This is consistent with the doc's overall simplicity stance. Every other command remains palette-accessible because it operates on an already-selected tree item (a bookmark, collection, or the view itself), not an ambiguous target.
+
+**The same cut extends to the global-add commands (issue #55, amends AC 5).** `bookmarks.addFileGlobal` and `bookmarks.addFolderGlobal` have the identical ambiguous-URI problem as their workspace counterparts, for the same reason, so they are Explorer-context-menu only and `when: false` in `commandPalette`. Issue #55's acceptance criterion asking for these commands on "context menu + command palette" is amended accordingly — palette registration is **not** implemented, consistent with the decision already shipped for `addFile`/`addFolder` (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
+**Command handlers resolve their store from the node's scope (issue #55).** Every node-taking command handler is injected with `ScopedStores { workspace: BookmarkStore; global: BookmarkStore }` instead of a single bare store, and resolves which one to read or write via `stores[node.scope]` (see [§3](#3-data-model) for the `scope` field). This keeps one command ID and one registration per command. The alternative — duplicating each command ID per scope (e.g. a separate `bookmarks.removeGlobal`) — was considered and rejected: it doubles the contribution surface permanently and lets the two scopes drift when a fix lands on one command ID and not its twin (issue #55, comment [issuecomment-5305131447](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/55#issuecomment-5305131447)).
+
+**`bookmarks.addToWorkspace` (issue #56).** Available on a global, folder-type bookmark whose target is not already inside the current workspace. Whether a URI is "inside" the workspace is decided by a pure predicate, `isInsideWorkspace(uri, folders)` (new `src/workspaceFolders.ts`), rather than calling `vscode.workspace.getWorkspaceFolder` directly at each call site — call sites pass `vscode.workspace.workspaceFolders` in. A pure, parameterized predicate was chosen over calling the VS Code API directly because the API needs live `vscode.workspace` state, which is awkward to unit-test. Its documented semantics match `getWorkspaceFolder`'s own: a URI that *is* a workspace folder counts as inside; comparison is on path-segment boundaries, so `file:///a/foobar` is **not** inside `file:///a/foo`; Windows drive-letter casing and path case-insensitivity are handled; and for non-`file` schemes, scheme and authority are compared before path, with a mismatch treated as outside (issue #56, comment [issuecomment-5305131813](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/56#issuecomment-5305131813)).
 
 **Folder click behavior — no expand/collapse ambiguity.** Folder bookmark tree items are always leaf nodes (`collapsibleState: None`); the tree never expands them inline, per the "reveal in Explorer, not expand inline" decision below. Since there's no twisty/chevron on a folder bookmark row, a click has only one possible target: `TreeItem.command` always fires and triggers `bookmarks.reveal`.
 
