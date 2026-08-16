@@ -25,7 +25,17 @@ import {
 
 const WATCHER_DEBOUNCE_MS = 150;
 
-let activeStore: BookmarkStore | undefined;
+let activeStores: BookmarkStore[] = [];
+
+export async function disposeStores(stores: (BookmarkStore | undefined)[]): Promise<void> {
+  for (const store of stores) {
+    if (!store) {
+      continue;
+    }
+    await store.flushMirrorWrites();
+    store.dispose();
+  }
+}
 
 function logMirrorDisabled(output: OutputSink, reason: string): void {
   output.appendLine(
@@ -78,7 +88,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const store = new BookmarkStore(context.workspaceState, output, {
     mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : undefined
   });
-  activeStore = store;
+  const globalStore = new BookmarkStore(context.globalState, output);
+  activeStores = [store, globalStore];
 
   let provider: BookmarksTreeDataProvider | undefined = undefined;
   const getGitApi = createGitApiFactory(
@@ -93,7 +104,12 @@ export function activate(context: vscode.ExtensionContext): void {
     dragAndDropController: provider,
     showCollapseAll: true
   });
-  context.subscriptions.push(output, treeView, { dispose: () => store.dispose() });
+  context.subscriptions.push(
+    output,
+    treeView,
+    { dispose: () => store.dispose() },
+    { dispose: () => globalStore.dispose() }
+  );
 
   registerAddCommands(context, store);
   registerItemCommands(context, store);
@@ -148,7 +164,6 @@ export function activate(context: vscode.ExtensionContext): void {
 export async function deactivate(): Promise<void> {
   // Flush rather than drop a pending mirror write. A failed write records the mirror as
   // dirty so workspaceState wins and the write is retried on the next activation.
-  await activeStore?.flushMirrorWrites();
-  activeStore?.dispose();
-  activeStore = undefined;
+  await disposeStores(activeStores);
+  activeStores = [];
 }
