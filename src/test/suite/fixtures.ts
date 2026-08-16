@@ -5,6 +5,12 @@ import { MirrorPort } from '../../bookmarkMirror';
 export class FakeMemento implements vscode.Memento {
   private store = new Map<string, unknown>();
   updateCallCount = 0;
+  /**
+   * Counts every call to `get()`, regardless of key. Used by tests that need to prove a
+   * `Memento` was actually read from (e.g. that a store was constructed against it) without
+   * coupling to the specific storage key the constructor happens to use.
+   */
+  getCallCount = 0;
 
   constructor(initial?: Record<string, unknown>) {
     if (initial) {
@@ -17,6 +23,7 @@ export class FakeMemento implements vscode.Memento {
   get<T>(key: string): T | undefined;
   get<T>(key: string, defaultValue: T): T;
   get<T>(key: string, defaultValue?: T): T | undefined {
+    this.getCallCount++;
     return this.store.has(key) ? (this.store.get(key) as T) : defaultValue;
   }
 
@@ -44,6 +51,26 @@ export class FakeOutput {
   appendLine(value: string): void {
     this.lines.push(value);
   }
+}
+
+/**
+ * The subset of `vscode.ExtensionContext` that `activate()`/`deactivate()` read from. Kept as a
+ * plain shape (not `vscode.ExtensionContext` itself) so tests can pass it to `activate()` via an
+ * `as unknown as vscode.ExtensionContext` cast, matching the fixture pattern already used for
+ * `registerViewCommands` in commands.test.ts.
+ */
+export interface FakeExtensionContext {
+  subscriptions: vscode.Disposable[];
+  workspaceState: FakeMemento;
+  globalState: FakeMemento;
+}
+
+export function createFakeExtensionContext(): FakeExtensionContext {
+  return {
+    subscriptions: [],
+    workspaceState: new FakeMemento(),
+    globalState: new FakeMemento()
+  };
 }
 
 export function sleep(ms: number): Promise<void> {

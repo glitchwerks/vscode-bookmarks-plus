@@ -909,3 +909,25 @@ suite('BookmarkStore - reloadFromMirror (external change)', () => {
     assert.strictEqual(memento.updateCallCount, 0);
   });
 });
+
+// Characterization test for T2 (#55): a store built with no `mirror` option is already safe to
+// reuse unmodified for the (mirror-less) global store, because `syncWithMirror()` and
+// `reloadFromMirror()` both guard on the absence of a mirror. This locks in that existing
+// behavior so a future change can't regress it; it is expected to pass today, not to be red.
+suite('BookmarkStore - no-mirror store: mirror methods are always inert (T2 characterization)', () => {
+  test('syncWithMirror and reloadFromMirror never throw and never write mirror bookkeeping keys', async () => {
+    const memento = new FakeMemento();
+    const store = new BookmarkStore(memento);
+
+    await assert.doesNotReject(() => store.syncWithMirror());
+    await assert.doesNotReject(() => store.reloadFromMirror());
+
+    assert.strictEqual(memento.get('bookmarks.mirrorHash'), undefined);
+    assert.strictEqual(memento.get('bookmarks.mirrorDirty'), undefined);
+    assert.ok(
+      !memento.keys().includes('bookmarks.mirrorHash') && !memento.keys().includes('bookmarks.mirrorDirty'),
+      'a store with no mirror option must never write mirror bookkeeping keys — this is what makes ' +
+        'it safe to reuse BookmarkStore unmodified for the mirror-less global store in T2'
+    );
+  });
+});
