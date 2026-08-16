@@ -102,7 +102,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
     await handler(nonItemNode);
     assert.strictEqual(store.getAll().items.length, 1, 'non-item nodes must be a no-op');
 
-    await handler({ kind: 'item', item });
+    await handler({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(store.getAll().items.length, 0);
   });
 
@@ -111,7 +111,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
     const handler = createRevealHandler(async (uri) => { calls.push(uri.toString()); });
     const item: BookmarkItem = { id: '1', type: 'file', uri: 'file:///a.txt', collectionId: null, order: 0 };
 
-    await handler({ kind: 'item', item });
+    await handler({ kind: 'item', item, scope: 'workspace' });
     assert.deepStrictEqual(calls, ['file:///a.txt']);
   });
 
@@ -120,7 +120,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
     const handler = createRevealHandler(async (uri) => { calls.push(uri.toString()); });
     const item: BookmarkItem = { id: '2', type: 'folder', uri: 'file:///dir', collectionId: null, order: 0 };
 
-    await handler({ kind: 'item', item });
+    await handler({ kind: 'item', item, scope: 'workspace' });
     assert.deepStrictEqual(calls, ['file:///dir']);
   });
 
@@ -156,7 +156,7 @@ suite('commands - collections', () => {
     const collection = await store.addCollection('Work');
     const prompter = makePrompter({ showInputBox: async () => 'Work Stuff' });
 
-    await createRenameCollectionHandler(store, prompter)({ kind: 'collection', collection });
+    await createRenameCollectionHandler(store, prompter)({ kind: 'collection', collection, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work Stuff');
   });
@@ -165,7 +165,7 @@ suite('commands - collections', () => {
     const store = new BookmarkStore(new FakeMemento());
     const collection = await store.addCollection('Work');
 
-    await createRenameCollectionHandler(store, makePrompter())({ kind: 'collection', collection });
+    await createRenameCollectionHandler(store, makePrompter())({ kind: 'collection', collection, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work', 'cancelled prompt must not rename');
   });
@@ -181,7 +181,7 @@ suite('commands - collections', () => {
       }
     });
 
-    await createRenameCollectionHandler(store, prompter)({ kind: 'item', item });
+    await createRenameCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(store.getAll().collections.length, 0);
     assert.strictEqual(inputBoxCalled, false, 'must not prompt for a non-collection node');
   });
@@ -192,7 +192,7 @@ suite('commands - collections', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const declining = makePrompter({ showWarningConfirm: async () => false });
 
-    await createDeleteCollectionHandler(store, declining)({ kind: 'collection', collection });
+    await createDeleteCollectionHandler(store, declining)({ kind: 'collection', collection, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().collections.length, 1, 'declined confirmation must not delete');
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, collection.id);
@@ -204,7 +204,7 @@ suite('commands - collections', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const confirming = makePrompter({ showWarningConfirm: async () => true });
 
-    await createDeleteCollectionHandler(store, confirming)({ kind: 'collection', collection });
+    await createDeleteCollectionHandler(store, confirming)({ kind: 'collection', collection, scope: 'workspace' });
 
     const data = store.getAll();
     assert.strictEqual(data.collections.length, 0);
@@ -226,7 +226,7 @@ suite('commands - collections', () => {
       }
     });
 
-    await createDeleteCollectionHandler(store, confirming)({ kind: 'item', item });
+    await createDeleteCollectionHandler(store, confirming)({ kind: 'item', item, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().items.length, 1, 'non-collection nodes must be a no-op');
     assert.strictEqual(
@@ -244,7 +244,7 @@ suite('commands - collections', () => {
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item });
+    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, collection.id);
   });
@@ -264,7 +264,7 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item });
+    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
 
     assert.deepStrictEqual(messages, ['This item is already bookmarked.']);
     assert.strictEqual(
@@ -286,7 +286,7 @@ suite('commands - collections', () => {
         )
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item });
+    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
 
     assert.strictEqual(
       store.getAll().items.find((storedItem) => storedItem.id === item.id)!.collectionId,
@@ -303,7 +303,7 @@ suite('commands - collections', () => {
         items.find((quickPickItem) => quickPickItem.label === 'Ungrouped')
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item });
+    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
@@ -311,7 +311,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler does nothing when the pick is cancelled', async () => {
     const store = new BookmarkStore(new FakeMemento());
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    await createMoveToCollectionHandler(store, makePrompter())({ kind: 'item', item });
+    await createMoveToCollectionHandler(store, makePrompter())({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
 
@@ -365,11 +365,11 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
 
     try {
       const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-      await provider.getTreeItem({ kind: 'item', item });
+      await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
       assert.strictEqual(resolveCalls, 1);
 
       await vscode.commands.executeCommand('bookmarks.refresh');
-      await provider.getTreeItem({ kind: 'item', item });
+      await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
       assert.strictEqual(resolveCalls, 2);
     } finally {
       subscriptions.forEach((d) => d.dispose());
@@ -379,7 +379,7 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
 
 suite('commands - setDescription', () => {
   function itemNode(item: BookmarkItem): BookmarkNode {
-    return { kind: 'item', item };
+    return { kind: 'item', item, scope: 'workspace' };
   }
 
   test('is a no-op when invoked without a tree node', async () => {
@@ -441,7 +441,8 @@ suite('commands - setDescription', () => {
 
     await createSetDescriptionHandler(store, prompter)({
       kind: 'collection',
-      collection: store.getAll().collections[0]
+      collection: store.getAll().collections[0],
+      scope: 'workspace'
     });
 
     assert.strictEqual(store.getAll().collections[0].description, 'work-related bookmarks');

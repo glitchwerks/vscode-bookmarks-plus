@@ -1,3 +1,5 @@
+export type BookmarkScope = 'workspace' | 'global';
+
 export interface BookmarkItem {
   id: string;                    // uuid
   type: 'file' | 'folder';
