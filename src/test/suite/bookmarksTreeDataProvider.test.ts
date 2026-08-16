@@ -38,7 +38,7 @@ suite('BookmarksTreeDataProvider - default mode', () => {
     await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     await store.addItem({ type: 'file', uri: 'file:///b.txt' }); // root item — must not appear
 
-    const node: BookmarkNode = { kind: 'collection', collection };
+    const node: BookmarkNode = { kind: 'collection', collection, scope: 'workspace' };
     const children = await provider.getChildren(node);
 
     assert.strictEqual(children.length, 1);
@@ -48,7 +48,7 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   test('a folder bookmark tree item is always a leaf (collapsibleState None) and has no children', async () => {
     const { store, provider } = makeProvider();
     const folder = await store.addItem({ type: 'folder', uri: 'file:///dir' });
-    const node: BookmarkNode = { kind: 'item', item: folder };
+    const node: BookmarkNode = { kind: 'item', item: folder, scope: 'workspace' };
 
     const treeItem = await provider.getTreeItem(node);
     assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.None);
@@ -60,7 +60,7 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   test('a broken bookmark renders with a warning icon and does not throw', async () => {
     const { store, provider } = makeProvider(async () => ({ exists: false }));
     const item = await store.addItem({ type: 'file', uri: 'file:///missing.txt' });
-    const node: BookmarkNode = { kind: 'item', item };
+    const node: BookmarkNode = { kind: 'item', item, scope: 'workspace' };
 
     const treeItem = await provider.getTreeItem(node);
     assert.ok(treeItem.iconPath instanceof vscode.ThemeIcon);
@@ -70,21 +70,21 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   test('a valid bookmark with a resolved repo shows the repo name as its description', async () => {
     const { store, provider } = makeProvider(async () => ({ exists: true, repoName: 'my-repo' }));
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(treeItem.description, 'my-repo');
   });
 
   test('file bookmark tree item opens the file directly, bypassing bookmarks.reveal', async () => {
     const { store, provider } = makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(treeItem.command?.command, 'vscode.open');
   });
 
   test('folder bookmark tree item triggers bookmarks.reveal (its only possible click target)', async () => {
     const { store, provider } = makeProvider();
     const item = await store.addItem({ type: 'folder', uri: 'file:///dir' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(treeItem.command?.command, 'bookmarks.reveal');
   });
 
@@ -93,7 +93,7 @@ suite('BookmarksTreeDataProvider - default mode', () => {
     const { store, provider } = makeProvider(async () => { resolveCalls++; return { exists: true }; });
 
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    await provider.getTreeItem({ kind: 'item', item });
+    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(resolveCalls, 1);
 
     let redraws = 0;
@@ -101,7 +101,7 @@ suite('BookmarksTreeDataProvider - default mode', () => {
     await store.addItem({ type: 'file', uri: 'file:///b.txt' });
     assert.strictEqual(redraws, 1);
 
-    await provider.getTreeItem({ kind: 'item', item });
+    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
     assert.strictEqual(resolveCalls, 2, 'the cache must be invalidated on onBookmarksChanged');
   });
 });
@@ -211,7 +211,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const other = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
 
-    const targetNode: BookmarkNode = { kind: 'collection', collection };
+    const targetNode: BookmarkNode = { kind: 'collection', collection, scope: 'workspace' };
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrop(targetNode, makeDropTransfer([item.id]), token);
 
@@ -231,7 +231,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
     const c = await store.addItem({ type: 'file', uri: 'file:///c.txt' });
 
-    const targetNode: BookmarkNode = { kind: 'item', item: a }; // drop c onto a's position
+    const targetNode: BookmarkNode = { kind: 'item', item: a, scope: 'workspace' }; // drop c onto a's position
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrop(targetNode, makeDropTransfer([c.id]), token);
 
@@ -262,7 +262,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
 
     const dt = new vscode.DataTransfer();
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrag([{ kind: 'item', item }], dt, token);
+    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace' }], dt, token);
 
     assert.strictEqual(dt.get(DND_MIME_TYPE), undefined);
   });
@@ -275,7 +275,7 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
     await store.setItemDescription(item.id, 'the entrypoint');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0] });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
 
     assert.strictEqual(typeof treeItem.tooltip, 'string');
     assert.ok((treeItem.tooltip as string).includes('the entrypoint'));
@@ -287,7 +287,7 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0] });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
 
     assert.strictEqual(treeItem.tooltip, undefined);
   });
@@ -301,7 +301,7 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
       new FsGitCache(async () => ({ exists: true, repoName: 'repo-a' }))
     );
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0] });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
 
     assert.strictEqual(treeItem.description, 'repo-a');
   });
@@ -312,7 +312,7 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
     await store.setItemDescription(item.id, 'was here');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: false })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0] });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
 
     assert.strictEqual(treeItem.description, 'missing');
     assert.ok((treeItem.tooltip as string).includes('was here'));
@@ -323,11 +323,11 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
     const collection = await store.addCollection('Work');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const before = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0] });
+    const before = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace' });
     assert.strictEqual(before.tooltip, undefined);
 
     await store.setCollectionDescription(collection.id, 'work-related bookmarks');
-    const after = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0] });
+    const after = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace' });
     assert.strictEqual(after.tooltip, 'work-related bookmarks');
   });
 });

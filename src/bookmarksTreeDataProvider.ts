@@ -1,14 +1,14 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { BookmarkStore } from './bookmarkStore';
-import { BookmarkItem, BookmarkCollection } from './types';
+import { BookmarkItem, BookmarkCollection, BookmarkScope } from './types';
 import { FsGitCache } from './fsGitCache';
 
 export type GroupMode = 'default' | 'byRepo';
 
 export type BookmarkNode =
-  | { kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string }
-  | { kind: 'item'; item: BookmarkItem }
+  | { kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string; scope: BookmarkScope }
+  | { kind: 'item'; item: BookmarkItem; scope: BookmarkScope }
   | { kind: 'repoGroup'; label: string; repoKey: string };
 
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
@@ -177,11 +177,11 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (!node) {
       const collectionNodes: BookmarkNode[] = [...collections]
         .sort((a, b) => a.order - b.order)
-        .map((collection) => ({ kind: 'collection', collection }));
+        .map((collection) => ({ kind: 'collection', collection, scope: 'workspace' }));
       const rootItemNodes: BookmarkNode[] = items
         .filter((i) => i.collectionId === null)
         .sort((a, b) => a.order - b.order)
-        .map((item) => ({ kind: 'item', item }));
+        .map((item) => ({ kind: 'item', item, scope: 'workspace' }));
       return [...collectionNodes, ...rootItemNodes];
     }
 
@@ -189,7 +189,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       return items
         .filter((i) => i.collectionId === node.collection.id)
         .sort((a, b) => a.order - b.order)
-        .map((item) => ({ kind: 'item', item }));
+        .map((item) => ({ kind: 'item', item, scope: 'workspace' }));
     }
 
     return [];
@@ -235,12 +235,13 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
           kind: 'collection',
           collection,
           repoLabel: node.label,
-          repoKey: node.repoKey
+          repoKey: node.repoKey,
+          scope: 'workspace'
         }));
       const rootItemNodes: BookmarkNode[] = itemsInRepo
         .filter((i) => i.collectionId === null)
         .sort((a, b) => a.order - b.order)
-        .map((item) => ({ kind: 'item', item }));
+        .map((item) => ({ kind: 'item', item, scope: 'workspace' }));
       return [...collectionNodes, ...rootItemNodes];
     }
 
@@ -254,7 +255,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
           matched.push(item);
         }
       }
-      return matched.sort((a, b) => a.order - b.order).map((item) => ({ kind: 'item', item }));
+      return matched.sort((a, b) => a.order - b.order).map((item) => ({ kind: 'item', item, scope: 'workspace' }));
     }
 
     return [];
