@@ -333,40 +333,15 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
 });
 
 // --- T3: pinned Global row -------------------------------------------------------------------
-//
-// `BookmarkNode` does not have a `'globalRoot'` member yet, and the constructor does not accept a
-// third `globalStore` argument yet — that is exactly the behavior these tests exist to drive. Two
-// small type-only helpers below let this file keep compiling against *today's* narrower types
-// (so `tsc` — run by `pretest` — doesn't fail the whole suite over a type it doesn't know about
-// yet) while still exercising the *real* runtime object: a plain ES class constructor silently
-// ignores extra arguments it does not declare, so calling it with three arguments today is
-// behaviorally identical to calling it with two, which is precisely the missing-Global-row red
-// these tests must observe.
 
-type BookmarkNodeWithGlobalRoot = BookmarkNode | { kind: 'globalRoot' };
-
-function widenNodes(nodes: BookmarkNode[]): BookmarkNodeWithGlobalRoot[] {
-  return nodes as unknown as BookmarkNodeWithGlobalRoot[];
+function findGlobalRoot(nodes: BookmarkNode[]): BookmarkNode | undefined {
+  return nodes.find((n) => n.kind === 'globalRoot');
 }
 
-function asBookmarkNode(node: BookmarkNodeWithGlobalRoot): BookmarkNode {
-  return node as unknown as BookmarkNode;
-}
-
-function findGlobalRoot(nodes: BookmarkNode[]): BookmarkNodeWithGlobalRoot | undefined {
-  return widenNodes(nodes).find((n) => n.kind === 'globalRoot');
-}
-
-/** The non-Global-row root children, narrowed back to the real (pre-T3) `BookmarkNode` union. */
+/** The root children other than the pinned Global row. */
 function excludeGlobalRoot(nodes: BookmarkNode[]): BookmarkNode[] {
-  return widenNodes(nodes).filter((n): n is BookmarkNode => n.kind !== 'globalRoot');
+  return nodes.filter((n) => n.kind !== 'globalRoot');
 }
-
-// Expected constructor signature per the T3 spec: an optional third parameter, backward
-// compatible with every existing two-arg call site.
-//   constructor(store: BookmarkStore, cache: FsGitCache, globalStore?: BookmarkStore)
-type ProviderCtorWithGlobal = new (store: BookmarkStore, cache: FsGitCache, globalStore?: BookmarkStore) => BookmarksTreeDataProvider;
-const ProviderWithGlobalSupport = BookmarksTreeDataProvider as unknown as ProviderCtorWithGlobal;
 
 function makeProviderWithGlobal(
   resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })
@@ -374,7 +349,7 @@ function makeProviderWithGlobal(
   const store = new BookmarkStore(new FakeMemento());
   const globalStore = new BookmarkStore(new FakeMemento());
   const cache = new FsGitCache(resolve);
-  const provider = new ProviderWithGlobalSupport(store, cache, globalStore);
+  const provider = new BookmarksTreeDataProvider(store, cache, globalStore);
   return { store, globalStore, cache, provider };
 }
 
@@ -388,9 +363,9 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     const children = await provider.getChildren();
 
     assert.strictEqual(children.length, 3, "today's child count must be unchanged when no globalStore is passed");
-    assert.deepStrictEqual(widenNodes(children).map((n) => n.kind), ['collection', 'item', 'item']);
+    assert.deepStrictEqual(children.map((n) => n.kind), ['collection', 'item', 'item']);
     assert.ok(
-      widenNodes(children).every((n) => n.kind !== 'globalRoot'),
+      children.every((n) => n.kind !== 'globalRoot'),
       'omitting globalStore must never synthesize a Global row'
     );
   });
@@ -403,7 +378,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     assert.ok(children.length > 0, 'the Global row must be present even when both stores are empty');
     const globalRootNode = findGlobalRoot(children);
     assert.ok(globalRootNode, 'expected a node with kind "globalRoot" among root children');
-    assert.strictEqual(widenNodes(children)[0].kind, 'globalRoot', 'the Global row must be the first root child');
+    assert.strictEqual(children[0].kind, 'globalRoot', 'the Global row must be the first root child');
   });
 
   test('the Global row tree item carries contextValue "bookmarkGlobalRoot"', async () => {
@@ -413,7 +388,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     const globalRootNode = findGlobalRoot(children);
     assert.ok(globalRootNode, 'expected a Global row to fetch a tree item for');
 
-    const treeItem = await provider.getTreeItem(asBookmarkNode(globalRootNode!));
+    const treeItem = await provider.getTreeItem(globalRootNode);
     assert.strictEqual(treeItem.contextValue, 'bookmarkGlobalRoot');
   });
 
@@ -423,7 +398,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const children = await provider.getChildren();
-    assert.strictEqual(widenNodes(children)[0].kind, 'globalRoot');
+    assert.strictEqual(children[0].kind, 'globalRoot');
   });
 
   test('global collections and items render only under the Global row, tagged scope "global"', async () => {
@@ -454,7 +429,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
       }
     }
 
-    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+    const globalChildren = await provider.getChildren(globalRootNode);
     assert.strictEqual(globalChildren.length, 2, 'the Global row must list the global collection and the global root item');
 
     const globalCollectionNode = globalChildren.find((n) => n.kind === 'collection');
@@ -490,7 +465,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     const globalRootNode = findGlobalRoot(rootChildren);
     assert.ok(globalRootNode, 'expected a Global row among root children');
 
-    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+    const globalChildren = await provider.getChildren(globalRootNode);
 
     // Pin the positive shape first, so this test cannot pass vacuously on an empty result — an
     // implementation that (bug) returns [] for the Global row's children would otherwise sail
@@ -594,7 +569,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
       'a global collection must never be nested inside a workspace repo group (D4-A)'
     );
 
-    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+    const globalChildren = await provider.getChildren(globalRootNode);
     assert.ok(
       globalChildren.every((n) => n.kind === 'collection' || n.kind === 'item'),
       "the Global row's children must stay in the default (collection/item) layout, never repoGroup, regardless of the group-by-repo toggle"

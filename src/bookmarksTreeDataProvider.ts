@@ -55,7 +55,11 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (this.groupMode === 'byRepo') {
       return; // DnD disabled in group-by-repo mode (spec §4).
     }
-    const ids = source.filter((n): n is Extract<BookmarkNode, { kind: 'item' }> => n.kind === 'item').map((n) => n.item.id);
+    const ids = source
+      .filter(
+        (n): n is Extract<BookmarkNode, { kind: 'item' }> => n.kind === 'item' && n.scope === 'workspace'
+      )
+      .map((n) => n.item.id);
     if (ids.length === 0) {
       return;
     }
@@ -84,9 +88,17 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       newCollectionId = null;
       newIndex = data.items.filter((i) => i.collectionId === null).length;
     } else if (target.kind === 'collection') {
+      // Global collections are not valid drop targets for workspace items.
+      if (target.scope !== 'workspace') {
+        return;
+      }
       newCollectionId = target.collection.id;
       newIndex = data.items.filter((i) => i.collectionId === target.collection.id).length;
     } else if (target.kind === 'item') {
+      // Global items are not valid drop targets.
+      if (target.scope !== 'workspace') {
+        return;
+      }
       newCollectionId = target.item.collectionId;
       newIndex = target.item.order;
     } else {
