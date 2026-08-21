@@ -15,6 +15,11 @@ export interface Prompter {
   showInfo(message: string): Thenable<unknown>;
 }
 
+export interface ScopedStores {
+  workspace: BookmarkStore;
+  global: BookmarkStore;
+}
+
 export function createPrompter(): Prompter {
   return {
     showInputBox: (options) => vscode.window.showInputBox(options),
@@ -66,12 +71,13 @@ export function createAddFolderHandler(
 }
 
 export function createRemoveHandler(
-  store: BookmarkStore
+  stores: ScopedStores
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
     if (node.kind !== 'item') {
       return;
     }
+    const store = stores[node.scope];
     await store.removeItem(node.item.id);
   };
 }
@@ -101,13 +107,14 @@ export function createNewCollectionHandler(
 }
 
 export function createRenameCollectionHandler(
-  store: BookmarkStore,
+  stores: ScopedStores,
   prompter: Prompter
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
     if (node.kind !== 'collection') {
       return;
     }
+    const store = stores[node.scope];
     const name = await prompter.showInputBox({
       prompt: 'Rename collection',
       value: node.collection.name
@@ -120,13 +127,14 @@ export function createRenameCollectionHandler(
 }
 
 export function createSetDescriptionHandler(
-  store: BookmarkStore,
+  stores: ScopedStores,
   prompter: Pick<Prompter, 'showInputBox'>
 ): (node?: BookmarkNode) => Promise<void> {
   return async (node?: BookmarkNode): Promise<void> => {
     if (node === undefined || node.kind === 'repoGroup' || node.kind === 'globalRoot') {
       return;
     }
+    const store = stores[node.scope];
     const current = node.kind === 'item'
       ? node.item.description
       : node.collection.description;
@@ -146,13 +154,14 @@ export function createSetDescriptionHandler(
 }
 
 export function createDeleteCollectionHandler(
-  store: BookmarkStore,
+  stores: ScopedStores,
   prompter: Prompter
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
     if (node.kind !== 'collection') {
       return;
     }
+    const store = stores[node.scope];
     const confirmed = await prompter.showWarningConfirm(
       `Delete collection "${node.collection.name}"? Its bookmarks will be ungrouped, not deleted.`,
       'Delete'
@@ -165,13 +174,14 @@ export function createDeleteCollectionHandler(
 }
 
 export function createMoveToCollectionHandler(
-  store: BookmarkStore,
+  stores: ScopedStores,
   prompter: Prompter
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
     if (node.kind !== 'item') {
       return;
     }
+    const store = stores[node.scope];
     const data = store.getAll();
     const options: Array<vscode.QuickPickItem & { id: string | null }> = [
       { label: 'Ungrouped', id: null },
@@ -222,10 +232,10 @@ export function registerAddCommands(
 
 export function registerItemCommands(
   context: vscode.ExtensionContext,
-  store: BookmarkStore
+  stores: ScopedStores
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('bookmarks.remove', createRemoveHandler(store)),
+    vscode.commands.registerCommand('bookmarks.remove', createRemoveHandler(stores)),
     vscode.commands.registerCommand(
       'bookmarks.reveal',
       createRevealHandler((uri) =>
@@ -237,37 +247,37 @@ export function registerItemCommands(
 
 export function registerCollectionCommands(
   context: vscode.ExtensionContext,
-  store: BookmarkStore
+  stores: ScopedStores
 ): void {
   const prompter = createPrompter();
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'bookmarks.newCollection',
-      createNewCollectionHandler(store, prompter)
+      createNewCollectionHandler(stores.workspace, prompter)
     ),
     vscode.commands.registerCommand(
       'bookmarks.renameCollection',
-      createRenameCollectionHandler(store, prompter)
+      createRenameCollectionHandler(stores, prompter)
     ),
     vscode.commands.registerCommand(
       'bookmarks.deleteCollection',
-      createDeleteCollectionHandler(store, prompter)
+      createDeleteCollectionHandler(stores, prompter)
     ),
     vscode.commands.registerCommand(
       'bookmarks.moveToCollection',
-      createMoveToCollectionHandler(store, prompter)
+      createMoveToCollectionHandler(stores, prompter)
     )
   );
 }
 
 export function registerDescriptionCommands(
   context: vscode.ExtensionContext,
-  store: BookmarkStore
+  stores: ScopedStores
 ): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'bookmarks.setDescription',
-      createSetDescriptionHandler(store, createPrompter())
+      createSetDescriptionHandler(stores, createPrompter())
     )
   );
 }

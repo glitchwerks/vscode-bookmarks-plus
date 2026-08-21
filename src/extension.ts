@@ -12,7 +12,8 @@ import {
   registerCollectionCommands,
   registerDescriptionCommands,
   registerItemCommands,
-  registerViewCommands
+  registerViewCommands,
+  ScopedStores
 } from './commands';
 import { Delayer } from './delayer';
 import { CacheEntry, FsGitCache, ResolveFn } from './fsGitCache';
@@ -89,6 +90,7 @@ export function activate(context: vscode.ExtensionContext): void {
     mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : undefined
   });
   const globalStore = new BookmarkStore(context.globalState, output);
+  const stores: ScopedStores = { workspace: store, global: globalStore };
   activeStores = [store, globalStore];
 
   let provider: BookmarksTreeDataProvider | undefined = undefined;
@@ -112,9 +114,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   registerAddCommands(context, store);
-  registerItemCommands(context, store);
-  registerCollectionCommands(context, store);
-  registerDescriptionCommands(context, store);
+  registerItemCommands(context, stores);
+  registerCollectionCommands(context, stores);
+  registerDescriptionCommands(context, stores);
   registerViewCommands(context, provider);
 
   let mirrorResources: vscode.Disposable | undefined;

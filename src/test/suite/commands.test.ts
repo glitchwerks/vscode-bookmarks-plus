@@ -10,6 +10,7 @@ import {
   createRemoveHandler,
   createRevealHandler,
   Prompter,
+  ScopedStores,
   createNewCollectionHandler,
   createRenameCollectionHandler,
   createDeleteCollectionHandler,
@@ -27,6 +28,51 @@ function makePrompter(overrides: Partial<Prompter> = {}): Prompter {
     showInfo: async () => {},
     ...overrides
   };
+}
+
+/**
+ * Builds a ScopedStores fixture (T4 / #55 D2 option A: `stores[node.scope]`). Any store not
+ * supplied gets a fresh, empty BookmarkStore backed by its own FakeMemento — never shared with
+ * the other scope, so "the other store is untouched" assertions are meaningful.
+ */
+function makeScopedStores(overrides: Partial<ScopedStores> = {}): ScopedStores {
+  return {
+    workspace: overrides.workspace ?? new BookmarkStore(new FakeMemento()),
+    global: overrides.global ?? new BookmarkStore(new FakeMemento())
+  };
+}
+
+interface StoreSnapshot {
+  data: ReturnType<BookmarkStore['getAll']>;
+  updateCallCount: number;
+}
+
+function snapshotStore(store: BookmarkStore, memento: FakeMemento): StoreSnapshot {
+  // Deep-copy via JSON round-trip (BookmarkData is plain primitives/arrays) so this snapshot is
+  // immune to `getAll()` returning the store's live internal object by reference — otherwise a
+  // later `assertUntouched` deep-equal would tautologically compare the mutated object to itself.
+  return {
+    data: JSON.parse(JSON.stringify(store.getAll())) as ReturnType<BookmarkStore['getAll']>,
+    updateCallCount: memento.updateCallCount
+  };
+}
+
+/**
+ * Asserts a store was not mutated by the handler under test: both its content (deep-equal
+ * snapshot) and the fact that no write was even attempted (Memento.update call count unchanged).
+ */
+function assertUntouched(
+  store: BookmarkStore,
+  memento: FakeMemento,
+  before: StoreSnapshot,
+  label: string
+): void {
+  assert.deepStrictEqual(store.getAll(), before.data, `the ${label} store must be untouched`);
+  assert.strictEqual(
+    memento.updateCallCount,
+    before.updateCallCount,
+    `the ${label} store must not even attempt a write`
+  );
 }
 
 suite('commands - addFile / addFolder / remove / reveal', () => {
@@ -94,16 +140,50 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 
   test('remove handler deletes the targeted item and ignores non-item nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
-    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    const handler = createRemoveHandler(store);
+    const stores = makeScopedStores();
+    const item = await stores.workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
+    const handler = createRemoveHandler(stores);
 
     const nonItemNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
     await handler(nonItemNode);
-    assert.strictEqual(store.getAll().items.length, 1, 'non-item nodes must be a no-op');
+    assert.strictEqual(stores.workspace.getAll().items.length, 1, 'non-item nodes must be a no-op');
 
     await handler({ kind: 'item', item, scope: 'workspace' });
-    assert.strictEqual(store.getAll().items.length, 0);
+    assert.strictEqual(stores.workspace.getAll().items.length, 0);
+  });
+
+  test('remove handler on a workspace-scoped node removes only from the workspace store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
+    const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
+    const globalBefore = snapshotStore(global, globalMemento);
+    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+
+    await handler({ kind: 'item', item: workspaceItem, scope: 'workspace' });
+
+    assert.strictEqual(workspace.getAll().items.length, 0, 'the workspace item must be removed');
+    assertUntouched(global, globalMemento, globalBefore, 'global');
+    assert.strictEqual(global.getAll().items.find((i) => i.id === globalItem.id)?.id, globalItem.id);
+  });
+
+  test('remove handler on a global-scoped node removes only from the global store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
+    const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+
+    await handler({ kind: 'item', item: globalItem, scope: 'global' });
+
+    assert.strictEqual(global.getAll().items.length, 0, 'the global item must be removed');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+    assert.strictEqual(workspace.getAll().items.find((i) => i.id === workspaceItem.id)?.id, workspaceItem.id);
   });
 
   test('reveal handler calls the injected reveal function with the item uri', async () => {
@@ -133,6 +213,12 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 });
 
+// T4 (#55 D2) scope-routing note: `createAddFileHandler` / `createAddFolderHandler` take a
+// vscode.Uri, not a BookmarkNode, so there is no `node.scope` to route on — they stay bound to a
+// single store here, and #55's global-add commands (bookmarks.addFileGlobal /
+// bookmarks.addFolderGlobal) are separately-registered handlers over the global store (plan T5),
+// not a scope-routed variant of these. `createRevealHandler` takes a node but never touches a
+// store at all, so it is scope-irrelevant.
 suite('commands - collections', () => {
   test('newCollection handler creates a collection with the prompted name', async () => {
     const store = new BookmarkStore(new FakeMemento());
@@ -151,12 +237,21 @@ suite('commands - collections', () => {
     assert.strictEqual(store.getAll().collections.length, 0);
   });
 
+  // T4 (#55 D2) scope-routing note: `bookmarks.newCollection` is pinned to the workspace store
+  // per plan T5 ("global collections are created from the Global row's own inline button") —
+  // `createNewCollectionHandler` takes no node, so there is no `node.scope` to route on, and it
+  // is not part of the ScopedStores contract.
+
   test('renameCollection handler renames the targeted collection', async () => {
     const store = new BookmarkStore(new FakeMemento());
     const collection = await store.addCollection('Work');
     const prompter = makePrompter({ showInputBox: async () => 'Work Stuff' });
 
-    await createRenameCollectionHandler(store, prompter)({ kind: 'collection', collection, scope: 'workspace' });
+    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'collection',
+      collection,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work Stuff');
   });
@@ -165,7 +260,11 @@ suite('commands - collections', () => {
     const store = new BookmarkStore(new FakeMemento());
     const collection = await store.addCollection('Work');
 
-    await createRenameCollectionHandler(store, makePrompter())({ kind: 'collection', collection, scope: 'workspace' });
+    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), makePrompter())({
+      kind: 'collection',
+      collection,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work', 'cancelled prompt must not rename');
   });
@@ -181,9 +280,53 @@ suite('commands - collections', () => {
       }
     });
 
-    await createRenameCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
+    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
     assert.strictEqual(store.getAll().collections.length, 0);
     assert.strictEqual(inputBoxCalled, false, 'must not prompt for a non-collection node');
+  });
+
+  test('renameCollection handler on a workspace-scoped node renames only in the workspace store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceCollection = await workspace.addCollection('Work');
+    await global.addCollection('Work'); // deliberately colliding name, distinct store
+    const globalBefore = snapshotStore(global, globalMemento);
+    const prompter = makePrompter({ showInputBox: async () => 'Work Stuff' });
+
+    await createRenameCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'collection',
+      collection: workspaceCollection,
+      scope: 'workspace'
+    });
+
+    assert.strictEqual(workspace.getAll().collections[0].name, 'Work Stuff');
+    assertUntouched(global, globalMemento, globalBefore, 'global');
+  });
+
+  test('renameCollection handler on a global-scoped node renames only in the global store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    await workspace.addCollection('Work'); // deliberately colliding name, distinct store
+    const globalCollection = await global.addCollection('Work');
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const prompter = makePrompter({ showInputBox: async () => 'Personal' });
+
+    await createRenameCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'collection',
+      collection: globalCollection,
+      scope: 'global'
+    });
+
+    assert.strictEqual(global.getAll().collections[0].name, 'Personal');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
   });
 
   test('deleteCollection handler does nothing when the confirmation is declined', async () => {
@@ -192,7 +335,11 @@ suite('commands - collections', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const declining = makePrompter({ showWarningConfirm: async () => false });
 
-    await createDeleteCollectionHandler(store, declining)({ kind: 'collection', collection, scope: 'workspace' });
+    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), declining)({
+      kind: 'collection',
+      collection,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().collections.length, 1, 'declined confirmation must not delete');
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, collection.id);
@@ -204,7 +351,11 @@ suite('commands - collections', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const confirming = makePrompter({ showWarningConfirm: async () => true });
 
-    await createDeleteCollectionHandler(store, confirming)({ kind: 'collection', collection, scope: 'workspace' });
+    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), confirming)({
+      kind: 'collection',
+      collection,
+      scope: 'workspace'
+    });
 
     const data = store.getAll();
     assert.strictEqual(data.collections.length, 0);
@@ -226,7 +377,11 @@ suite('commands - collections', () => {
       }
     });
 
-    await createDeleteCollectionHandler(store, confirming)({ kind: 'item', item, scope: 'workspace' });
+    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), confirming)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().items.length, 1, 'non-collection nodes must be a no-op');
     assert.strictEqual(
@@ -236,6 +391,79 @@ suite('commands - collections', () => {
     );
   });
 
+  test('deleteCollection handler on a global-scoped node deletes only in the global store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceCollection = await workspace.addCollection('Notes'); // untouched control
+    const globalCollection = await global.addCollection('Notes');
+    const globalItem = await global.addItem({
+      type: 'file',
+      uri: 'file:///global-note.txt',
+      collectionId: globalCollection.id
+    });
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const confirming = makePrompter({ showWarningConfirm: async () => true });
+
+    await createDeleteCollectionHandler(makeScopedStores({ workspace, global }), confirming)({
+      kind: 'collection',
+      collection: globalCollection,
+      scope: 'global'
+    });
+
+    const globalData = global.getAll();
+    assert.strictEqual(globalData.collections.length, 0, 'the global collection must be deleted');
+    assert.strictEqual(
+      globalData.items.find((i) => i.id === globalItem.id)!.collectionId,
+      null,
+      'the global item must be ungrouped, not deleted'
+    );
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+    assert.strictEqual(workspace.getAll().collections[0].id, workspaceCollection.id);
+  });
+
+  test(
+    'deleteCollection handler on a global collection ungroups only the global item, leaving a ' +
+      'workspace item at the same uri and its own collection untouched',
+    async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      // Same uri and collection name in both scopes (D6: same URI is allowed once per scope) —
+      // this must not fool the handler into ungrouping across scopes.
+      const uri = 'file:///shared.txt';
+      const workspaceCollection = await workspace.addCollection('Shared Name');
+      const workspaceItem = await workspace.addItem({ type: 'file', uri, collectionId: workspaceCollection.id });
+      const globalCollection = await global.addCollection('Shared Name');
+      const globalItem = await global.addItem({ type: 'file', uri, collectionId: globalCollection.id });
+      const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+      const confirming = makePrompter({ showWarningConfirm: async () => true });
+
+      await createDeleteCollectionHandler(makeScopedStores({ workspace, global }), confirming)({
+        kind: 'collection',
+        collection: globalCollection,
+        scope: 'global'
+      });
+
+      const globalData = global.getAll();
+      assert.strictEqual(globalData.collections.length, 0);
+      assert.strictEqual(
+        globalData.items.find((i) => i.id === globalItem.id)!.collectionId,
+        null,
+        'the global item sharing a uri with a workspace item must be ungrouped'
+      );
+      assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+      assert.strictEqual(
+        workspace.getAll().items.find((i) => i.id === workspaceItem.id)!.collectionId,
+        workspaceCollection.id,
+        'the workspace item and its collection must be unaffected by deleting the same-named, ' +
+          'same-uri global collection'
+      );
+    }
+  );
+
   test('moveToCollection handler moves the item into the chosen collection', async () => {
     const store = new BookmarkStore(new FakeMemento());
     const collection = await store.addCollection('Work');
@@ -244,7 +472,11 @@ suite('commands - collections', () => {
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, collection.id);
   });
@@ -264,7 +496,11 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
 
     assert.deepStrictEqual(messages, ['This item is already bookmarked.']);
     assert.strictEqual(
@@ -286,7 +522,11 @@ suite('commands - collections', () => {
         )
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(
       store.getAll().items.find((storedItem) => storedItem.id === item.id)!.collectionId,
@@ -303,7 +543,11 @@ suite('commands - collections', () => {
         items.find((quickPickItem) => quickPickItem.label === 'Ungrouped')
     });
 
-    await createMoveToCollectionHandler(store, prompter)({ kind: 'item', item, scope: 'workspace' });
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
@@ -311,7 +555,11 @@ suite('commands - collections', () => {
   test('moveToCollection handler does nothing when the pick is cancelled', async () => {
     const store = new BookmarkStore(new FakeMemento());
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    await createMoveToCollectionHandler(store, makePrompter())({ kind: 'item', item, scope: 'workspace' });
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), makePrompter())({
+      kind: 'item',
+      item,
+      scope: 'workspace'
+    });
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
 
@@ -327,9 +575,158 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(store, prompter)(nonItemNode);
+    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)(nonItemNode);
 
     assert.strictEqual(quickPickCalled, false, 'must not prompt when there is no item to move');
+  });
+
+  test('moveToCollection handler offers only global collections (and Ungrouped) for a global-scoped node', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    // Deliberately colliding label so a label-based assertion could pass vacuously; the id set
+    // is the only thing that actually proves scope isolation.
+    await workspace.addCollection('Shared Name');
+    const globalCollectionA = await global.addCollection('Shared Name');
+    const globalCollectionB = await global.addCollection('Other Global');
+    const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
+    let offeredIds: Array<string | null> = [];
+    const prompter = makePrompter({
+      showQuickPick: async (items) => {
+        offeredIds = (items as unknown as Array<{ id: string | null }>).map((item) => item.id);
+        return undefined;
+      }
+    });
+
+    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: globalItem,
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(
+      [...offeredIds].sort(),
+      [null, globalCollectionA.id, globalCollectionB.id].sort(),
+      'a global node picker must offer exactly the global collections plus Ungrouped, never workspace collections'
+    );
+  });
+
+  test('moveToCollection handler offers only workspace collections (and Ungrouped) for a workspace-scoped node', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceCollection = await workspace.addCollection('Shared Name');
+    await global.addCollection('Shared Name'); // deliberately colliding label, distinct store
+    const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
+    let offeredIds: Array<string | null> = [];
+    const prompter = makePrompter({
+      showQuickPick: async (items) => {
+        offeredIds = (items as unknown as Array<{ id: string | null }>).map((item) => item.id);
+        return undefined;
+      }
+    });
+
+    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: workspaceItem,
+      scope: 'workspace'
+    });
+
+    assert.deepStrictEqual(
+      [...offeredIds].sort(),
+      [null, workspaceCollection.id].sort(),
+      'a workspace node picker must offer exactly the workspace collections plus Ungrouped, never global collections'
+    );
+  });
+
+  test('moveToCollection handler computes the sibling count from the target scope store, not the other scope', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+
+    // The workspace collection of the same name has a different sibling count (3) than the
+    // global collection (1) being moved into — proves order comes from the resolved store.
+    const workspaceCollection = await workspace.addCollection('Personal');
+    await workspace.addItem({ type: 'file', uri: 'file:///w1.txt', collectionId: workspaceCollection.id });
+    await workspace.addItem({ type: 'file', uri: 'file:///w2.txt', collectionId: workspaceCollection.id });
+    await workspace.addItem({ type: 'file', uri: 'file:///w3.txt', collectionId: workspaceCollection.id });
+
+    const globalCollection = await global.addCollection('Personal');
+    await global.addItem({ type: 'file', uri: 'file:///g1.txt', collectionId: globalCollection.id });
+    const globalItemToMove = await global.addItem({ type: 'file', uri: 'file:///g2.txt' });
+
+    const prompter = makePrompter({
+      showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Personal')
+    });
+
+    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: globalItemToMove,
+      scope: 'global'
+    });
+
+    const moved = global.getAll().items.find((i) => i.id === globalItemToMove.id)!;
+    assert.strictEqual(moved.collectionId, globalCollection.id);
+    assert.strictEqual(
+      moved.order,
+      1,
+      'order must equal the global collection\'s existing sibling count (1), not the workspace collection\'s (3)'
+    );
+  });
+
+  test('moveToCollection handler on a workspace-scoped node leaves the global store untouched', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceCollection = await workspace.addCollection('Work');
+    const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
+    await global.addCollection('Work'); // deliberately colliding name, distinct store
+    const globalBefore = snapshotStore(global, globalMemento);
+    const prompter = makePrompter({
+      showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
+    });
+
+    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: workspaceItem,
+      scope: 'workspace'
+    });
+
+    assert.strictEqual(
+      workspace.getAll().items.find((i) => i.id === workspaceItem.id)!.collectionId,
+      workspaceCollection.id
+    );
+    assertUntouched(global, globalMemento, globalBefore, 'global');
+  });
+
+  test('moveToCollection handler on a global-scoped node leaves the workspace store untouched', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    await workspace.addCollection('Work'); // deliberately colliding name, distinct store
+    const globalCollection = await global.addCollection('Work');
+    const globalItem = await global.addItem({ type: 'file', uri: 'file:///a.txt' });
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const prompter = makePrompter({
+      showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
+    });
+
+    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: globalItem,
+      scope: 'global'
+    });
+
+    assert.strictEqual(
+      global.getAll().items.find((i) => i.id === globalItem.id)!.collectionId,
+      globalCollection.id
+    );
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
   });
 });
 
@@ -386,7 +783,7 @@ suite('commands - setDescription', () => {
     const store = new BookmarkStore(new FakeMemento());
     const prompter = new FakePrompter({ inputBoxResult: 'unused' });
 
-    await createSetDescriptionHandler(store, prompter)();
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)();
 
     assert.strictEqual(prompter.inputBoxCallCount, 0);
   });
@@ -396,7 +793,9 @@ suite('commands - setDescription', () => {
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const prompter = new FakePrompter({ inputBoxResult: 'the entrypoint' });
 
-    await createSetDescriptionHandler(store, prompter)(itemNode(store.getAll().items[0]));
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+      itemNode(store.getAll().items[0])
+    );
 
     assert.strictEqual(store.getAll().items[0].description, 'the entrypoint');
   });
@@ -407,7 +806,9 @@ suite('commands - setDescription', () => {
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: 'updated' });
 
-    await createSetDescriptionHandler(store, prompter)(itemNode(store.getAll().items[0]));
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+      itemNode(store.getAll().items[0])
+    );
 
     assert.strictEqual(prompter.lastInputBoxOptions?.value, 'existing');
   });
@@ -418,7 +819,9 @@ suite('commands - setDescription', () => {
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: '' });
 
-    await createSetDescriptionHandler(store, prompter)(itemNode(store.getAll().items[0]));
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+      itemNode(store.getAll().items[0])
+    );
 
     assert.strictEqual(store.getAll().items[0].description, undefined);
   });
@@ -429,7 +832,9 @@ suite('commands - setDescription', () => {
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: undefined });
 
-    await createSetDescriptionHandler(store, prompter)(itemNode(store.getAll().items[0]));
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+      itemNode(store.getAll().items[0])
+    );
 
     assert.strictEqual(store.getAll().items[0].description, 'existing');
   });
@@ -439,7 +844,7 @@ suite('commands - setDescription', () => {
     await store.addCollection('Work');
     const prompter = new FakePrompter({ inputBoxResult: 'work-related bookmarks' });
 
-    await createSetDescriptionHandler(store, prompter)({
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)({
       kind: 'collection',
       collection: store.getAll().collections[0],
       scope: 'workspace'
@@ -452,8 +857,70 @@ suite('commands - setDescription', () => {
     const store = new BookmarkStore(new FakeMemento());
     const prompter = new FakePrompter({ inputBoxResult: 'nope' });
 
-    await createSetDescriptionHandler(store, prompter)({ kind: 'repoGroup', label: 'repo-a', repoKey: 'repo:repo-a' });
+    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)({
+      kind: 'repoGroup',
+      label: 'repo-a',
+      repoKey: 'repo:repo-a'
+    });
 
     assert.strictEqual(prompter.inputBoxCallCount, 0, 'the input box must not even open for a repo group');
+  });
+
+  test('sets a description on a global-scoped item without touching the workspace store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const prompter = new FakePrompter({ inputBoxResult: 'always available' });
+
+    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: globalItem,
+      scope: 'global'
+    });
+
+    assert.strictEqual(global.getAll().items[0].description, 'always available');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+  });
+
+  test('sets a description on a global-scoped collection without touching the workspace store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    await workspace.addCollection('Work'); // deliberately colliding name, distinct store
+    const globalCollection = await global.addCollection('Work');
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const prompter = new FakePrompter({ inputBoxResult: 'global collection note' });
+
+    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'collection',
+      collection: globalCollection,
+      scope: 'global'
+    });
+
+    assert.strictEqual(global.getAll().collections[0].description, 'global collection note');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+  });
+
+  test('sets a description on a workspace-scoped item without touching the global store', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
+    const globalBefore = snapshotStore(global, globalMemento);
+    const prompter = new FakePrompter({ inputBoxResult: 'project-specific' });
+
+    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+      kind: 'item',
+      item: workspaceItem,
+      scope: 'workspace'
+    });
+
+    assert.strictEqual(workspace.getAll().items[0].description, 'project-specific');
+    assertUntouched(global, globalMemento, globalBefore, 'global');
   });
 });
