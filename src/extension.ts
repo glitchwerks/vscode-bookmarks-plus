@@ -97,7 +97,7 @@ export function activate(context: vscode.ExtensionContext): void {
     () => provider?.refresh()
   );
   const cache = new FsGitCache(createCacheResolver(getGitApi));
-  provider = new BookmarksTreeDataProvider(store, cache);
+  provider = new BookmarksTreeDataProvider(store, cache, globalStore);
 
   const treeView = vscode.window.createTreeView('bookmarksView', {
     treeDataProvider: provider,
