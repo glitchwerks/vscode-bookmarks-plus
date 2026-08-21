@@ -124,7 +124,7 @@ export function createSetDescriptionHandler(
   prompter: Pick<Prompter, 'showInputBox'>
 ): (node?: BookmarkNode) => Promise<void> {
   return async (node?: BookmarkNode): Promise<void> => {
-    if (node === undefined || node.kind === 'repoGroup') {
+    if (node === undefined || node.kind === 'repoGroup' || node.kind === 'globalRoot') {
       return;
     }
     const current = node.kind === 'item'

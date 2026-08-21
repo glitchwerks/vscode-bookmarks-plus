@@ -7,6 +7,7 @@ import { FsGitCache } from './fsGitCache';
 export type GroupMode = 'default' | 'byRepo';
 
 export type BookmarkNode =
+  | { kind: 'globalRoot' }
   | { kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string; scope: BookmarkScope }
   | { kind: 'item'; item: BookmarkItem; scope: BookmarkScope }
   | { kind: 'repoGroup'; label: string; repoKey: string };
@@ -30,9 +31,14 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
   constructor(
     private readonly store: BookmarkStore,
-    private readonly cache: FsGitCache
+    private readonly cache: FsGitCache,
+    private readonly globalStore?: BookmarkStore
   ) {
     this.store.onBookmarksChanged(() => {
+      this.cache.invalidateAll();
+      this._onDidChangeTreeData.fire();
+    });
+    this.globalStore?.onBookmarksChanged(() => {
       this.cache.invalidateAll();
       this._onDidChangeTreeData.fire();
     });
@@ -84,7 +90,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       newCollectionId = target.item.collectionId;
       newIndex = target.item.order;
     } else {
-      return; // repoGroup nodes are not a valid drop target.
+      return; // repoGroup and globalRoot nodes are not valid drop targets.
     }
 
     for (const id of ids) {
@@ -109,6 +115,13 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   async getTreeItem(node: BookmarkNode): Promise<vscode.TreeItem> {
+    if (node.kind === 'globalRoot') {
+      const treeItem = new vscode.TreeItem('Global', vscode.TreeItemCollapsibleState.Collapsed);
+      treeItem.contextValue = 'bookmarkGlobalRoot';
+      treeItem.iconPath = new vscode.ThemeIcon('globe');
+      return treeItem;
+    }
+
     if (node.kind === 'repoGroup') {
       const treeItem = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.Collapsed);
       treeItem.contextValue = 'bookmarkRepoGroup';
@@ -161,27 +174,38 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   async getChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
+    if (node?.kind === 'globalRoot' || (node?.kind === 'collection' && node.scope === 'global')) {
+      if (!this.globalStore) {
+        return [];
+      }
+      const globalData = this.globalStore.getAll();
+      return this.getChildrenDefault(node, globalData.items, globalData.collections, 'global');
+    }
+
     const data = this.store.getAll();
 
     if (this.groupMode === 'byRepo') {
-      return this.getChildrenByRepo(node, data.items, data.collections);
+      const children = await this.getChildrenByRepo(node, data.items, data.collections);
+      return !node && this.globalStore ? [{ kind: 'globalRoot' }, ...children] : children;
     }
-    return this.getChildrenDefault(node, data.items, data.collections);
+    const children = this.getChildrenDefault(node, data.items, data.collections, 'workspace');
+    return !node && this.globalStore ? [{ kind: 'globalRoot' }, ...children] : children;
   }
 
   private getChildrenDefault(
     node: BookmarkNode | undefined,
     items: BookmarkItem[],
-    collections: BookmarkCollection[]
+    collections: BookmarkCollection[],
+    scope: BookmarkScope
   ): BookmarkNode[] {
-    if (!node) {
+    if (!node || node.kind === 'globalRoot') {
       const collectionNodes: BookmarkNode[] = [...collections]
         .sort((a, b) => a.order - b.order)
-        .map((collection) => ({ kind: 'collection', collection, scope: 'workspace' }));
+        .map((collection) => ({ kind: 'collection', collection, scope }));
       const rootItemNodes: BookmarkNode[] = items
         .filter((i) => i.collectionId === null)
         .sort((a, b) => a.order - b.order)
-        .map((item) => ({ kind: 'item', item, scope: 'workspace' }));
+        .map((item) => ({ kind: 'item', item, scope }));
       return [...collectionNodes, ...rootItemNodes];
     }
 
@@ -189,7 +213,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       return items
         .filter((i) => i.collectionId === node.collection.id)
         .sort((a, b) => a.order - b.order)
-        .map((item) => ({ kind: 'item', item, scope: 'workspace' }));
+        .map((item) => ({ kind: 'item', item, scope }));
     }
 
     return [];

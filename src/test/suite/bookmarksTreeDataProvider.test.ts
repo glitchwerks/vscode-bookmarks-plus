@@ -331,3 +331,283 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
     assert.strictEqual(after.tooltip, 'work-related bookmarks');
   });
 });
+
+// --- T3: pinned Global row -------------------------------------------------------------------
+//
+// `BookmarkNode` does not have a `'globalRoot'` member yet, and the constructor does not accept a
+// third `globalStore` argument yet — that is exactly the behavior these tests exist to drive. Two
+// small type-only helpers below let this file keep compiling against *today's* narrower types
+// (so `tsc` — run by `pretest` — doesn't fail the whole suite over a type it doesn't know about
+// yet) while still exercising the *real* runtime object: a plain ES class constructor silently
+// ignores extra arguments it does not declare, so calling it with three arguments today is
+// behaviorally identical to calling it with two, which is precisely the missing-Global-row red
+// these tests must observe.
+
+type BookmarkNodeWithGlobalRoot = BookmarkNode | { kind: 'globalRoot' };
+
+function widenNodes(nodes: BookmarkNode[]): BookmarkNodeWithGlobalRoot[] {
+  return nodes as unknown as BookmarkNodeWithGlobalRoot[];
+}
+
+function asBookmarkNode(node: BookmarkNodeWithGlobalRoot): BookmarkNode {
+  return node as unknown as BookmarkNode;
+}
+
+function findGlobalRoot(nodes: BookmarkNode[]): BookmarkNodeWithGlobalRoot | undefined {
+  return widenNodes(nodes).find((n) => n.kind === 'globalRoot');
+}
+
+/** The non-Global-row root children, narrowed back to the real (pre-T3) `BookmarkNode` union. */
+function excludeGlobalRoot(nodes: BookmarkNode[]): BookmarkNode[] {
+  return widenNodes(nodes).filter((n): n is BookmarkNode => n.kind !== 'globalRoot');
+}
+
+// Expected constructor signature per the T3 spec: an optional third parameter, backward
+// compatible with every existing two-arg call site.
+//   constructor(store: BookmarkStore, cache: FsGitCache, globalStore?: BookmarkStore)
+type ProviderCtorWithGlobal = new (store: BookmarkStore, cache: FsGitCache, globalStore?: BookmarkStore) => BookmarksTreeDataProvider;
+const ProviderWithGlobalSupport = BookmarksTreeDataProvider as unknown as ProviderCtorWithGlobal;
+
+function makeProviderWithGlobal(
+  resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })
+) {
+  const store = new BookmarkStore(new FakeMemento());
+  const globalStore = new BookmarkStore(new FakeMemento());
+  const cache = new FsGitCache(resolve);
+  const provider = new ProviderWithGlobalSupport(store, cache, globalStore);
+  return { store, globalStore, cache, provider };
+}
+
+suite('BookmarksTreeDataProvider - Global row (T3)', () => {
+  test('omitting globalStore leaves root children unaffected — no Global row is synthesized (regression guard)', async () => {
+    const { store, provider } = makeProvider();
+    await store.addCollection('Work');
+    await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+    await store.addItem({ type: 'file', uri: 'file:///b.txt' });
+
+    const children = await provider.getChildren();
+
+    assert.strictEqual(children.length, 3, "today's child count must be unchanged when no globalStore is passed");
+    assert.deepStrictEqual(widenNodes(children).map((n) => n.kind), ['collection', 'item', 'item']);
+    assert.ok(
+      widenNodes(children).every((n) => n.kind !== 'globalRoot'),
+      'omitting globalStore must never synthesize a Global row'
+    );
+  });
+
+  test('a globalStore constructor argument produces a Global row, positioned first among root children, even when both stores are empty', async () => {
+    const { provider } = makeProviderWithGlobal();
+
+    const children = await provider.getChildren();
+
+    assert.ok(children.length > 0, 'the Global row must be present even when both stores are empty');
+    const globalRootNode = findGlobalRoot(children);
+    assert.ok(globalRootNode, 'expected a node with kind "globalRoot" among root children');
+    assert.strictEqual(widenNodes(children)[0].kind, 'globalRoot', 'the Global row must be the first root child');
+  });
+
+  test('the Global row tree item carries contextValue "bookmarkGlobalRoot"', async () => {
+    const { provider } = makeProviderWithGlobal();
+
+    const children = await provider.getChildren();
+    const globalRootNode = findGlobalRoot(children);
+    assert.ok(globalRootNode, 'expected a Global row to fetch a tree item for');
+
+    const treeItem = await provider.getTreeItem(asBookmarkNode(globalRootNode!));
+    assert.strictEqual(treeItem.contextValue, 'bookmarkGlobalRoot');
+  });
+
+  test('the Global row is still present and first even when the workspace store already has content', async () => {
+    const { store, provider } = makeProviderWithGlobal();
+    await store.addCollection('Work');
+    await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+
+    const children = await provider.getChildren();
+    assert.strictEqual(widenNodes(children)[0].kind, 'globalRoot');
+  });
+
+  test('global collections and items render only under the Global row, tagged scope "global"', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+
+    await store.addCollection('WorkCol');
+    await store.addItem({ type: 'file', uri: 'file:///workspace-root.txt' });
+
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    const globalCollectionItem = await globalStore.addItem({
+      type: 'file',
+      uri: 'file:///global-in-collection.txt',
+      collectionId: globalCollection.id
+    });
+    const globalRootItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-root.txt' });
+
+    const rootChildren = await provider.getChildren();
+    const globalRootNode = findGlobalRoot(rootChildren);
+    assert.ok(globalRootNode, 'expected a Global row among root children');
+
+    // Global content must never leak into the workspace-scoped root children.
+    for (const n of excludeGlobalRoot(rootChildren)) {
+      if (n.kind === 'collection') {
+        assert.notStrictEqual(n.collection.id, globalCollection.id, 'the global collection must not appear in workspace root children');
+      }
+      if (n.kind === 'item') {
+        assert.notStrictEqual(n.item.id, globalRootItem.id, 'the global item must not appear in workspace root children');
+      }
+    }
+
+    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+    assert.strictEqual(globalChildren.length, 2, 'the Global row must list the global collection and the global root item');
+
+    const globalCollectionNode = globalChildren.find((n) => n.kind === 'collection');
+    assert.ok(globalCollectionNode && globalCollectionNode.kind === 'collection');
+    assert.strictEqual(globalCollectionNode.collection.id, globalCollection.id);
+    assert.strictEqual(globalCollectionNode.scope, 'global', 'a collection rendered under the Global row must be tagged scope "global"');
+
+    const globalItemNode = globalChildren.find((n) => n.kind === 'item');
+    assert.ok(globalItemNode && globalItemNode.kind === 'item');
+    assert.strictEqual(globalItemNode.item.id, globalRootItem.id);
+    assert.strictEqual(globalItemNode.scope, 'global', 'an item rendered under the Global row must be tagged scope "global"');
+
+    const itemsInGlobalCollection = await provider.getChildren(globalCollectionNode);
+    assert.strictEqual(itemsInGlobalCollection.length, 1);
+    assert.strictEqual(itemsInGlobalCollection[0].kind, 'item');
+    assert.strictEqual((itemsInGlobalCollection[0] as { item: { id: string } }).item.id, globalCollectionItem.id);
+    assert.strictEqual((itemsInGlobalCollection[0] as { scope: string }).scope, 'global');
+  });
+
+  test("workspace collections and items never leak into the Global row's children", async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+
+    const workspaceCollection = await store.addCollection('WorkCol');
+    const workspaceCollectionItem = await store.addItem({
+      type: 'file',
+      uri: 'file:///workspace-in-collection.txt',
+      collectionId: workspaceCollection.id
+    });
+    const workspaceRootItem = await store.addItem({ type: 'file', uri: 'file:///workspace-root.txt' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///global-root.txt' });
+
+    const rootChildren = await provider.getChildren();
+    const globalRootNode = findGlobalRoot(rootChildren);
+    assert.ok(globalRootNode, 'expected a Global row among root children');
+
+    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+
+    // Pin the positive shape first, so this test cannot pass vacuously on an empty result — an
+    // implementation that (bug) returns [] for the Global row's children would otherwise sail
+    // through the leak checks below with nothing to check.
+    assert.strictEqual(globalChildren.length, 1, 'the Global row must list exactly the one global root item');
+    assert.strictEqual(globalChildren[0].kind, 'item');
+    assert.strictEqual((globalChildren[0] as { item: { uri: string } }).item.uri, 'file:///global-root.txt');
+
+    for (const n of globalChildren) {
+      if (n.kind === 'collection') {
+        assert.notStrictEqual(n.collection.id, workspaceCollection.id, "the workspace collection must not appear under the Global row");
+      }
+      if (n.kind === 'item') {
+        assert.notStrictEqual(n.item.id, workspaceRootItem.id, "the workspace root item must not appear under the Global row");
+        assert.notStrictEqual(n.item.id, workspaceCollectionItem.id, "the workspace collection item must not appear under the Global row");
+      }
+    }
+  });
+
+  test("changes to the global store fire onDidChangeTreeData and invalidate the cache, independent of the workspace store's subscription", async () => {
+    let resolveCalls = 0;
+    const { store, globalStore, provider } = makeProviderWithGlobal(async () => {
+      resolveCalls++;
+      return { exists: true };
+    });
+
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
+    await provider.getTreeItem({ kind: 'item', item: globalItem, scope: 'global' });
+    assert.strictEqual(resolveCalls, 1);
+
+    let redraws = 0;
+    provider.onDidChangeTreeData(() => {
+      redraws++;
+    });
+
+    // Mutate only the global store — the workspace store is never touched in this test, so a
+    // redraw here can only be explained by a subscription to the global store's own event.
+    await globalStore.addItem({ type: 'file', uri: 'file:///global-b.txt' });
+
+    assert.strictEqual(redraws, 1, 'a change to the global store alone must trigger a tree refresh');
+    assert.strictEqual(store.getAll().items.length, 0, 'sanity check: the workspace store was never mutated in this test');
+
+    await provider.getTreeItem({ kind: 'item', item: globalItem, scope: 'global' });
+    assert.strictEqual(resolveCalls, 2, 'the cache must be invalidated when the global store changes, same as for the workspace store');
+
+    // Prove the workspace subscription still fires too — a "swap" implementation that subscribes
+    // to globalStore *instead of* store when the third constructor argument is present would
+    // satisfy every assertion above while breaking this one.
+    await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+    assert.strictEqual(redraws, 2, 'the workspace store subscription must keep firing alongside the global store subscription');
+  });
+
+  test('in byRepo mode, the workspace section groups by repo while the Global row stays flat and ungrouped', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal(async (uri) => ({
+      exists: true,
+      repoName: uri.includes('repo-a') ? 'repo-a' : uri.includes('repo-b') ? 'repo-b' : undefined
+    }));
+    provider.setGroupMode('byRepo');
+
+    await store.addItem({ type: 'file', uri: 'file:///repo-a/workspace.txt' });
+    await store.addItem({ type: 'file', uri: 'file:///repo-b/workspace.txt' });
+
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    // Deliberately resolvable to repo-a, to prove the Global row does not participate in
+    // group-by-repo even when its content *could* be grouped (D4-A).
+    const globalItem = await globalStore.addItem({
+      type: 'file',
+      uri: 'file:///repo-a/global.txt',
+      collectionId: globalCollection.id
+    });
+
+    const rootChildren = await provider.getChildren();
+    const globalRootNode = findGlobalRoot(rootChildren);
+    assert.ok(globalRootNode, 'expected a Global row among root children even in byRepo mode');
+
+    const workspaceSection = excludeGlobalRoot(rootChildren);
+    assert.strictEqual(workspaceSection.length, 2, 'repo-a and repo-b workspace groups');
+    assert.ok(
+      workspaceSection.every((n) => n.kind === 'repoGroup'),
+      'the workspace section must still group by repo in byRepo mode'
+    );
+    assert.ok(
+      workspaceSection.every((n) => n.kind !== 'repoGroup' || n.label !== 'GlobalCol'),
+      'the global collection must not surface as a workspace repo group'
+    );
+
+    // The global item's uri is deliberately resolvable to repo-a — drill into that group and
+    // prove the global collection/item were not folded into it (D4-A). A shallow check on the
+    // root-level repoGroup labels alone cannot catch this: it would still pass even if the leak
+    // happened one level down, inside repo-a's own children.
+    const repoAGroup = workspaceSection.find((n) => n.kind === 'repoGroup' && n.label === 'repo-a');
+    assert.ok(repoAGroup, 'expected a repo-a workspace group');
+    const repoAChildren = await provider.getChildren(repoAGroup!);
+    assert.strictEqual(repoAChildren.length, 1, 'repo-a must hold only the workspace item, not the global one');
+    assert.ok(
+      repoAChildren.every((n) => n.kind !== 'item' || n.item.id !== globalItem.id),
+      'a global item must never be folded into a workspace repo group (D4-A)'
+    );
+    assert.ok(
+      repoAChildren.every((n) => n.kind !== 'collection' || n.collection.id !== globalCollection.id),
+      'a global collection must never be nested inside a workspace repo group (D4-A)'
+    );
+
+    const globalChildren = await provider.getChildren(asBookmarkNode(globalRootNode!));
+    assert.ok(
+      globalChildren.every((n) => n.kind === 'collection' || n.kind === 'item'),
+      "the Global row's children must stay in the default (collection/item) layout, never repoGroup, regardless of the group-by-repo toggle"
+    );
+    assert.strictEqual(globalChildren.length, 1, 'only the global collection sits at the Global row root; the global item is nested inside it');
+
+    const globalCollectionNode = globalChildren[0];
+    assert.ok(globalCollectionNode.kind === 'collection');
+    assert.strictEqual(globalCollectionNode.collection.id, globalCollection.id);
+
+    const itemsInGlobalCollection = await provider.getChildren(globalCollectionNode);
+    assert.strictEqual(itemsInGlobalCollection.length, 1);
+    assert.strictEqual(itemsInGlobalCollection[0].kind, 'item');
+    assert.strictEqual((itemsInGlobalCollection[0] as { item: { id: string } }).item.id, globalItem.id);
+  });
+});
