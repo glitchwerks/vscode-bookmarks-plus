@@ -223,100 +223,126 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
 
 // T5 (#55) registerAddCommands wiring: registers four commands over a ScopedStores — the two
 // existing workspace-bound commands (regression-checked here so the ScopedStores signature change
-// cannot silently flip their routing) plus two new global-bound commands. Mirrors the
-// `registerViewCommands` real-wiring pattern above: a stub ExtensionContext, execute the real
-// command id, assert on the stores, dispose in `finally`.
+// cannot silently flip their routing) plus two new global-bound commands.
+//
+// `registerAddCommands` registers all four command ids ('bookmarks.addFile', '.addFolder',
+// '.addFileGlobal', '.addFolderGlobal') on every call, and the real extension's own `activate()`
+// registers those same four ids for real via the exact same `registerAddCommands` call, triggered
+// by `onStartupFinished` (implied by package.json's `activationEvents: []`) at a non-deterministic
+// point in the mocha run — independent of which test is currently executing. Each test here used to
+// call `registerAddCommands` directly against the real `vscode.commands` registry, so if real
+// activation happened to land between two of these tests (after one test's `dispose()` calls freed
+// the ids, before the next test's `registerAddCommands` call re-registered them), the next
+// `registerCommand` call would throw `command '...' already exists` — and since real activation is
+// never disposed mid-process, every later `registerAddCommands` call in the whole run would then
+// fail permanently too. This reproduced in CI (PR #75, commit 65cac1d): the `addFolder`-workspace
+// test failed with `command 'bookmarks.addFile' already exists` after the two preceding tests in
+// this same suite passed — i.e. activation landed mid-suite. Confirmed by instrumenting an
+// artificial delay into this suite locally: shifting the wall-clock offset reproducibly moved the
+// same class of real-activation collision (there, "Trying to add a disposable to a DisposableStore
+// that has already been disposed of") into a different suite, proving activation genuinely fires
+// asynchronously mid-run and collides with any suite that owns the real command/store lifecycle
+// without isolating it. This is the same race the `commands - view` suite below already isolates
+// itself from via `withIsolatedCommandRegistry` — applying the identical fix here.
 suite('commands - registerAddCommands (workspace + global)', () => {
   test('bookmarks.addFileGlobal adds a bookmark to the global store; workspace store is untouched', async () => {
-    const workspaceMemento = new FakeMemento();
-    const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
-    const global = new BookmarkStore(globalMemento);
-    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
-    const subscriptions: vscode.Disposable[] = [];
-    registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
 
-    try {
-      const uri = vscode.Uri.file('/global/a.txt');
-      await vscode.commands.executeCommand('bookmarks.addFileGlobal', uri);
+      try {
+        const uri = vscode.Uri.file('/global/a.txt');
+        await vscode.commands.executeCommand('bookmarks.addFileGlobal', uri);
 
-      const globalItems = global.getAll().items;
-      assert.strictEqual(globalItems.length, 1);
-      assert.strictEqual(globalItems[0].type, 'file');
-      assert.strictEqual(globalItems[0].uri, uri.toString());
-      assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
+        const globalItems = global.getAll().items;
+        assert.strictEqual(globalItems.length, 1);
+        assert.strictEqual(globalItems[0].type, 'file');
+        assert.strictEqual(globalItems[0].uri, uri.toString());
+        assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
   });
 
   test('bookmarks.addFolderGlobal adds a bookmark to the global store; workspace store is untouched', async () => {
-    const workspaceMemento = new FakeMemento();
-    const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
-    const global = new BookmarkStore(globalMemento);
-    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
-    const subscriptions: vscode.Disposable[] = [];
-    registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
 
-    try {
-      const uri = vscode.Uri.file('/global/dir');
-      await vscode.commands.executeCommand('bookmarks.addFolderGlobal', uri);
+      try {
+        const uri = vscode.Uri.file('/global/dir');
+        await vscode.commands.executeCommand('bookmarks.addFolderGlobal', uri);
 
-      const globalItems = global.getAll().items;
-      assert.strictEqual(globalItems.length, 1);
-      assert.strictEqual(globalItems[0].type, 'folder');
-      assert.strictEqual(globalItems[0].uri, uri.toString());
-      assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
+        const globalItems = global.getAll().items;
+        assert.strictEqual(globalItems.length, 1);
+        assert.strictEqual(globalItems[0].type, 'folder');
+        assert.strictEqual(globalItems[0].uri, uri.toString());
+        assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
   });
 
   test('bookmarks.addFile still adds only to the workspace store after the ScopedStores signature change', async () => {
-    const workspaceMemento = new FakeMemento();
-    const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
-    const global = new BookmarkStore(globalMemento);
-    const globalBefore = snapshotStore(global, globalMemento);
-    const subscriptions: vscode.Disposable[] = [];
-    registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const globalBefore = snapshotStore(global, globalMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
 
-    try {
-      const uri = vscode.Uri.file('/workspace/a.txt');
-      await vscode.commands.executeCommand('bookmarks.addFile', uri);
+      try {
+        const uri = vscode.Uri.file('/workspace/a.txt');
+        await vscode.commands.executeCommand('bookmarks.addFile', uri);
 
-      const workspaceItems = workspace.getAll().items;
-      assert.strictEqual(workspaceItems.length, 1);
-      assert.strictEqual(workspaceItems[0].type, 'file');
-      assert.strictEqual(workspaceItems[0].uri, uri.toString());
-      assertUntouched(global, globalMemento, globalBefore, 'global');
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
+        const workspaceItems = workspace.getAll().items;
+        assert.strictEqual(workspaceItems.length, 1);
+        assert.strictEqual(workspaceItems[0].type, 'file');
+        assert.strictEqual(workspaceItems[0].uri, uri.toString());
+        assertUntouched(global, globalMemento, globalBefore, 'global');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
   });
 
   test('bookmarks.addFolder still adds only to the workspace store after the ScopedStores signature change', async () => {
-    const workspaceMemento = new FakeMemento();
-    const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
-    const global = new BookmarkStore(globalMemento);
-    const globalBefore = snapshotStore(global, globalMemento);
-    const subscriptions: vscode.Disposable[] = [];
-    registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const globalBefore = snapshotStore(global, globalMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
 
-    try {
-      const uri = vscode.Uri.file('/workspace/dir');
-      await vscode.commands.executeCommand('bookmarks.addFolder', uri);
+      try {
+        const uri = vscode.Uri.file('/workspace/dir');
+        await vscode.commands.executeCommand('bookmarks.addFolder', uri);
 
-      const workspaceItems = workspace.getAll().items;
-      assert.strictEqual(workspaceItems.length, 1);
-      assert.strictEqual(workspaceItems[0].type, 'folder');
-      assert.strictEqual(workspaceItems[0].uri, uri.toString());
-      assertUntouched(global, globalMemento, globalBefore, 'global');
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
+        const workspaceItems = workspace.getAll().items;
+        assert.strictEqual(workspaceItems.length, 1);
+        assert.strictEqual(workspaceItems[0].type, 'folder');
+        assert.strictEqual(workspaceItems[0].uri, uri.toString());
+        assertUntouched(global, globalMemento, globalBefore, 'global');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
   });
 });
 
@@ -855,10 +881,12 @@ suite('commands - collections', () => {
 // single, non-idempotent, process-wide registry, so once real activation has claimed an id, any
 // later `registerCommand` call for that same id — such as this suite's stub-context registration —
 // throws `command '...' already exists`, and there is no supported API to unregister a command
-// owned by a `Disposable` this suite never held. `registerAddCommands`'s suite above runs early
-// enough in this file to reliably win that race; this suite runs many tests later and reliably
-// loses it (confirmed empirically: pre-existing on `main`, this suite passed only because nothing
-// ran before it in the file long enough for real activation to land first).
+// owned by a `Disposable` this suite never held. This is not just a "runs late in the file" problem:
+// PR #75's CI run proved real activation can land in the middle of the (textually earlier, four-test)
+// `registerAddCommands` suite too — the third test passed, then the fourth failed with `command
+// 'bookmarks.addFile' already exists`, because activation registered it in the gap between the two
+// tests. That suite now uses this same shim (see its comment above) rather than relying on running
+// "early enough" to win a race that has no guaranteed winner.
 //
 // These two tests isolate themselves from that shared, uncontrollable global registry by swapping
 // `vscode.commands.registerCommand` / `executeCommand` for an in-memory stand-in for the test's
