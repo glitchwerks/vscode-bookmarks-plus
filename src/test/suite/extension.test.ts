@@ -49,6 +49,8 @@ suite('Extension - workspace-folder mirror changes', () => {
     const store = new BookmarkStore(new FakeMemento(), output, { mirror, writeDelayMs: 5 });
     let disposed = false;
     const resources = { dispose: () => { disposed = true; } };
+    let refreshCallCount = 0;
+    const refresh = () => { refreshCallCount++; };
 
     await store.addItem({ type: 'file', uri: 'file:///before.txt' });
     await store.flushMirrorWrites();
@@ -61,7 +63,8 @@ suite('Extension - workspace-folder mirror changes', () => {
         { uri: vscode.Uri.file('/workspace/one') },
         { uri: vscode.Uri.file('/workspace/two') }
       ],
-      resources
+      resources,
+      refresh
     );
     await store.addItem({ type: 'file', uri: 'file:///after.txt' });
     await store.flushMirrorWrites();
@@ -69,5 +72,58 @@ suite('Extension - workspace-folder mirror changes', () => {
     assert.strictEqual(mirror.writeCount, writesBefore);
     assert.strictEqual(disposed, true);
     assert.ok(output.lines.some((line) => line.includes('multi-root workspaces are not supported')));
+    assert.strictEqual(refreshCallCount, 1, 'expected refresh() to be called exactly once');
+  });
+
+  test('still calls refresh when the folder change leaves the mirror enabled', async () => {
+    const mirror = new FakeMirror();
+    const output = new FakeOutput();
+    const store = new BookmarkStore(new FakeMemento(), output, { mirror, writeDelayMs: 5 });
+    let disposed = false;
+    const resources = { dispose: () => { disposed = true; } };
+    let refreshCallCount = 0;
+    const refresh = () => { refreshCallCount++; };
+
+    await store.addItem({ type: 'file', uri: 'file:///before.txt' });
+    await store.flushMirrorWrites();
+    const writesBefore = mirror.writeCount;
+
+    const result = handleWorkspaceFoldersChanged(
+      store,
+      output,
+      [{ uri: vscode.Uri.file('/workspace/single') }],
+      resources,
+      refresh
+    );
+
+    assert.strictEqual(result, false, 'a single-root workspace keeps the mirror enabled');
+    assert.strictEqual(disposed, false, 'mirror resources must not be disposed when still enabled');
+    await store.addItem({ type: 'file', uri: 'file:///after.txt' });
+    await store.flushMirrorWrites();
+    assert.ok(mirror.writeCount > writesBefore, 'mirror writes must continue after a still-enabled folder change');
+    assert.strictEqual(refreshCallCount, 1, 'expected refresh() to be called exactly once even when the mirror stays enabled');
+  });
+
+  test('does not throw when refresh is omitted', async () => {
+    const mirror = new FakeMirror();
+    const output = new FakeOutput();
+    const store = new BookmarkStore(new FakeMemento(), output, { mirror, writeDelayMs: 5 });
+    const resources = { dispose: () => { /* no-op */ } };
+
+    assert.doesNotThrow(() => {
+      handleWorkspaceFoldersChanged(
+        store,
+        output,
+        [
+          { uri: vscode.Uri.file('/workspace/one') },
+          { uri: vscode.Uri.file('/workspace/two') }
+        ],
+        resources
+      );
+    });
+
+    assert.doesNotThrow(() => {
+      handleWorkspaceFoldersChanged(store, output, [{ uri: vscode.Uri.file('/workspace/single') }], resources);
+    });
   });
 });
