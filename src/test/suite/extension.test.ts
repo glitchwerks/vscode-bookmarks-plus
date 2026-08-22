@@ -29,7 +29,10 @@ suite('Extension activation', () => {
       'bookmarks.moveToCollection',
       'bookmarks.setDescription',
       'bookmarks.toggleGroupByRepo',
-      'bookmarks.refresh'
+      'bookmarks.refresh',
+      'bookmarks.addFileGlobal',
+      'bookmarks.addFolderGlobal',
+      'bookmarks.newGlobalCollection'
     ];
 
     for (const command of expected) {
