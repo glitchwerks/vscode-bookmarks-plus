@@ -14,6 +14,16 @@ export type BookmarkNode =
 
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
 export const UNKNOWN_REPO_LABEL = 'Unknown';
+
+/**
+ * The drag transfer payload (spec §6, D5): scope-tagged so handleDrop can tell a
+ * workspace-scoped drag apart from a global-scoped one and refuse cross-scope moves.
+ */
+interface DragEnvelope {
+  scope: BookmarkScope;
+  ids: string[];
+}
+
 const UNKNOWN_REPO_KEY = '\u0000unknown-repo\u0000';
 
 function repoIdentity(repoName: string | undefined): { key: string; label: string } {
@@ -55,15 +65,18 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (this.groupMode === 'byRepo') {
       return; // DnD disabled in group-by-repo mode (spec §4).
     }
-    const ids = source
-      .filter(
-        (n): n is Extract<BookmarkNode, { kind: 'item' }> => n.kind === 'item' && n.scope === 'workspace'
-      )
-      .map((n) => n.item.id);
-    if (ids.length === 0) {
+    const items = source.filter(
+      (n): n is Extract<BookmarkNode, { kind: 'item' }> => n.kind === 'item'
+    );
+    if (items.length === 0) {
       return;
     }
-    dataTransfer.set(DND_MIME_TYPE, new vscode.DataTransferItem(ids));
+    const scope = items[0].scope;
+    if (!items.every((n) => n.scope === scope)) {
+      return; // A mixed-scope selection is refused rather than silently split (spec §6, D5).
+    }
+    const envelope: DragEnvelope = { scope, ids: items.map((n) => n.item.id) };
+    dataTransfer.set(DND_MIME_TYPE, new vscode.DataTransferItem(envelope));
   }
 
   async handleDrop(
@@ -78,37 +91,56 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (!transferItem) {
       return;
     }
-    const ids: string[] = transferItem.value;
-    const data = this.store.getAll();
+    const envelope: DragEnvelope = transferItem.value;
+
+    // Resolve the acting store from the envelope's scope, not the target's — this is what lets
+    // handleDrop refuse a cross-scope move instead of silently writing to the wrong store (D5).
+    const activeStore = envelope.scope === 'global' ? this.globalStore : this.store;
+    if (!activeStore) {
+      return; // Defensive: a global envelope with no globalStore configured is a no-op.
+    }
+    const data = activeStore.getAll();
 
     let newCollectionId: string | null;
     let newIndex: number;
 
     if (!target) {
+      // An untargeted drop always means "append to this scope's root" — but per D5 that is only
+      // ever valid for the workspace scope; a global-scope envelope with no target is refused.
+      if (envelope.scope !== 'workspace') {
+        return;
+      }
+      newCollectionId = null;
+      newIndex = data.items.filter((i) => i.collectionId === null).length;
+    } else if (target.kind === 'globalRoot') {
+      // The Global row is only a valid ungroup target for a global-scope envelope.
+      if (envelope.scope !== 'global') {
+        return;
+      }
       newCollectionId = null;
       newIndex = data.items.filter((i) => i.collectionId === null).length;
     } else if (target.kind === 'collection') {
-      // Global collections are not valid drop targets for workspace items.
-      if (target.scope !== 'workspace') {
+      // The target collection must belong to the same scope as the dragged envelope.
+      if (target.scope !== envelope.scope) {
         return;
       }
       newCollectionId = target.collection.id;
       newIndex = data.items.filter((i) => i.collectionId === target.collection.id).length;
     } else if (target.kind === 'item') {
-      // Global items are not valid drop targets.
-      if (target.scope !== 'workspace') {
+      // The target item must belong to the same scope as the dragged envelope.
+      if (target.scope !== envelope.scope) {
         return;
       }
       newCollectionId = target.item.collectionId;
       newIndex = target.item.order;
     } else {
-      return; // repoGroup and globalRoot nodes are not valid drop targets.
+      return; // repoGroup nodes are not valid drop targets.
     }
 
-    for (const id of ids) {
+    for (const id of envelope.ids) {
       // Calls the exact same BookmarkStore.moveItem() path every command handler uses (spec §2) —
       // there is no special-case write path for drag-and-drop.
-      await this.store.moveItem(id, newCollectionId, newIndex);
+      await activeStore.moveItem(id, newCollectionId, newIndex);
     }
   }
 
