@@ -213,7 +213,7 @@ export function createMoveToCollectionHandler(
 
 export function registerAddCommands(
   context: vscode.ExtensionContext,
-  store: BookmarkStore
+  stores: ScopedStores
 ): void {
   const prompter: Pick<Prompter, 'showInfo'> = {
     showInfo: (message) => vscode.window.showInformationMessage(message)
@@ -221,11 +221,19 @@ export function registerAddCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'bookmarks.addFile',
-      createAddFileHandler(store, prompter)
+      createAddFileHandler(stores.workspace, prompter)
     ),
     vscode.commands.registerCommand(
       'bookmarks.addFolder',
-      createAddFolderHandler(store, prompter)
+      createAddFolderHandler(stores.workspace, prompter)
+    ),
+    vscode.commands.registerCommand(
+      'bookmarks.addFileGlobal',
+      createAddFileHandler(stores.global, prompter)
+    ),
+    vscode.commands.registerCommand(
+      'bookmarks.addFolderGlobal',
+      createAddFolderHandler(stores.global, prompter)
     )
   );
 }
@@ -254,6 +262,10 @@ export function registerCollectionCommands(
     vscode.commands.registerCommand(
       'bookmarks.newCollection',
       createNewCollectionHandler(stores.workspace, prompter)
+    ),
+    vscode.commands.registerCommand(
+      'bookmarks.newGlobalCollection',
+      createNewCollectionHandler(stores.global, prompter)
     ),
     vscode.commands.registerCommand(
       'bookmarks.renameCollection',

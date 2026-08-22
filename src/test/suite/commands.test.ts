@@ -16,7 +16,8 @@ import {
   createDeleteCollectionHandler,
   createMoveToCollectionHandler,
   createSetDescriptionHandler,
-  registerViewCommands
+  registerViewCommands,
+  registerAddCommands
 } from '../../commands';
 import { FakeMemento, FakePrompter } from './fixtures';
 
@@ -219,6 +220,132 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
 // bookmarks.addFolderGlobal) are separately-registered handlers over the global store (plan T5),
 // not a scope-routed variant of these. `createRevealHandler` takes a node but never touches a
 // store at all, so it is scope-irrelevant.
+
+// T5 (#55) registerAddCommands wiring: registers four commands over a ScopedStores — the two
+// existing workspace-bound commands (regression-checked here so the ScopedStores signature change
+// cannot silently flip their routing) plus two new global-bound commands.
+//
+// `registerAddCommands` registers all four command ids ('bookmarks.addFile', '.addFolder',
+// '.addFileGlobal', '.addFolderGlobal') on every call, and the real extension's own `activate()`
+// registers those same four ids for real via the exact same `registerAddCommands` call, triggered
+// by `onStartupFinished` (implied by package.json's `activationEvents: []`) at a non-deterministic
+// point in the mocha run — independent of which test is currently executing. Each test here used to
+// call `registerAddCommands` directly against the real `vscode.commands` registry, so if real
+// activation happened to land between two of these tests (after one test's `dispose()` calls freed
+// the ids, before the next test's `registerAddCommands` call re-registered them), the next
+// `registerCommand` call would throw `command '...' already exists` — and since real activation is
+// never disposed mid-process, every later `registerAddCommands` call in the whole run would then
+// fail permanently too. This reproduced in CI (PR #75, commit 65cac1d): the `addFolder`-workspace
+// test failed with `command 'bookmarks.addFile' already exists` after the two preceding tests in
+// this same suite passed — i.e. activation landed mid-suite. Confirmed by instrumenting an
+// artificial delay into this suite locally: shifting the wall-clock offset reproducibly moved the
+// same class of real-activation collision (there, "Trying to add a disposable to a DisposableStore
+// that has already been disposed of") into a different suite, proving activation genuinely fires
+// asynchronously mid-run and collides with any suite that owns the real command/store lifecycle
+// without isolating it. This is the same race the `commands - view` suite below already isolates
+// itself from via `withIsolatedCommandRegistry` — applying the identical fix here.
+suite('commands - registerAddCommands (workspace + global)', () => {
+  test('bookmarks.addFileGlobal adds a bookmark to the global store; workspace store is untouched', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+
+      try {
+        const uri = vscode.Uri.file('/global/a.txt');
+        await vscode.commands.executeCommand('bookmarks.addFileGlobal', uri);
+
+        const globalItems = global.getAll().items;
+        assert.strictEqual(globalItems.length, 1);
+        assert.strictEqual(globalItems[0].type, 'file');
+        assert.strictEqual(globalItems[0].uri, uri.toString());
+        assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+
+  test('bookmarks.addFolderGlobal adds a bookmark to the global store; workspace store is untouched', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+
+      try {
+        const uri = vscode.Uri.file('/global/dir');
+        await vscode.commands.executeCommand('bookmarks.addFolderGlobal', uri);
+
+        const globalItems = global.getAll().items;
+        assert.strictEqual(globalItems.length, 1);
+        assert.strictEqual(globalItems[0].type, 'folder');
+        assert.strictEqual(globalItems[0].uri, uri.toString());
+        assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+
+  test('bookmarks.addFile still adds only to the workspace store after the ScopedStores signature change', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const globalBefore = snapshotStore(global, globalMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+
+      try {
+        const uri = vscode.Uri.file('/workspace/a.txt');
+        await vscode.commands.executeCommand('bookmarks.addFile', uri);
+
+        const workspaceItems = workspace.getAll().items;
+        assert.strictEqual(workspaceItems.length, 1);
+        assert.strictEqual(workspaceItems[0].type, 'file');
+        assert.strictEqual(workspaceItems[0].uri, uri.toString());
+        assertUntouched(global, globalMemento, globalBefore, 'global');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+
+  test('bookmarks.addFolder still adds only to the workspace store after the ScopedStores signature change', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const workspaceMemento = new FakeMemento();
+      const globalMemento = new FakeMemento();
+      const workspace = new BookmarkStore(workspaceMemento);
+      const global = new BookmarkStore(globalMemento);
+      const globalBefore = snapshotStore(global, globalMemento);
+      const subscriptions: vscode.Disposable[] = [];
+      registerAddCommands({ subscriptions } as unknown as vscode.ExtensionContext, { workspace, global });
+
+      try {
+        const uri = vscode.Uri.file('/workspace/dir');
+        await vscode.commands.executeCommand('bookmarks.addFolder', uri);
+
+        const workspaceItems = workspace.getAll().items;
+        assert.strictEqual(workspaceItems.length, 1);
+        assert.strictEqual(workspaceItems[0].type, 'folder');
+        assert.strictEqual(workspaceItems[0].uri, uri.toString());
+        assertUntouched(global, globalMemento, globalBefore, 'global');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+});
+
 suite('commands - collections', () => {
   test('newCollection handler creates a collection with the prompted name', async () => {
     const store = new BookmarkStore(new FakeMemento());
@@ -241,6 +368,22 @@ suite('commands - collections', () => {
   // per plan T5 ("global collections are created from the Global row's own inline button") —
   // `createNewCollectionHandler` takes no node, so there is no `node.scope` to route on, and it
   // is not part of the ScopedStores contract.
+
+  test('createNewCollectionHandler bound to the global store creates a collection in the global store only, workspace store untouched', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const prompter = makePrompter({ showInputBox: async () => 'My Global Collection' });
+
+    await createNewCollectionHandler(global, prompter)();
+
+    const globalCollections = global.getAll().collections;
+    assert.strictEqual(globalCollections.length, 1);
+    assert.strictEqual(globalCollections[0].name, 'My Global Collection');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+  });
 
   test('renameCollection handler renames the targeted collection', async () => {
     const store = new BookmarkStore(new FakeMemento());
@@ -730,47 +873,111 @@ suite('commands - collections', () => {
   });
 });
 
+// The VS Code Extension Test Host activates this extension for real at some point during the
+// mocha run (package.json's `"activationEvents": []` implies `onStartupFinished`), independent of
+// test/file order — permanently registering the real `bookmarks.*` commands, including
+// `bookmarks.toggleGroupByRepo` / `bookmarks.refresh`, through the real extension's own
+// `context.subscriptions` (never disposed mid-process). `vscode.commands.registerCommand` is a
+// single, non-idempotent, process-wide registry, so once real activation has claimed an id, any
+// later `registerCommand` call for that same id — such as this suite's stub-context registration —
+// throws `command '...' already exists`, and there is no supported API to unregister a command
+// owned by a `Disposable` this suite never held. This is not just a "runs late in the file" problem:
+// PR #75's CI run proved real activation can land in the middle of the (textually earlier, four-test)
+// `registerAddCommands` suite too — the third test passed, then the fourth failed with `command
+// 'bookmarks.addFile' already exists`, because activation registered it in the gap between the two
+// tests. That suite now uses this same shim (see its comment above) rather than relying on running
+// "early enough" to win a race that has no guaranteed winner.
+//
+// These two tests isolate themselves from that shared, uncontrollable global registry by swapping
+// `vscode.commands.registerCommand` / `executeCommand` for an in-memory stand-in for the test's
+// duration only, then restoring the originals. `registerViewCommands` still calls the exact same
+// API surface with the exact same signatures, and the test still dispatches by command id through
+// `vscode.commands.executeCommand` — so this still proves `registerViewCommands` wires
+// `bookmarks.toggleGroupByRepo` / `bookmarks.refresh` to the given `BookmarksTreeDataProvider`
+// exactly as a real command dispatch would. It just never touches the real extension's
+// registrations, so the assertions no longer depend on winning a timing race against
+// `onStartupFinished`. Any id not registered through the shim falls through to the real dispatcher,
+// so this cannot mask an unrelated command lookup.
+async function withIsolatedCommandRegistry<T>(run: () => Promise<T>): Promise<T> {
+  const realRegisterCommand = vscode.commands.registerCommand;
+  const realExecuteCommand = vscode.commands.executeCommand;
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+
+  (vscode.commands as { registerCommand: typeof vscode.commands.registerCommand }).registerCommand = ((
+    command: string,
+    callback: (...args: unknown[]) => unknown,
+    thisArg?: unknown
+  ) => {
+    handlers.set(command, thisArg === undefined ? callback : callback.bind(thisArg));
+    return { dispose: () => handlers.delete(command) };
+  }) as typeof vscode.commands.registerCommand;
+
+  (vscode.commands as { executeCommand: typeof vscode.commands.executeCommand }).executeCommand = (async (
+    command: string,
+    ...rest: unknown[]
+  ) => {
+    const handler = handlers.get(command);
+    if (!handler) {
+      return realExecuteCommand(command, ...rest);
+    }
+    return handler(...rest);
+  }) as typeof vscode.commands.executeCommand;
+
+  try {
+    return await run();
+  } finally {
+    (vscode.commands as { registerCommand: typeof vscode.commands.registerCommand }).registerCommand =
+      realRegisterCommand;
+    (vscode.commands as { executeCommand: typeof vscode.commands.executeCommand }).executeCommand =
+      realExecuteCommand;
+  }
+}
+
 suite('commands - view (toggleGroupByRepo / refresh)', () => {
   test('toggleGroupByRepo flips between default and byRepo', async () => {
-    const store = new BookmarkStore(new FakeMemento());
-    const cache = new FsGitCache(async () => ({ exists: true }));
-    const provider = new BookmarksTreeDataProvider(store, cache);
-    const subscriptions: vscode.Disposable[] = [];
-    registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
+    await withIsolatedCommandRegistry(async () => {
+      const store = new BookmarkStore(new FakeMemento());
+      const cache = new FsGitCache(async () => ({ exists: true }));
+      const provider = new BookmarksTreeDataProvider(store, cache);
+      const subscriptions: vscode.Disposable[] = [];
+      registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
 
-    try {
-      assert.strictEqual(provider.getGroupMode(), 'default');
-      await vscode.commands.executeCommand('bookmarks.toggleGroupByRepo');
-      assert.strictEqual(provider.getGroupMode(), 'byRepo');
-      await vscode.commands.executeCommand('bookmarks.toggleGroupByRepo');
-      assert.strictEqual(provider.getGroupMode(), 'default');
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
+      try {
+        assert.strictEqual(provider.getGroupMode(), 'default');
+        await vscode.commands.executeCommand('bookmarks.toggleGroupByRepo');
+        assert.strictEqual(provider.getGroupMode(), 'byRepo');
+        await vscode.commands.executeCommand('bookmarks.toggleGroupByRepo');
+        assert.strictEqual(provider.getGroupMode(), 'default');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
   });
 
   test('refresh invalidates the cache so the next render re-resolves', async () => {
-    let resolveCalls = 0;
-    const store = new BookmarkStore(new FakeMemento());
-    const cache = new FsGitCache(async () => {
-      resolveCalls++;
-      return { exists: true };
+    await withIsolatedCommandRegistry(async () => {
+      let resolveCalls = 0;
+      const store = new BookmarkStore(new FakeMemento());
+      const cache = new FsGitCache(async () => {
+        resolveCalls++;
+        return { exists: true };
+      });
+      const provider = new BookmarksTreeDataProvider(store, cache);
+      const subscriptions: vscode.Disposable[] = [];
+      registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
+
+      try {
+        const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+        assert.strictEqual(resolveCalls, 1);
+
+        await vscode.commands.executeCommand('bookmarks.refresh');
+        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+        assert.strictEqual(resolveCalls, 2);
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
     });
-    const provider = new BookmarksTreeDataProvider(store, cache);
-    const subscriptions: vscode.Disposable[] = [];
-    registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
-
-    try {
-      const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-      await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
-      assert.strictEqual(resolveCalls, 1);
-
-      await vscode.commands.executeCommand('bookmarks.refresh');
-      await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
-      assert.strictEqual(resolveCalls, 2);
-    } finally {
-      subscriptions.forEach((d) => d.dispose());
-    }
   });
 });
 

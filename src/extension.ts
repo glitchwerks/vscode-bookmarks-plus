@@ -113,7 +113,7 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => globalStore.dispose() }
   );
 
-  registerAddCommands(context, store);
+  registerAddCommands(context, stores);
   registerItemCommands(context, stores);
   registerCollectionCommands(context, stores);
   registerDescriptionCommands(context, stores);
