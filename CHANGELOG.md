@@ -20,6 +20,18 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   Claude Code. The server now reads `CLAUDE_PROJECT_DIR`, which Claude Code sets automatically
   for any MCP server it spawns for a project, letting a project-scoped `.mcp.json` entry carry
   no workspace path at all. See the README's "Recommended: project-scoped, path-free" section.
+- Global bookmarks (#55): a new scope, backed by a second `BookmarkStore` over
+  `context.globalState`, available in every workspace rather than just the one it was added from.
+  No cross-machine sync — `setKeysForSync` is never called on it.
+- A pinned "Global" row in the tree view, always shown first, with the same collection,
+  reorder, and drag-and-drop support as workspace bookmarks.
+- New commands to bookmark a file or folder into the global scope from the Explorer context
+  menu, and to create a global collection from the Global row.
+- Drag-and-drop now refuses cross-scope moves — a workspace bookmark can't be dropped into the
+  Global row's section, and a global bookmark can't be dropped into a workspace collection.
+  Reordering and moving within a single scope is unchanged.
+- Global bookmarks are not mirrored to `.vscode/bookmarks.json` and are therefore not visible to
+  the MCP server; only workspace bookmarks are.
 
 ### Changed
 
