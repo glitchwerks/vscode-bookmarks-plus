@@ -183,10 +183,26 @@ suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   });
 });
 
-function makeDropTransfer(ids: string[]): vscode.DataTransfer {
+/**
+ * T6 (#55 D5): the drag transfer payload is a scope-tagged envelope, not a bare id array — this
+ * is what lets handleDrop tell a workspace-scoped drag apart from a global-scoped one and refuse
+ * cross-scope moves. Every existing drop test must build its transfer through this shape.
+ */
+type DragScope = 'workspace' | 'global';
+interface DragEnvelope {
+  scope: DragScope;
+  ids: string[];
+}
+
+function makeDropTransfer(scope: DragScope, ids: string[]): vscode.DataTransfer {
   const dt = new vscode.DataTransfer();
-  dt.set(DND_MIME_TYPE, new vscode.DataTransferItem(ids));
+  dt.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope, ids }));
   return dt;
+}
+
+/** Reads the scope-tagged envelope back out of a DataTransfer set up by handleDrag, if any. */
+function getTransferEnvelope(dt: vscode.DataTransfer): DragEnvelope | undefined {
+  return dt.get(DND_MIME_TYPE)?.value as DragEnvelope | undefined;
 }
 
 suite('BookmarksTreeDataProvider - drag and drop', () => {
@@ -196,7 +212,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
 
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrop(undefined, makeDropTransfer([a.id]), token);
+    await provider.handleDrop(undefined, makeDropTransfer('workspace', [a.id]), token);
 
     const data = store.getAll();
     const byId = (id: string) => data.items.find((i) => i.id === id)!;
@@ -213,7 +229,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
 
     const targetNode: BookmarkNode = { kind: 'collection', collection, scope: 'workspace' };
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrop(targetNode, makeDropTransfer([item.id]), token);
+    await provider.handleDrop(targetNode, makeDropTransfer('workspace', [item.id]), token);
 
     const data = store.getAll();
     const moved = data.items.find((i) => i.id === item.id)!;
@@ -233,7 +249,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
 
     const targetNode: BookmarkNode = { kind: 'item', item: a, scope: 'workspace' }; // drop c onto a's position
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrop(targetNode, makeDropTransfer([c.id]), token);
+    await provider.handleDrop(targetNode, makeDropTransfer('workspace', [c.id]), token);
 
     const data = store.getAll();
     const byId = (id: string) => data.items.find((i) => i.id === id)!;
@@ -248,7 +264,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrop(undefined, makeDropTransfer([item.id]), token);
+    await provider.handleDrop(undefined, makeDropTransfer('workspace', [item.id]), token);
 
     const untouched = store.getAll().items.find((i) => i.id === item.id)!;
     assert.strictEqual(untouched.collectionId, null);
@@ -265,6 +281,206 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     await provider.handleDrag([{ kind: 'item', item, scope: 'workspace' }], dt, token);
 
     assert.strictEqual(dt.get(DND_MIME_TYPE), undefined);
+  });
+
+  test('handleDrag on an all-workspace-scope selection sets a workspace-scoped transfer envelope', async () => {
+    const { store, provider } = makeProvider();
+    const a = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+    const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
+
+    const dt = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag(
+      [
+        { kind: 'item', item: a, scope: 'workspace' },
+        { kind: 'item', item: b, scope: 'workspace' }
+      ],
+      dt,
+      token
+    );
+
+    const envelope = getTransferEnvelope(dt);
+    assert.ok(envelope, 'expected a transfer envelope to be set for an all-workspace selection');
+    assert.strictEqual(envelope!.scope, 'workspace');
+    assert.deepStrictEqual([...envelope!.ids].sort(), [a.id, b.id].sort());
+  });
+
+  test('handleDrag on an all-global-scope selection sets a global-scoped transfer envelope', async () => {
+    const { globalStore, provider } = makeProviderWithGlobal();
+    const a = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
+    const b = await globalStore.addItem({ type: 'file', uri: 'file:///global-b.txt' });
+
+    const dt = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag(
+      [
+        { kind: 'item', item: a, scope: 'global' },
+        { kind: 'item', item: b, scope: 'global' }
+      ],
+      dt,
+      token
+    );
+
+    const envelope = getTransferEnvelope(dt);
+    assert.ok(envelope, 'expected a transfer envelope to be set for an all-global selection');
+    assert.strictEqual(envelope!.scope, 'global');
+    assert.deepStrictEqual([...envelope!.ids].sort(), [a.id, b.id].sort());
+  });
+
+  test('handleDrag with a mixed-scope selection sets no transfer data', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
+
+    const dt = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag(
+      [
+        { kind: 'item', item: workspaceItem, scope: 'workspace' },
+        { kind: 'item', item: globalItem, scope: 'global' }
+      ],
+      dt,
+      token
+    );
+
+    assert.strictEqual(
+      dt.get(DND_MIME_TYPE),
+      undefined,
+      'a selection mixing workspace and global items must set no transfer data at all'
+    );
+  });
+
+  test('a global-scope envelope dropped on a workspace collection is a no-op in both stores', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const workspaceCollection = await store.addCollection('WorkCol');
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
+
+    const targetNode: BookmarkNode = { kind: 'collection', collection: workspaceCollection, scope: 'workspace' };
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(targetNode, makeDropTransfer('global', [globalItem.id]), token);
+
+    const untouchedGlobal = globalStore.getAll().items.find((i) => i.id === globalItem.id)!;
+    assert.strictEqual(untouchedGlobal.collectionId, null, 'the global item must not move into the workspace collection');
+    assert.strictEqual(
+      store.getAll().items.length,
+      0,
+      'nothing may be created in the workspace store by a refused cross-scope drop'
+    );
+  });
+
+  test('a global-scope envelope dropped on a global collection moves within the global store, workspace store untouched', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const targetNode: BookmarkNode = { kind: 'collection', collection: globalCollection, scope: 'global' };
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(targetNode, makeDropTransfer('global', [globalItem.id]), token);
+
+    const moved = globalStore.getAll().items.find((i) => i.id === globalItem.id)!;
+    assert.strictEqual(moved.collectionId, globalCollection.id, 'the global item must move into the global collection');
+    assert.strictEqual(
+      store.getAll().items.every((i) => i.uri === 'file:///workspace-a.txt'),
+      true,
+      'the workspace store must be untouched by a same-scope global drop'
+    );
+    assert.strictEqual(store.getAll().items.length, 1);
+  });
+
+  test('a global-scope envelope dropped on the Global row ungroups within the global store', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    const globalItem = await globalStore.addItem({
+      type: 'file',
+      uri: 'file:///global-a.txt',
+      collectionId: globalCollection.id
+    });
+    await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const rootChildren = await provider.getChildren();
+    const globalRootNode = rootChildren.find((n) => n.kind === 'globalRoot')!;
+    assert.ok(globalRootNode, 'expected a Global row to drop onto');
+
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(globalRootNode, makeDropTransfer('global', [globalItem.id]), token);
+
+    const moved = globalStore.getAll().items.find((i) => i.id === globalItem.id)!;
+    assert.strictEqual(moved.collectionId, null, 'dropping on the Global row must ungroup the item within the global store');
+    assert.strictEqual(store.getAll().items.length, 1, 'the workspace store must be untouched');
+    assert.strictEqual(store.getAll().items[0].collectionId, null);
+  });
+
+  test('a global-scope envelope dropped with no target is a no-op (refused per D5)', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    const globalItem = await globalStore.addItem({
+      type: 'file',
+      uri: 'file:///global-a.txt',
+      collectionId: globalCollection.id
+    });
+    await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(undefined, makeDropTransfer('global', [globalItem.id]), token);
+
+    const untouched = globalStore.getAll().items.find((i) => i.id === globalItem.id)!;
+    assert.strictEqual(
+      untouched.collectionId,
+      globalCollection.id,
+      'an untargeted drop of a global-scope payload must refuse, not fall back to the workspace root'
+    );
+    assert.strictEqual(store.getAll().items.length, 1, 'the workspace store must be untouched');
+  });
+
+  test('a workspace-scope envelope dropped on a global collection is a no-op in both stores', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const globalCollection = await globalStore.addCollection('GlobalCol');
+    const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const targetNode: BookmarkNode = { kind: 'collection', collection: globalCollection, scope: 'global' };
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(targetNode, makeDropTransfer('workspace', [workspaceItem.id]), token);
+
+    const untouched = store.getAll().items.find((i) => i.id === workspaceItem.id)!;
+    assert.strictEqual(untouched.collectionId, null, 'the workspace item must not move into the global collection');
+    assert.strictEqual(
+      globalStore.getAll().items.length,
+      0,
+      'nothing may be created in the global store by a refused cross-scope drop'
+    );
+  });
+
+  test('a workspace-scope envelope dropped on the Global row is a no-op in both stores', async () => {
+    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const rootChildren = await provider.getChildren();
+    const globalRootNode = rootChildren.find((n) => n.kind === 'globalRoot')!;
+    assert.ok(globalRootNode, 'expected a Global row to drop onto');
+
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(globalRootNode, makeDropTransfer('workspace', [workspaceItem.id]), token);
+
+    const untouched = store.getAll().items.find((i) => i.id === workspaceItem.id)!;
+    assert.strictEqual(untouched.collectionId, null, 'a workspace-scoped payload must not be absorbed into the global store');
+    assert.strictEqual(untouched.order, 0, 'the workspace item must not have been moved at all');
+    assert.strictEqual(globalStore.getAll().items.length, 0, 'nothing may be created in the global store');
+  });
+
+  test('a global-scope envelope is a no-op when the provider has no globalStore (defensive)', async () => {
+    const { store, provider } = makeProvider();
+    const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
+
+    const token = new vscode.CancellationTokenSource().token;
+    // Not reachable via the real UI (handleDrag can't produce a global envelope without a global
+    // store), but handleDrop must still defend against it rather than throwing or falling through
+    // to the workspace store.
+    await provider.handleDrop(undefined, makeDropTransfer('global', [workspaceItem.id]), token);
+
+    const untouched = store.getAll().items.find((i) => i.id === workspaceItem.id)!;
+    assert.strictEqual(untouched.collectionId, null);
+    assert.strictEqual(untouched.order, 0, 'the workspace store must not be mistakenly used as the fallback for a global envelope');
   });
 });
 
