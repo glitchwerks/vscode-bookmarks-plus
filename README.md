@@ -7,11 +7,16 @@ See `docs/superpowers/specs/` for the design spec.
 ## Features
 
 - Bookmark whole files and folders — not just lines — per workspace.
+- Global bookmarks: a pinned "Global" row in the tree holds bookmarks that are available in every
+  workspace, with the same collection, reorder, and drag-and-drop support as workspace bookmarks.
+  Moves and reordering stay within whichever scope you're in — dragging a bookmark across scopes
+  is refused.
 - Organize bookmarks into collections; drag and drop to reorder or move between collections.
 - Group the view by git repository, with a dedicated "Unknown" group for anything unresolved.
 - Broken bookmarks (moved/deleted targets) show a warning icon instead of erroring.
 - Add an optional description to any bookmark or collection — shown on hover.
-- Bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit them.
+- Workspace bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit
+  them. Global bookmarks are never mirrored — see "The `.vscode/bookmarks.json` mirror" below.
 
 ![Bookmarks Plus screenshot](images/screenshot.png)
 
@@ -43,6 +48,10 @@ server — can read and change them.
 - **Single-folder workspaces only.** In a multi-root workspace there is no unambiguous place to
   put the file (the folder order is user-changeable), so the mirror is disabled and a line is
   logged to the output channel. Bookmarks and descriptions work normally.
+- **Global bookmarks are never mirrored.** The mirror only ever reflects the workspace-scoped
+  store — there is no unambiguous single-workspace location to write a global bookmark's mirror
+  entry to. Global bookmarks are invisible to `.vscode/bookmarks.json` and, by extension, to
+  anything that only reads that file (see "Using bookmarks from Claude (MCP server)" below).
 - **Source control is your choice.** The extension neither commits nor ignores the file. Commit
   it to share a bookmark set with your team, or add `.vscode/bookmarks.json` to `.gitignore` to
   keep it private — bookmarks were private-per-user before this file existed.
@@ -52,7 +61,9 @@ server — can read and change them.
 `mcp-server/` is a standalone Node/TypeScript package that exposes a workspace's
 `.vscode/bookmarks.json` mirror to Claude Desktop and Claude Code over the Model Context
 Protocol (stdio). It reads and writes the same mirror file described above — it has no other
-connection to the extension and works whether or not VS Code is running.
+connection to the extension and works whether or not VS Code is running. Because the mirror only
+ever holds workspace-scoped bookmarks, the MCP server only ever sees those — global bookmarks are
+never visible to it.
 
 ### Build
 

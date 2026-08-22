@@ -211,6 +211,11 @@ Four cases are handled, and each degrades without surfacing an error dialog:
   - Grouped-by-repo rendering with no active Git repository: when `vscode.git` is unavailable or no item resolves to a repo root, the view degrades to an ungrouped (or all-"Unknown") render without throwing.
   - Broken-path rendering: an item whose `fs.stat` lookup fails renders with the warning icon overlay and greyed text, and does not throw.
   - Click/reveal behavior: clicking a file bookmark opens it in the editor; clicking a folder bookmark triggers `bookmarks.reveal` (reveal in Explorer) and never attempts an inline expand, consistent with folder items always being leaf nodes ([§5](#5-commands)).
+- **Global scope (issue #55):**
+  - Unit tests exercise the global-scoped `BookmarkStore` instance constructed over `context.globalState` ([§2](#2-architecture)): it never reads or writes the mirror-bookkeeping keys and never calls `setKeysForSync`, so global bookmarks stay unsynced and un-mirrored by construction, not by an explicit exclusion the tests have to special-case.
+  - Integration tests cover `BookmarksTreeDataProvider`'s rendering of the pinned Global row ([§4](#4-ui--tree-view)): it is present and first among root children even when both stores are empty, its children come from the global store's own collections and ungrouped items, and global nodes never leak into the workspace section's children or vice versa.
+  - Tests for the scope-routed command handlers ([§5](#5-commands)) assert that each handler mutates only the store matching the scope carried on the node it acted on, leaving the other store untouched — including the "move to collection" flow, which offers only same-scope collections.
+  - Tests for the drag-and-drop scope guard ([§4](#4-ui--tree-view)) cover same-scope moves (allowed, unchanged from v1.0), cross-scope moves refused in both directions (a workspace payload dropped on the Global row, and a global payload dropped on a workspace collection), and dropping a global payload onto the Global row itself, which ungroups within the global scope and is allowed.
 
 ## 8. Packaging / publishing
 
