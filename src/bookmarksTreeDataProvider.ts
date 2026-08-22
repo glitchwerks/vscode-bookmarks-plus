@@ -3,6 +3,7 @@ import * as path from 'path';
 import { BookmarkStore } from './bookmarkStore';
 import { BookmarkItem, BookmarkCollection, BookmarkScope } from './types';
 import { FsGitCache } from './fsGitCache';
+import { isInsideWorkspace } from './workspaceFolders';
 
 export type GroupMode = 'default' | 'byRepo';
 
@@ -42,7 +43,9 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   constructor(
     private readonly store: BookmarkStore,
     private readonly cache: FsGitCache,
-    private readonly globalStore?: BookmarkStore
+    private readonly globalStore?: BookmarkStore,
+    private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () =>
+      vscode.workspace.workspaceFolders
   ) {
     this.store.onBookmarksChanged(() => {
       this.cache.invalidateAll();
@@ -190,7 +193,12 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
     const treeItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
     treeItem.id = `item:${bookmark.id}`;
-    treeItem.contextValue = 'bookmarkItem';
+    // A global-scoped folder bookmark not already inside a current workspace folder gets a
+    // distinct contextValue so a future "Add to Workspace" command (T10) can target it via a
+    // `view/item/context` when clause (#56, T9).
+    const isAddableGlobalFolder =
+      node.scope === 'global' && bookmark.type === 'folder' && !isInsideWorkspace(uri, this.getWorkspaceFolders());
+    treeItem.contextValue = isAddableGlobalFolder ? 'bookmarkItem-addable' : 'bookmarkItem';
     treeItem.resourceUri = uri;
     if (bookmark.description) {
       // TreeItem.description is already taken by the 'missing'/repo-name badge below,

@@ -60,12 +60,12 @@
         { "command": "bookmarks.refresh", "when": "view == bookmarksView", "group": "navigation@3" }
       ],
       "view/item/context": [
-        { "command": "bookmarks.remove", "when": "view == bookmarksView && viewItem == bookmarkItem", "group": "inline@1" },
-        { "command": "bookmarks.reveal", "when": "view == bookmarksView && viewItem == bookmarkItem", "group": "inline@2" },
-        { "command": "bookmarks.moveToCollection", "when": "view == bookmarksView && viewItem == bookmarkItem", "group": "inline@3" },
+        { "command": "bookmarks.remove", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@1" },
+        { "command": "bookmarks.reveal", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@2" },
+        { "command": "bookmarks.moveToCollection", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@3" },
         { "command": "bookmarks.renameCollection", "when": "view == bookmarksView && viewItem == bookmarkCollection", "group": "inline@1" },
         { "command": "bookmarks.deleteCollection", "when": "view == bookmarksView && viewItem == bookmarkCollection", "group": "inline@2" },
-        { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem == bookmarkItem", "group": "bookmarks@1" },
+        { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "bookmarks@1" },
         { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem == bookmarkCollection", "group": "bookmarks@1" },
         { "command": "bookmarks.newGlobalCollection", "when": "view == bookmarksView && viewItem == bookmarkGlobalRoot", "group": "inline@1" }
       ],
