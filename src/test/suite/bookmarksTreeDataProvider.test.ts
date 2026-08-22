@@ -560,12 +560,15 @@ function excludeGlobalRoot(nodes: BookmarkNode[]): BookmarkNode[] {
 }
 
 function makeProviderWithGlobal(
-  resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })
+  resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true }),
+  getWorkspaceFolders?: () => readonly vscode.WorkspaceFolder[] | undefined
 ) {
   const store = new BookmarkStore(new FakeMemento());
   const globalStore = new BookmarkStore(new FakeMemento());
   const cache = new FsGitCache(resolve);
-  const provider = new BookmarksTreeDataProvider(store, cache, globalStore);
+  const provider = getWorkspaceFolders
+    ? new BookmarksTreeDataProvider(store, cache, globalStore, getWorkspaceFolders)
+    : new BookmarksTreeDataProvider(store, cache, globalStore);
   return { store, globalStore, cache, provider };
 }
 
@@ -800,5 +803,81 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
     assert.strictEqual(itemsInGlobalCollection.length, 1);
     assert.strictEqual(itemsInGlobalCollection[0].kind, 'item');
     assert.strictEqual((itemsInGlobalCollection[0] as { item: { id: string } }).item.id, globalItem.id);
+  });
+});
+
+// --- T9: "addable" contextValue for global folders outside the current workspace (#56) --------
+//
+// A global-scoped *folder* bookmark whose target directory is not already part of the current
+// workspace gets a distinct contextValue so a future "Add to Workspace" command (T10) can target
+// it via a `view/item/context` `when` clause. Every other combination (workspace-scoped items,
+// global files, global folders already inside the workspace) keeps today's plain 'bookmarkItem'.
+
+/** Builds a `vscode.WorkspaceFolder`-shaped fixture, mirroring workspaceFolders.test.ts's `folder()`. */
+function workspaceFolder(uri: vscode.Uri, name = 'workspace-folder', index = 0): vscode.WorkspaceFolder {
+  return { uri, name, index };
+}
+
+suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)', () => {
+  test('a global folder bookmark outside every workspace folder gets the addable contextValue', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem-addable');
+  });
+
+  test('a global folder bookmark already inside a workspace folder keeps the plain contextValue', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/global/some-repo'))];
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem');
+  });
+
+  test('a global file bookmark outside every workspace folder never gets the addable contextValue', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const item = await globalStore.addItem({ type: 'file', uri: 'file:///global/some-file.txt' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem', 'files can never be added as a workspace folder');
+  });
+
+  test('a workspace-scoped folder bookmark outside every current workspace folder is still never addable', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
+    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const item = await store.addItem({ type: 'folder', uri: 'file:///workspace/some-repo' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(
+      treeItem.contextValue,
+      'bookmarkItem',
+      'workspace-scoped items are never addable, regardless of where their target sits'
+    );
+  });
+
+  test('a global folder bookmark gets the addable contextValue when no workspace is open at all (folders undefined)', async () => {
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => undefined);
+    const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem-addable', 'an empty window (no workspace) still counts as "outside"');
+  });
+
+  test('a global folder bookmark gets the addable contextValue when the workspace folder list is empty', async () => {
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => []);
+    const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem-addable');
   });
 });
