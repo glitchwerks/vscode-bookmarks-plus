@@ -32,7 +32,8 @@ suite('Extension activation', () => {
       'bookmarks.refresh',
       'bookmarks.addFileGlobal',
       'bookmarks.addFolderGlobal',
-      'bookmarks.newGlobalCollection'
+      'bookmarks.newGlobalCollection',
+      'bookmarks.addToWorkspace'
     ];
 
     for (const command of expected) {
