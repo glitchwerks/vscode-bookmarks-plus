@@ -3,10 +3,13 @@ import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { BookmarkNode, BookmarksTreeDataProvider } from '../../bookmarksTreeDataProvider';
 import { FsGitCache } from '../../fsGitCache';
-import { BookmarkItem } from '../../types';
+import { BookmarkCollection, BookmarkItem } from '../../types';
+import { isInsideWorkspace } from '../../workspaceFolders';
 import {
+  AddToWorkspaceDeps,
   createAddFileHandler,
   createAddFolderHandler,
+  createAddToWorkspaceHandler,
   createRemoveHandler,
   createRevealHandler,
   Prompter,
@@ -1129,5 +1132,307 @@ suite('commands - setDescription', () => {
 
     assert.strictEqual(workspace.getAll().items[0].description, 'project-specific');
     assertUntouched(global, globalMemento, globalBefore, 'global');
+  });
+});
+
+// T10 (#55/#56) `createAddToWorkspaceHandler`: promotes an addable global folder into the current
+// workspace via `vscode.workspace.updateWorkspaceFolders`. Contract pinned in
+// docs/superpowers/plans/2026-08-15-global-bookmarks-and-add-to-workspace.md §6 T10.
+//
+// `folder()` mirrors the fixture shape already used in workspaceFolders.test.ts:10-12 — `index`
+// isn't part of any contract this handler reads, a fixed default is fine.
+function folder(uri: vscode.Uri, name = 'workspace-folder', index = 0): vscode.WorkspaceFolder {
+  return { uri, name, index };
+}
+
+interface UpdateWorkspaceFoldersCall {
+  start: number;
+  deleteCount: number | undefined | null;
+  folders: { uri: vscode.Uri; name?: string }[];
+}
+
+interface AddToWorkspaceFakes {
+  deps: AddToWorkspaceDeps;
+  /** Ordered log of every side-effecting call the handler made, across all three fakes. */
+  calls: string[];
+  updateCalls: UpdateWorkspaceFoldersCall[];
+  infoMessages: string[];
+  confirmCalls: Array<{ message: string; confirmLabel: string }>;
+}
+
+/**
+ * Builds a fresh set of `AddToWorkspaceDeps` fakes plus recorders. `calls` is the single shared
+ * ordering log ('confirm' / 'flush' / 'update') used to pin the confirm-before-flush-before-update
+ * sequence, the flush-must-precede-mutation risk (plan risk 2), and the never-call-twice rule all
+ * in one assertion per test, rather than needing a dedicated "called exactly once" test.
+ */
+function makeAddToWorkspaceFakes(
+  options: {
+    folders?: readonly vscode.WorkspaceFolder[] | undefined;
+    confirmResult?: boolean;
+    updateResult?: boolean;
+  } = {}
+): AddToWorkspaceFakes {
+  const calls: string[] = [];
+  const updateCalls: UpdateWorkspaceFoldersCall[] = [];
+  const infoMessages: string[] = [];
+  const confirmCalls: Array<{ message: string; confirmLabel: string }> = [];
+  const confirmResult = options.confirmResult ?? true;
+  const updateResult = options.updateResult ?? true;
+
+  const deps: AddToWorkspaceDeps = {
+    prompter: {
+      showWarningConfirm: async (message: string, confirmLabel: string) => {
+        calls.push('confirm');
+        confirmCalls.push({ message, confirmLabel });
+        return confirmResult;
+      },
+      showInfo: async (message: string) => {
+        infoMessages.push(message);
+      }
+    },
+    getWorkspaceFolders: () => options.folders,
+    updateWorkspaceFolders: (
+      start: number,
+      deleteCount: number | undefined | null,
+      ...foldersToAdd: { uri: vscode.Uri; name?: string }[]
+    ) => {
+      calls.push('update');
+      updateCalls.push({ start, deleteCount, folders: foldersToAdd });
+      return updateResult;
+    },
+    flushMirrorWrites: async () => {
+      calls.push('flush');
+    }
+  };
+
+  return { deps, calls, updateCalls, infoMessages, confirmCalls };
+}
+
+function folderItem(uri: vscode.Uri, id = 'addable-folder'): BookmarkItem {
+  return { id, type: 'folder', uri: uri.toString(), collectionId: null, order: 0 };
+}
+
+suite('commands - addToWorkspace', () => {
+  // A location that is never inside any of this suite's fixture workspace-folder lists, so it is
+  // always the "outside the workspace" addable case unless a test constructs its own uri.
+  const outsideUri = vscode.Uri.file('/outside/new-folder');
+
+  function assertNoSideEffects(fakes: AddToWorkspaceFakes): void {
+    assert.deepStrictEqual(
+      fakes.calls,
+      [],
+      'a refused node must never call updateWorkspaceFolders or flushMirrorWrites'
+    );
+  }
+
+  test('refuses a workspace-scoped folder item', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'workspace'
+    });
+    assertNoSideEffects(fakes);
+  });
+
+  test('refuses a global-scoped file item', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    const item: BookmarkItem = {
+      id: 'global-file',
+      type: 'file',
+      uri: outsideUri.toString(),
+      collectionId: null,
+      order: 0
+    };
+    await createAddToWorkspaceHandler(fakes.deps)({ kind: 'item', item, scope: 'global' });
+    assertNoSideEffects(fakes);
+  });
+
+  test('refuses a global folder item that is already inside the workspace', async () => {
+    const root = vscode.Uri.file('/workspace/project');
+    const folders = [folder(root)];
+    const descendantUri = vscode.Uri.file('/workspace/project/subfolder');
+    assert.strictEqual(
+      isInsideWorkspace(descendantUri, folders),
+      true,
+      'fixture precondition: the descendant uri must actually be inside these folders'
+    );
+    const fakes = makeAddToWorkspaceFakes({ folders });
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(descendantUri),
+      scope: 'global'
+    });
+    assertNoSideEffects(fakes);
+  });
+
+  test('refuses a collection node', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    const collection: BookmarkCollection = { id: 'c1', name: 'Work', order: 0 };
+    await createAddToWorkspaceHandler(fakes.deps)({ kind: 'collection', collection, scope: 'global' });
+    assertNoSideEffects(fakes);
+  });
+
+  test('refuses a repoGroup node', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'repoGroup',
+      label: 'repo-a',
+      repoKey: 'repo:repo-a'
+    });
+    assertNoSideEffects(fakes);
+  });
+
+  test('refuses a globalRoot node', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    await createAddToWorkspaceHandler(fakes.deps)({ kind: 'globalRoot' });
+    assertNoSideEffects(fakes);
+  });
+
+  test('empty window (folders undefined): adds at index 0, no confirm, flush before update', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined });
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(
+      fakes.calls,
+      ['flush', 'update'],
+      'an empty window must flush the mirror before updating folders, and never confirm'
+    );
+    assert.strictEqual(fakes.updateCalls.length, 1);
+    const call = fakes.updateCalls[0];
+    assert.strictEqual(call.start, 0);
+    assert.strictEqual(call.deleteCount, null);
+    assert.strictEqual(call.folders.length, 1);
+    assert.strictEqual(call.folders[0].uri.toString(), outsideUri.toString());
+  });
+
+  test('empty window (folders []): adds at index 0, no confirm, flush before update', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: [] });
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(fakes.calls, ['flush', 'update']);
+    assert.strictEqual(fakes.updateCalls.length, 1);
+    assert.strictEqual(fakes.updateCalls[0].start, 0);
+    assert.strictEqual(fakes.updateCalls[0].deleteCount, null);
+    assert.strictEqual(fakes.updateCalls[0].folders[0].uri.toString(), outsideUri.toString());
+  });
+
+  test(
+    'single-root, confirmed: shows a confirm naming the mirror and restart consequences, then ' +
+      'flushes, then adds at index 1',
+    async () => {
+      const root = vscode.Uri.file('/workspace/project');
+      const folders = [folder(root)];
+      const fakes = makeAddToWorkspaceFakes({ folders, confirmResult: true });
+
+      await createAddToWorkspaceHandler(fakes.deps)({
+        kind: 'item',
+        item: folderItem(outsideUri),
+        scope: 'global'
+      });
+
+      assert.deepStrictEqual(
+        fakes.calls,
+        ['confirm', 'flush', 'update'],
+        'must confirm, then flush the mirror, then update folders — in that order'
+      );
+      assert.strictEqual(fakes.confirmCalls.length, 1);
+      const { message, confirmLabel } = fakes.confirmCalls[0];
+      assert.ok(message.length > 0, 'the confirm message must not be empty');
+      assert.match(
+        message,
+        /mirror|bookmarks\.json/i,
+        'the confirm message must name the mirror-disabling consequence'
+      );
+      assert.match(
+        message,
+        /restart|reload/i,
+        'the confirm message must name the possible extension-host restart consequence'
+      );
+      assert.ok(confirmLabel.length > 0, 'the confirm label must not be empty');
+
+      assert.strictEqual(fakes.updateCalls.length, 1);
+      assert.strictEqual(fakes.updateCalls[0].start, 1, 'start index must equal the current folder count (1)');
+      assert.strictEqual(fakes.updateCalls[0].deleteCount, null);
+      assert.strictEqual(fakes.updateCalls[0].folders[0].uri.toString(), outsideUri.toString());
+    }
+  );
+
+  test('single-root, declined: never updates workspace folders or flushes the mirror', async () => {
+    const root = vscode.Uri.file('/workspace/project');
+    const folders = [folder(root)];
+    const fakes = makeAddToWorkspaceFakes({ folders, confirmResult: false });
+
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(
+      fakes.calls,
+      ['confirm'],
+      'declining the confirmation must stop before any flush or update call'
+    );
+  });
+
+  test('multi-root: no confirm, adds at index equal to the current folder count', async () => {
+    const folders = [
+      folder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0),
+      folder(vscode.Uri.file('/workspace/repo-b'), 'repo-b', 1),
+      folder(vscode.Uri.file('/workspace/repo-c'), 'repo-c', 2)
+    ];
+    const fakes = makeAddToWorkspaceFakes({ folders });
+
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(
+      fakes.calls,
+      ['flush', 'update'],
+      'a transition that is already multi-root must not confirm'
+    );
+    assert.strictEqual(fakes.updateCalls.length, 1);
+    assert.strictEqual(fakes.updateCalls[0].start, 3, 'start index must equal the current folder count (3)');
+    assert.strictEqual(fakes.updateCalls[0].deleteCount, null);
+  });
+
+  test('a false return from updateWorkspaceFolders surfaces an info message and does not throw', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined, updateResult: false });
+
+    await assert.doesNotReject(
+      createAddToWorkspaceHandler(fakes.deps)({
+        kind: 'item',
+        item: folderItem(outsideUri),
+        scope: 'global'
+      })
+    );
+
+    assert.strictEqual(fakes.infoMessages.length, 1, 'a false return must surface exactly one info message');
+    assert.ok(fakes.infoMessages[0].length > 0, 'the failure message must not be empty');
+  });
+
+  test('a true return from updateWorkspaceFolders is silent (no info message)', async () => {
+    const fakes = makeAddToWorkspaceFakes({ folders: undefined, updateResult: true });
+
+    await createAddToWorkspaceHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.strictEqual(fakes.infoMessages.length, 0, 'success must not surface an info message');
   });
 });

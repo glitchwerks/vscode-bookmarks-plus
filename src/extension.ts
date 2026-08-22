@@ -9,6 +9,7 @@ import {
 import { BookmarksTreeDataProvider } from './bookmarksTreeDataProvider';
 import {
   registerAddCommands,
+  registerAddToWorkspaceCommand,
   registerCollectionCommands,
   registerDescriptionCommands,
   registerItemCommands,
@@ -114,6 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   registerAddCommands(context, stores);
+  registerAddToWorkspaceCommand(context, store);
   registerItemCommands(context, stores);
   registerCollectionCommands(context, stores);
   registerDescriptionCommands(context, stores);

@@ -4,6 +4,7 @@ import {
   BookmarkNode,
   BookmarksTreeDataProvider
 } from './bookmarksTreeDataProvider';
+import { isInsideWorkspace } from './workspaceFolders';
 
 export interface Prompter {
   showInputBox(options: vscode.InputBoxOptions): Thenable<string | undefined>;
@@ -211,6 +212,57 @@ export function createMoveToCollectionHandler(
   };
 }
 
+export interface AddToWorkspaceDeps {
+  prompter: Pick<Prompter, 'showWarningConfirm' | 'showInfo'>;
+  getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined;
+  updateWorkspaceFolders: (
+    start: number,
+    deleteCount: number | undefined | null,
+    ...foldersToAdd: { uri: vscode.Uri; name?: string }[]
+  ) => boolean;
+  flushMirrorWrites: () => Promise<void>;
+}
+
+/**
+ * Promotes an addable global folder bookmark (already-filtered by contextValue in the tree, see
+ * `bookmarksTreeDataProvider.ts:201`, T9) into the current workspace via
+ * `vscode.workspace.updateWorkspaceFolders`. Contract pinned in
+ * docs/superpowers/plans/2026-08-15-global-bookmarks-and-add-to-workspace.md §6 T10.
+ */
+export function createAddToWorkspaceHandler(
+  deps: AddToWorkspaceDeps
+): (node: BookmarkNode) => Promise<void> {
+  return async (node: BookmarkNode): Promise<void> => {
+    if (node.kind !== 'item' || node.scope !== 'global' || node.item.type !== 'folder') {
+      return;
+    }
+    const uri = vscode.Uri.parse(node.item.uri);
+    const folders = deps.getWorkspaceFolders();
+    if (isInsideWorkspace(uri, folders)) {
+      return;
+    }
+
+    const start = folders?.length ?? 0;
+    if (start === 1) {
+      const confirmed = await deps.prompter.showWarningConfirm(
+        'Adding this folder will add a second root to the workspace. This disables the ' +
+          '.vscode/bookmarks.json mirror for the workspace and may restart or reload the ' +
+          'extension host.',
+        'Add Folder'
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    await deps.flushMirrorWrites();
+    const succeeded = deps.updateWorkspaceFolders(start, null, { uri });
+    if (!succeeded) {
+      await deps.prompter.showInfo('Could not add the folder to the workspace.');
+    }
+  };
+}
+
 export function registerAddCommands(
   context: vscode.ExtensionContext,
   stores: ScopedStores
@@ -234,6 +286,25 @@ export function registerAddCommands(
     vscode.commands.registerCommand(
       'bookmarks.addFolderGlobal',
       createAddFolderHandler(stores.global, prompter)
+    )
+  );
+}
+
+export function registerAddToWorkspaceCommand(
+  context: vscode.ExtensionContext,
+  workspaceStore: BookmarkStore
+): void {
+  const deps: AddToWorkspaceDeps = {
+    prompter: createPrompter(),
+    getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
+    updateWorkspaceFolders: (start, deleteCount, ...foldersToAdd) =>
+      vscode.workspace.updateWorkspaceFolders(start, deleteCount, ...foldersToAdd),
+    flushMirrorWrites: () => workspaceStore.flushMirrorWrites()
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'bookmarks.addToWorkspace',
+      createAddToWorkspaceHandler(deps)
     )
   );
 }
