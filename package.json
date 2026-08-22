@@ -73,7 +73,8 @@
         { "command": "bookmarks.addFile", "when": "false" },
         { "command": "bookmarks.addFolder", "when": "false" },
         { "command": "bookmarks.addFileGlobal", "when": "false" },
-        { "command": "bookmarks.addFolderGlobal", "when": "false" }
+        { "command": "bookmarks.addFolderGlobal", "when": "false" },
+        { "command": "bookmarks.newGlobalCollection", "when": "false" }
       ]
     },
     "jsonValidation": [
