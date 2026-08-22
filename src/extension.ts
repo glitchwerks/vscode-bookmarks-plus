@@ -49,16 +49,19 @@ export function handleWorkspaceFoldersChanged(
   store: BookmarkStore,
   output: OutputSink,
   folders: readonly { uri: vscode.Uri }[] | undefined,
-  mirrorResources?: vscode.Disposable
+  mirrorResources?: vscode.Disposable,
+  refresh?: () => void
 ): boolean {
   const location = resolveMirrorLocation(folders);
   if (location.kind === 'enabled') {
+    refresh?.();
     return false;
   }
 
   logMirrorDisabled(output, location.reason);
   store.detachMirror();
   mirrorResources?.dispose();
+  refresh?.();
   return true;
 }
 
@@ -151,7 +154,8 @@ export function activate(context: vscode.ExtensionContext): void {
         store,
         output,
         vscode.workspace.workspaceFolders,
-        mirrorResources
+        mirrorResources,
+        () => provider?.refresh()
       );
       if (disabled) {
         mirrorResources = undefined;
