@@ -64,6 +64,26 @@ suite('Extension activation', () => {
       'bookmarks.addToWorkspace must have when: "false" in contributes.menus.commandPalette to stay hidden from the palette'
     );
   });
+
+  test('activationEvents includes onStartupFinished so early terminals still get the workspace env var', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    // Since VS Code 1.74, a contributed view activates its extension implicitly once the
+    // Bookmarks view is revealed — but a terminal opened before that (e.g. immediately after
+    // the window opens, before the user has looked at the Bookmarks view) would launch before
+    // the extension has had a chance to set BOOKMARKS_PLUS_WORKSPACE in its environment
+    // variable collection. "onStartupFinished" activates the extension shortly after VS Code
+    // starts, without delaying startup, so early terminals get the variable too. Do not remove
+    // this assertion as "redundant with implicit view activation" — it guards exactly the
+    // early-terminal case implicit activation does not cover.
+    const activationEvents: string[] = ext!.packageJSON.activationEvents;
+    assert.ok(
+      activationEvents.includes('onStartupFinished'),
+      'expected package.json activationEvents to include "onStartupFinished" so terminals opened before the Bookmarks view is revealed still receive BOOKMARKS_PLUS_WORKSPACE'
+    );
+  });
 });
 
 suite('Extension - workspace-folder mirror changes', () => {
