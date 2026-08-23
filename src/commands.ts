@@ -227,7 +227,7 @@ export interface AddToWorkspaceDeps {
  * Promotes an addable global folder bookmark (already-filtered by contextValue in the tree, see
  * `bookmarksTreeDataProvider.ts:201`, T9) into the current workspace via
  * `vscode.workspace.updateWorkspaceFolders`. Contract pinned in
- * docs/superpowers/plans/2026-08-15-global-bookmarks-and-add-to-workspace.md §6 T10.
+ * docs/superpowers/specs/2026-07-22-vscode-bookmarks-plus-design.md §5, issue #56.
  */
 export function createAddToWorkspaceHandler(
   deps: AddToWorkspaceDeps
