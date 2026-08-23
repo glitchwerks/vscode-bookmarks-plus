@@ -39,6 +39,11 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   consequences only appears when the add turns a single-folder workspace into a multi-folder one
   — the transition that also disables the `.vscode/bookmarks.json` mirror; an empty window or an
   already multi-root workspace proceeds without a prompt.
+- `BOOKMARKS_PLUS_WORKSPACE` terminal variable (#58): the extension now injects this environment
+  variable into every integrated terminal it launches, so the MCP server (#57) can resolve the
+  correct workspace without per-project registration config. A single-folder window sets the
+  folder's absolute path; two or more folders sets `disabled:multi-root`; no folder open sets
+  `disabled:no-folder`. See the README's "Configure" section for the full resolution order.
 
 ### Changed
 
@@ -52,6 +57,10 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   path-free registration form, or use the explicit `args` path override if you need a fixed
   workspace Claude Code's detection cannot override. See the README's "Legacy:
   `BOOKMARKS_MCP_WORKSPACE` — behavior change" section for the full migration note.
+- The extension now activates on VS Code startup (`onStartupFinished`), in addition to the
+  existing implicit activation when the Bookmarks view is first revealed. This is earlier
+  activation, not a fix — it ensures a terminal opened right at startup, before the view is ever
+  touched, still receives `BOOKMARKS_PLUS_WORKSPACE` (#58, above).
 
 ## [1.0.0] — 2026-07-26
 
