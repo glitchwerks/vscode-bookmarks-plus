@@ -40,6 +40,30 @@ suite('Extension activation', () => {
       assert.ok(commands.includes(command), `expected command "${command}" to be registered`);
     }
   });
+
+  test('bookmarks.addToWorkspace is hidden from the command palette like its sibling add-commands', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const commandPalette: Array<{ command: string; when?: string }> =
+      ext!.packageJSON.contributes.menus.commandPalette;
+
+    // addFile / addFolder / addFileGlobal / addFolderGlobal are all invoked with a tree-node
+    // argument and are deliberately hidden from the palette via a `when: "false"` entry.
+    // addToWorkspace takes the same kind of argument and must be hidden the same way —
+    // otherwise invoking it from the palette (no argument) throws.
+    const entry = commandPalette.find((item) => item.command === 'bookmarks.addToWorkspace');
+    assert.ok(
+      entry,
+      'expected a contributes.menus.commandPalette entry for bookmarks.addToWorkspace, matching its sibling add-commands'
+    );
+    assert.strictEqual(
+      entry!.when,
+      'false',
+      'bookmarks.addToWorkspace must have when: "false" in contributes.menus.commandPalette to stay hidden from the palette'
+    );
+  });
 });
 
 suite('Extension - workspace-folder mirror changes', () => {
