@@ -88,6 +88,56 @@ suite('workspaceEnv.resolveWorkspaceEnvValue', () => {
       assert.notStrictEqual(`${DISABLED_PREFIX}${MULTI_ROOT_SLUG}`, `${DISABLED_PREFIX}${NO_FOLDER_SLUG}`);
     });
   });
+
+  // --- T5: folder-set transitions -----------------------------------------------------------------
+  // `resolveWorkspaceEnvValue` is pure and stateless (no memoization), so these transition pairs are
+  // already satisfied by T2's implementation — they exist to pin that fact, not to drive new code.
+  // Each test calls the function twice, in the same body, and asserts on both results together so a
+  // future memoization/caching addition (which would make the second call return the first call's
+  // value) fails here. Without this comment a cleanup pass could read these as redundant with the
+  // single-call tests above and delete them — they are not: the single-call tests never observe two
+  // calls in sequence.
+  suite('folder-set transitions', () => {
+    test('enabled folder A, then enabled folder B, resolves to each folder\'s own distinct fsPath', () => {
+      const a = vscode.Uri.file('/workspace/project-a');
+      const b = vscode.Uri.file('/workspace/project-b');
+
+      const first = resolveWorkspaceEnvValue([folder(a)]);
+      const second = resolveWorkspaceEnvValue([folder(b)]);
+
+      assert.strictEqual(first, a.fsPath);
+      assert.strictEqual(second, b.fsPath);
+      assert.notStrictEqual(first, second);
+    });
+
+    test('enabled single folder, then multi-root, resolves to the fsPath then the multi-root sentinel', () => {
+      const single = vscode.Uri.file('/workspace/project-a');
+      const multi = [
+        folder(vscode.Uri.file('/workspace/repo-a')),
+        folder(vscode.Uri.file('/workspace/repo-b'))
+      ];
+
+      const first = resolveWorkspaceEnvValue([folder(single)]);
+      const second = resolveWorkspaceEnvValue(multi);
+
+      assert.strictEqual(first, single.fsPath);
+      assert.strictEqual(second, `${DISABLED_PREFIX}${MULTI_ROOT_SLUG}`);
+    });
+
+    test('multi-root, then enabled single folder, resolves to the multi-root sentinel then the fsPath', () => {
+      const multi = [
+        folder(vscode.Uri.file('/workspace/repo-a')),
+        folder(vscode.Uri.file('/workspace/repo-b'))
+      ];
+      const single = vscode.Uri.file('/workspace/project-a');
+
+      const first = resolveWorkspaceEnvValue(multi);
+      const second = resolveWorkspaceEnvValue([folder(single)]);
+
+      assert.strictEqual(first, `${DISABLED_PREFIX}${MULTI_ROOT_SLUG}`);
+      assert.strictEqual(second, single.fsPath);
+    });
+  });
 });
 
 suite('workspaceEnv.applyWorkspaceEnv', () => {
