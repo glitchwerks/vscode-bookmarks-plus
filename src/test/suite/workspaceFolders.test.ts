@@ -78,10 +78,10 @@ suite('workspaceFolders.isInsideWorkspace', () => {
   // Uri.from() is used (rather than Uri.file()) so the raw `scheme`/`path` components are under
   // the test's direct control and are not silently normalized by Uri.file()'s own platform-specific
   // path handling — this is the only way to deterministically reproduce the "c:" vs "C:" case
-  // difference the plan (docs/superpowers/plans/2026-08-15-global-bookmarks-and-add-to-workspace.md
-  // §D8) calls out, independent of whatever normalization Uri.file() may or may not already do.
+  // difference decision D8 (issue #56) calls out, independent of whatever normalization
+  // Uri.file() may or may not already do.
   //
-  // isInsideWorkspace is a pure function of its (uri, folders) arguments (plan §T8: "pure, no
+  // isInsideWorkspace is a pure function of its (uri, folders) arguments (issue #56, T8: "pure, no
   // vscode.workspace access") — the same pair must yield the same answer regardless of the host
   // OS running the test. CI runs these tests on ubuntu-latest (.github/workflows/ci.yml:15,32)
   // while local development here is on win32, so the Windows-flavored case-insensitivity below
