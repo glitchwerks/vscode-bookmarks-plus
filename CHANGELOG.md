@@ -32,6 +32,13 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   Reordering and moving within a single scope is unchanged.
 - Global bookmarks are not mirrored to `.vscode/bookmarks.json` and are therefore not visible to
   the MCP server; only workspace bookmarks are.
+- Add to Workspace (#56): a global folder bookmark that is outside the current workspace gets an
+  "Add to Workspace" action, promoting it to a new workspace root via
+  `vscode.workspace.updateWorkspaceFolders`. This may restart the extension host regardless of
+  the starting folder count, but a confirm prompt naming the restart and mirror-disabling
+  consequences only appears when the add turns a single-folder workspace into a multi-folder one
+  — the transition that also disables the `.vscode/bookmarks.json` mirror; an empty window or an
+  already multi-root workspace proceeds without a prompt.
 
 ### Changed
 

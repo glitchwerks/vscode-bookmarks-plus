@@ -17,6 +17,15 @@ See `docs/superpowers/specs/` for the design spec.
 - Add an optional description to any bookmark or collection — shown on hover.
 - Workspace bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit
   them. Global bookmarks are never mirrored — see "The `.vscode/bookmarks.json` mirror" below.
+- **Add to Workspace:** a global folder bookmark that isn't already inside the current workspace
+  gets an inline "Add to Workspace" action, which adds it as a new workspace root. This is VS
+  Code's own `updateWorkspaceFolders`, so it may restart the extension host — most likely when
+  adding to an empty window, but also when a single-folder workspace becomes multi-folder. You're
+  asked to confirm only for the single-folder → multi-folder case, since that's also when it
+  disables the `.vscode/bookmarks.json` mirror (see "The `.vscode/bookmarks.json` mirror" below);
+  adding to an empty window or an already multi-folder workspace proceeds without a prompt. Full
+  caveats, including a command-palette gap tracked as a follow-up, are in
+  [the design spec](docs/superpowers/specs/2026-07-22-vscode-bookmarks-plus-design.md#5-commands).
 
 ![Bookmarks Plus screenshot](images/screenshot.png)
 
