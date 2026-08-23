@@ -2,11 +2,13 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
   resolveWorkspaceEnvValue,
+  applyWorkspaceEnv,
   DISABLED_PREFIX,
   MULTI_ROOT_SLUG,
   NO_FOLDER_SLUG,
   WORKSPACE_ENV_VAR
 } from '../../workspaceEnv';
+import { FakeEnvironmentVariableCollection } from './fixtures';
 
 /**
  * Builds a `{ uri }`-shaped fixture — `resolveWorkspaceEnvValue` only reads `uri` off each folder
@@ -85,5 +87,75 @@ suite('workspaceEnv.resolveWorkspaceEnvValue', () => {
     test('the two disabled sentinels are distinct', () => {
       assert.notStrictEqual(`${DISABLED_PREFIX}${MULTI_ROOT_SLUG}`, `${DISABLED_PREFIX}${NO_FOLDER_SLUG}`);
     });
+  });
+});
+
+suite('workspaceEnv.applyWorkspaceEnv', () => {
+  function folderList(...uris: vscode.Uri[]): { uri: vscode.Uri }[] {
+    return uris.map((uri) => ({ uri }));
+  }
+
+  // --- 1. replace() called exactly once, with WORKSPACE_ENV_VAR and the T2-resolved value --------
+  test('calls replace exactly once, with WORKSPACE_ENV_VAR and the resolved value', () => {
+    const collection = new FakeEnvironmentVariableCollection();
+    const folders = folderList(vscode.Uri.file('/workspace/project'));
+
+    applyWorkspaceEnv(collection, folders);
+
+    assert.strictEqual(collection.calls.length, 1);
+    assert.strictEqual(collection.calls[0].variable, WORKSPACE_ENV_VAR);
+    assert.strictEqual(collection.calls[0].value, resolveWorkspaceEnvValue(folders));
+  });
+
+  // --- 2. No options argument passed to replace() -------------------------------------------------
+  // Passing any options object silently defaults `applyAtProcessCreation` to false (plan § 2.4), so
+  // the fixture's recorded `optionsPassed` flag must be false, not merely "options was undefined".
+  test('calls replace with no options argument', () => {
+    const collection = new FakeEnvironmentVariableCollection();
+
+    applyWorkspaceEnv(collection, folderList(vscode.Uri.file('/workspace/project')));
+
+    assert.strictEqual(collection.calls[0].optionsPassed, false);
+  });
+
+  // --- 3. persistent === false at the moment replace() was called, not merely after ---------------
+  // Uses the fixture's per-call snapshot rather than a post-hoc read of the live collection, because
+  // a post-hoc read would pass even if `persistent` were flipped to false *after* replace() ran —
+  // exactly the ordering bug the plan warns about (persistent collections return a cached value).
+  test('persistent is already false at the moment replace() is called', () => {
+    const collection = new FakeEnvironmentVariableCollection();
+
+    applyWorkspaceEnv(collection, folderList(vscode.Uri.file('/workspace/project')));
+
+    assert.strictEqual(collection.calls[0].persistentAtCall, false);
+  });
+
+  // --- 4. description is set ------------------------------------------------------------------
+  test('sets a non-empty description on the collection', () => {
+    const collection = new FakeEnvironmentVariableCollection();
+
+    applyWorkspaceEnv(collection, folderList(vscode.Uri.file('/workspace/project')));
+
+    assert.notStrictEqual(collection.description, '');
+  });
+
+  // --- 5. Calling twice with different folder sets leaves the second value in place ---------------
+  // VS Code allows only a single mutator per variable per extension (index.d.ts:L12914-L12916), so
+  // the second call's value must be what's observable afterward, not the first.
+  test('calling it twice with different folder sets leaves the second value in place', () => {
+    const collection = new FakeEnvironmentVariableCollection();
+    const first = folderList(vscode.Uri.file('/workspace/repo-a'));
+    const second = folderList(
+      vscode.Uri.file('/workspace/repo-b'),
+      vscode.Uri.file('/workspace/repo-c')
+    );
+
+    applyWorkspaceEnv(collection, first);
+    applyWorkspaceEnv(collection, second);
+
+    const lastCall = collection.calls[collection.calls.length - 1];
+    assert.strictEqual(lastCall.variable, WORKSPACE_ENV_VAR);
+    assert.strictEqual(lastCall.value, resolveWorkspaceEnvValue(second));
+    assert.notStrictEqual(lastCall.value, resolveWorkspaceEnvValue(first));
   });
 });
