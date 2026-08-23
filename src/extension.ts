@@ -166,6 +166,12 @@ export function activate(context: vscode.ExtensionContext): void {
       if (disabled) {
         mirrorResources = undefined;
       }
+
+      // Runs unconditionally, as a sibling to handleWorkspaceFoldersChanged rather than nested
+      // inside it (plan D-A). handleWorkspaceFoldersChanged early-returns on an enabled→enabled
+      // transition, but a single-root → single-root folder swap is exactly that transition and
+      // still needs the env var resynced to the new folder's path.
+      applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
     })
   );
 
