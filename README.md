@@ -91,9 +91,22 @@ The server resolves the workspace it should serve from up to four sources, check
 order, stopping at the first one present:
 
 1. **An explicit path** — the `args` positional argument in the registration entry.
-2. **`BOOKMARKS_PLUS_WORKSPACE`** — set automatically by the Bookmarks Plus VS Code extension.
-   Not shipped yet (tracked as issue #58); until it lands, nothing sets this variable and this
-   tier is always skipped.
+2. **`BOOKMARKS_PLUS_WORKSPACE`** — set automatically by the Bookmarks Plus VS Code extension in
+   every integrated terminal it launches, provided the extension is installed and active in that
+   window:
+
+   | Window state | `BOOKMARKS_PLUS_WORKSPACE` value |
+   | --- | --- |
+   | Single folder open (mirror enabled) | the folder's absolute OS path |
+   | Two or more folders open | `disabled:multi-root` |
+   | No folder open | `disabled:no-folder` |
+
+   A terminal opened before the extension activated, or before the workspace folders last
+   changed, keeps its original value — reopen the terminal to pick up a change. A `disabled:`
+   value stops resolution here — tiers 3 and 4 below are **not** consulted, even if
+   `CLAUDE_PROJECT_DIR` would otherwise resolve. The server still starts in that case; it refuses
+   each tool call individually instead (see "Limitations" below) — a different failure mode from
+   "none of the four resolve," which refuses to start at all.
 3. **`CLAUDE_PROJECT_DIR`** — set automatically by Claude Code in the environment of any MCP
    server it spawns for a project (an integrated VS Code terminal, or `claude` run from inside a
    project directory). This is what lets the recommended registration below carry no workspace
@@ -188,8 +201,14 @@ way to pin a workspace under Claude Code.
   MCP server, one change is lost. `add_bookmark` verifies its own write after a short delay
   (`BOOKMARKS_MCP_VERIFY_DELAY_MS`, default 400ms) and reports when it did not survive — it
   cannot prevent the loss, only detect it.
-- **Single-folder workspaces only.** In a multi-root workspace the extension disables the mirror
-  file entirely, so the MCP server's writes are never picked up.
+- **Single-folder workspaces only.** In a multi-root workspace, or in a window with no folder
+  open, the extension does not maintain the `.vscode/bookmarks.json` mirror. If the extension is
+  installed and active in that window, it also reports the state to the MCP server via
+  `BOOKMARKS_PLUS_WORKSPACE` (see "Configure" above), so every tool call — `list_bookmarks`,
+  `add_bookmark` — refuses individually with a message explaining why. If the extension is not
+  installed or not active, nothing sets that variable, resolution falls through to
+  `CLAUDE_PROJECT_DIR` or the legacy variable, and the server has no way to know the mirror is
+  unavailable — `add_bookmark` writes still succeed, but the extension never picks them up.
 - **Claude Desktop chat has no automatic workspace resolution.** It must use the explicit `args`
   path form described above — see "Explicit workspace path".
 - **No push notifications.** The server re-reads the mirror file fresh on every tool call; it
