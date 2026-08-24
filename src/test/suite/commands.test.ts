@@ -6,13 +6,16 @@ import { FsGitCache } from '../../fsGitCache';
 import { BookmarkCollection, BookmarkItem } from '../../types';
 import { isInsideWorkspace } from '../../workspaceFolders';
 import {
+  ADD_TO_WORKSPACE_LABEL,
   AddToWorkspaceDeps,
   createAddFileHandler,
   createAddFolderHandler,
   createAddToWorkspaceHandler,
   createRemoveHandler,
   createRevealHandler,
+  OPEN_IN_NEW_WINDOW_LABEL,
   Prompter,
+  RevealDeps,
   ScopedStores,
   createNewCollectionHandler,
   createRenameCollectionHandler,
@@ -30,6 +33,7 @@ function makePrompter(overrides: Partial<Prompter> = {}): Prompter {
     showQuickPick: async () => undefined,
     showWarningConfirm: async () => false,
     showInfo: async () => {},
+    showActionPrompt: async () => undefined,
     ...overrides
   };
 }
@@ -190,31 +194,12 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
     assert.strictEqual(workspace.getAll().items.find((i) => i.id === workspaceItem.id)?.id, workspaceItem.id);
   });
 
-  test('reveal handler calls the injected reveal function with the item uri', async () => {
-    const calls: string[] = [];
-    const handler = createRevealHandler(async (uri) => { calls.push(uri.toString()); });
-    const item: BookmarkItem = { id: '1', type: 'file', uri: 'file:///a.txt', collectionId: null, order: 0 };
-
-    await handler({ kind: 'item', item, scope: 'workspace' });
-    assert.deepStrictEqual(calls, ['file:///a.txt']);
-  });
-
-  test('reveal handler works identically for folder items', async () => {
-    const calls: string[] = [];
-    const handler = createRevealHandler(async (uri) => { calls.push(uri.toString()); });
-    const item: BookmarkItem = { id: '2', type: 'folder', uri: 'file:///dir', collectionId: null, order: 0 };
-
-    await handler({ kind: 'item', item, scope: 'workspace' });
-    assert.deepStrictEqual(calls, ['file:///dir']);
-  });
-
-  test('reveal handler is a no-op for non-item nodes', async () => {
-    let called = false;
-    const handler = createRevealHandler(async () => { called = true; });
-    const nonItemNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
-    await handler(nonItemNode);
-    assert.strictEqual(called, false);
-  });
+  // `createRevealHandler`'s tests (both its pre-existing plain-reveal branches and the new
+  // addable-global-folder action-prompt branches, #93) live in their own
+  // `commands - reveal (out-of-workspace global folder prompt, #93)` suite below, once its
+  // `RevealDeps` fixtures (`folder()`, `folderItem()`) are in scope — see that suite for the full
+  // reveal coverage, including the file/non-item/in-workspace no-prompt cases that used to live
+  // here.
 });
 
 // T4 (#55 D2) scope-routing note: `createAddFileHandler` / `createAddFolderHandler` take a
@@ -1434,5 +1419,223 @@ suite('commands - addToWorkspace', () => {
     });
 
     assert.strictEqual(fakes.infoMessages.length, 0, 'success must not surface an info message');
+  });
+});
+
+// Issue #93: clicking a global folder bookmark outside the workspace used to silently no-op
+// (revealInExplorer has nothing to reveal for a folder that isn't part of any open workspace
+// folder). `createRevealHandler` now takes a `RevealDeps` bag instead of a bare reveal function,
+// and branches: an "addable global folder" (same condition as `isAddableGlobalFolder` in
+// bookmarksTreeDataProvider.ts:199 — global scope, folder type, not already inside the workspace)
+// shows a two-action prompt instead of revealing; every other node shape reveals exactly as
+// before. `ADD_TO_WORKSPACE_LABEL` / `OPEN_IN_NEW_WINDOW_LABEL` are imported from `commands.ts`
+// rather than hardcoded here so the test file and the implementation share one source of truth for
+// the action labels.
+interface RevealFakes {
+  deps: RevealDeps;
+  /** Ordered log of every side-effecting call the handler made, across all four fakes. */
+  calls: string[];
+  revealedUris: string[];
+  promptCalls: Array<{ message: string; actions: string[] }>;
+  addToWorkspaceCalls: BookmarkNode[];
+  openInNewWindowUris: string[];
+}
+
+function makeRevealFakes(
+  options: {
+    folders?: readonly vscode.WorkspaceFolder[] | undefined;
+    actionPromptResult?: string | undefined;
+  } = {}
+): RevealFakes {
+  const calls: string[] = [];
+  const revealedUris: string[] = [];
+  const promptCalls: Array<{ message: string; actions: string[] }> = [];
+  const addToWorkspaceCalls: BookmarkNode[] = [];
+  const openInNewWindowUris: string[] = [];
+
+  const deps: RevealDeps = {
+    reveal: async (uri) => {
+      calls.push('reveal');
+      revealedUris.push(uri.toString());
+    },
+    prompter: {
+      showActionPrompt: async (message, actions) => {
+        calls.push('prompt');
+        promptCalls.push({ message, actions });
+        return options.actionPromptResult;
+      }
+    },
+    getWorkspaceFolders: () => options.folders,
+    addToWorkspace: async (node) => {
+      calls.push('addToWorkspace');
+      addToWorkspaceCalls.push(node);
+    },
+    openInNewWindow: async (uri) => {
+      calls.push('openInNewWindow');
+      openInNewWindowUris.push(uri.toString());
+    }
+  };
+
+  return { deps, calls, revealedUris, promptCalls, addToWorkspaceCalls, openInNewWindowUris };
+}
+
+suite('commands - reveal (out-of-workspace global folder prompt, #93)', () => {
+  // Never inside any of this suite's fixture workspace-folder lists, so it is always the
+  // "outside the workspace" case unless a test constructs its own uri/folders pair.
+  const outsideUri = vscode.Uri.file('/outside/new-folder');
+
+  function assertNoCalls(fakes: RevealFakes, label: string): void {
+    assert.deepStrictEqual(fakes.calls, [], `${label} must not call reveal, prompt, addToWorkspace, or openInNewWindow`);
+  }
+
+  test('is a no-op for non-item nodes (repoGroup)', async () => {
+    const fakes = makeRevealFakes();
+    await createRevealHandler(fakes.deps)({ kind: 'repoGroup', label: 'x', repoKey: 'x' });
+    assertNoCalls(fakes, 'a repoGroup node');
+  });
+
+  test('is a no-op for non-item nodes (globalRoot)', async () => {
+    const fakes = makeRevealFakes();
+    await createRevealHandler(fakes.deps)({ kind: 'globalRoot' });
+    assertNoCalls(fakes, 'a globalRoot node');
+  });
+
+  test('is a no-op for non-item nodes (collection)', async () => {
+    const fakes = makeRevealFakes();
+    const collection: BookmarkCollection = { id: 'c1', name: 'Work', order: 0 };
+    await createRevealHandler(fakes.deps)({ kind: 'collection', collection, scope: 'global' });
+    assertNoCalls(fakes, 'a collection node');
+  });
+
+  test('reveals a workspace-scoped file item without prompting', async () => {
+    const fakes = makeRevealFakes({ folders: undefined });
+    const item: BookmarkItem = { id: '1', type: 'file', uri: 'file:///a.txt', collectionId: null, order: 0 };
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace' });
+
+    assert.deepStrictEqual(fakes.calls, ['reveal']);
+    assert.deepStrictEqual(fakes.revealedUris, ['file:///a.txt']);
+  });
+
+  test('reveals a global-scoped file item without prompting, even when it is outside every workspace folder', async () => {
+    const fakes = makeRevealFakes({ folders: undefined });
+    const item: BookmarkItem = { id: '2', type: 'file', uri: outsideUri.toString(), collectionId: null, order: 0 };
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'global' });
+
+    assert.deepStrictEqual(fakes.calls, ['reveal'], 'a file is never "addable", so it always just reveals');
+    assert.deepStrictEqual(fakes.revealedUris, [outsideUri.toString()]);
+  });
+
+  test('reveals a workspace-scoped folder item without prompting, regardless of workspace-folder membership', async () => {
+    // Deliberately outside every fixture workspace folder — proves the no-prompt behavior here
+    // comes from scope (not global), not from the folder happening to already be inside the
+    // workspace.
+    const fakes = makeRevealFakes({ folders: undefined });
+    const item: BookmarkItem = { id: '3', type: 'folder', uri: outsideUri.toString(), collectionId: null, order: 0 };
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace' });
+
+    assert.deepStrictEqual(fakes.calls, ['reveal']);
+    assert.deepStrictEqual(fakes.revealedUris, [outsideUri.toString()]);
+  });
+
+  test('reveals a global folder item that is already inside the workspace without prompting', async () => {
+    const root = vscode.Uri.file('/workspace/project');
+    const folders = [folder(root)];
+    const descendantUri = vscode.Uri.file('/workspace/project/subfolder');
+    assert.strictEqual(
+      isInsideWorkspace(descendantUri, folders),
+      true,
+      'fixture precondition: the descendant uri must actually be inside these folders'
+    );
+    const fakes = makeRevealFakes({ folders });
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item: folderItem(descendantUri), scope: 'global' });
+
+    assert.deepStrictEqual(fakes.calls, ['reveal'], 'an already-in-workspace global folder is not "addable"');
+    assert.deepStrictEqual(fakes.revealedUris, [descendantUri.toString()]);
+  });
+
+  test(
+    'prompts with the Add-to-Workspace and Open-in-New-Window actions for an addable global ' +
+      'folder outside the workspace, and does not reveal',
+    async () => {
+      const fakes = makeRevealFakes({ folders: undefined, actionPromptResult: undefined });
+
+      await createRevealHandler(fakes.deps)({
+        kind: 'item',
+        item: folderItem(outsideUri),
+        scope: 'global'
+      });
+
+      assert.strictEqual(fakes.promptCalls.length, 1, 'exactly one action prompt must be shown');
+      const { message, actions } = fakes.promptCalls[0];
+      assert.ok(message.length > 0, 'the prompt message must not be empty');
+      assert.deepStrictEqual(
+        actions,
+        [ADD_TO_WORKSPACE_LABEL, OPEN_IN_NEW_WINDOW_LABEL],
+        'the two offered actions must be exactly the Add-to-Workspace and Open-in-New-Window labels, in that order'
+      );
+      assert.strictEqual(fakes.revealedUris.length, 0, 'reveal must never be called for an addable global folder');
+    }
+  );
+
+  test('the same addable-global-folder condition also applies when the folder list is empty ([])', async () => {
+    const fakes = makeRevealFakes({ folders: [], actionPromptResult: undefined });
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item: folderItem(outsideUri), scope: 'global' });
+
+    assert.strictEqual(fakes.promptCalls.length, 1);
+    assert.strictEqual(fakes.revealedUris.length, 0);
+  });
+
+  test('picking Add to Workspace calls addToWorkspace with the node and calls neither openInNewWindow nor reveal', async () => {
+    const fakes = makeRevealFakes({ folders: undefined, actionPromptResult: ADD_TO_WORKSPACE_LABEL });
+    const node: BookmarkNode = { kind: 'item', item: folderItem(outsideUri), scope: 'global' };
+
+    await createRevealHandler(fakes.deps)(node);
+
+    assert.deepStrictEqual(fakes.calls, ['prompt', 'addToWorkspace']);
+    assert.deepStrictEqual(fakes.addToWorkspaceCalls, [node]);
+    assert.strictEqual(fakes.openInNewWindowUris.length, 0);
+    assert.strictEqual(fakes.revealedUris.length, 0);
+  });
+
+  test('picking Open in New Window calls openInNewWindow with the parsed uri and calls neither addToWorkspace nor reveal', async () => {
+    const fakes = makeRevealFakes({ folders: undefined, actionPromptResult: OPEN_IN_NEW_WINDOW_LABEL });
+    const item = folderItem(outsideUri);
+
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'global' });
+
+    assert.deepStrictEqual(fakes.calls, ['prompt', 'openInNewWindow']);
+    assert.deepStrictEqual(fakes.openInNewWindowUris, [outsideUri.toString()]);
+    assert.strictEqual(fakes.addToWorkspaceCalls.length, 0);
+    assert.strictEqual(fakes.revealedUris.length, 0);
+  });
+
+  test('dismissing the action prompt (undefined) does nothing further', async () => {
+    const fakes = makeRevealFakes({ folders: undefined, actionPromptResult: undefined });
+
+    await createRevealHandler(fakes.deps)({
+      kind: 'item',
+      item: folderItem(outsideUri),
+      scope: 'global'
+    });
+
+    assert.deepStrictEqual(
+      fakes.calls,
+      ['prompt'],
+      'dismissing the prompt must not call addToWorkspace, openInNewWindow, or reveal'
+    );
+  });
+
+  test('the exported action labels are the user-visible strings the prompt must offer', () => {
+    // Pins the label *values*, not just their names — the branch tests above only prove the
+    // prompt is offered `[ADD_TO_WORKSPACE_LABEL, OPEN_IN_NEW_WINDOW_LABEL]` and route on
+    // whichever string each constant happens to hold, which is satisfied no matter what those
+    // constants are set to. This is the one assertion in the suite that pins the actual spec text.
+    assert.strictEqual(ADD_TO_WORKSPACE_LABEL, 'Add to Workspace');
+    assert.strictEqual(OPEN_IN_NEW_WINDOW_LABEL, 'Open in New Window');
   });
 });

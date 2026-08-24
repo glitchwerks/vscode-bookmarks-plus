@@ -148,6 +148,7 @@ export interface FakePrompterOptions {
   quickPickResult?: unknown;
   warningConfirmResult?: boolean;
   infoResult?: unknown;
+  actionPromptResult?: string | undefined;
 }
 
 /**
@@ -162,17 +163,21 @@ export interface FakePrompterOptions {
 export class FakePrompter implements Prompter {
   lastInputBoxOptions: vscode.InputBoxOptions | undefined;
   inputBoxCallCount = 0;
+  lastActionPromptArgs: { message: string; actions: string[] } | undefined;
+  actionPromptCallCount = 0;
 
   private readonly inputBoxResult: string | undefined;
   private readonly quickPickResult: unknown;
   private readonly warningConfirmResult: boolean;
   private readonly infoResult: unknown;
+  private readonly actionPromptResult: string | undefined;
 
   constructor(options: FakePrompterOptions = {}) {
     this.inputBoxResult = options.inputBoxResult;
     this.quickPickResult = options.quickPickResult;
     this.warningConfirmResult = options.warningConfirmResult ?? false;
     this.infoResult = options.infoResult;
+    this.actionPromptResult = options.actionPromptResult;
   }
 
   showInputBox(options: vscode.InputBoxOptions): Thenable<string | undefined> {
@@ -191,5 +196,11 @@ export class FakePrompter implements Prompter {
 
   showInfo(): Thenable<unknown> {
     return Promise.resolve(this.infoResult);
+  }
+
+  showActionPrompt(message: string, actions: string[]): Thenable<string | undefined> {
+    this.actionPromptCallCount++;
+    this.lastActionPromptArgs = { message, actions };
+    return Promise.resolve(this.actionPromptResult);
   }
 }
