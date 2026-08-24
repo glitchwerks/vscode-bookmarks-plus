@@ -24,6 +24,7 @@ import {
   GitApiFactory,
   GitExtensionExports
 } from './gitInfo';
+import { applyWorkspaceEnv } from './workspaceEnv';
 
 const WATCHER_DEBOUNCE_MS = 150;
 
@@ -89,6 +90,11 @@ export function activate(context: vscode.ExtensionContext): void {
   if (location.kind === 'disabled') {
     logMirrorDisabled(output, location.reason);
   }
+
+  // Written early, ahead of command registration, so the variable is set even if a later
+  // activation step throws (plan D-B). Only the initial write lives here; resyncing on
+  // workspace-folder changes is wired separately (T5).
+  applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
 
   const store = new BookmarkStore(context.workspaceState, output, {
     mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : undefined
@@ -160,6 +166,12 @@ export function activate(context: vscode.ExtensionContext): void {
       if (disabled) {
         mirrorResources = undefined;
       }
+
+      // Runs unconditionally, as a sibling to handleWorkspaceFoldersChanged rather than nested
+      // inside it (plan D-A). handleWorkspaceFoldersChanged early-returns on an enabled→enabled
+      // transition, but a single-root → single-root folder swap is exactly that transition and
+      // still needs the env var resynced to the new folder's path.
+      applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
     })
   );
 

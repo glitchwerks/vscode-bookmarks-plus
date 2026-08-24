@@ -54,6 +54,40 @@ export class FakeOutput {
 }
 
 /**
+ * One recorded call to `FakeEnvironmentVariableCollection.replace()`. `persistentAtCall` is a
+ * snapshot of `persistent` taken at the moment `replace()` ran (not a live reference to the
+ * collection), because later tests assert ordering — e.g. that `persistent` was already set to
+ * `false` before `replace()` was invoked (T3).
+ */
+export interface FakeEnvironmentVariableCollectionCall {
+  variable: string;
+  value: string;
+  optionsPassed: boolean;
+  persistentAtCall: boolean;
+}
+
+/**
+ * A minimal fake of the subset of `vscode.GlobalEnvironmentVariableCollection` that
+ * `workspaceEnv.ts` uses: `persistent`, `description`, and `replace()`. Every `replace()` call is
+ * recorded in `calls` so tests can assert what was written, how many times, and in what order
+ * relative to `persistent`/`description` mutations.
+ */
+export class FakeEnvironmentVariableCollection {
+  persistent = true;
+  description = '';
+  calls: FakeEnvironmentVariableCollectionCall[] = [];
+
+  replace(variable: string, value: string, options?: unknown): void {
+    this.calls.push({
+      variable,
+      value,
+      optionsPassed: options !== undefined,
+      persistentAtCall: this.persistent
+    });
+  }
+}
+
+/**
  * The subset of `vscode.ExtensionContext` that `activate()`/`deactivate()` read from. Kept as a
  * plain shape (not `vscode.ExtensionContext` itself) so tests can pass it to `activate()` via an
  * `as unknown as vscode.ExtensionContext` cast, matching the fixture pattern already used for
@@ -63,13 +97,15 @@ export interface FakeExtensionContext {
   subscriptions: vscode.Disposable[];
   workspaceState: FakeMemento;
   globalState: FakeMemento;
+  environmentVariableCollection: FakeEnvironmentVariableCollection;
 }
 
 export function createFakeExtensionContext(): FakeExtensionContext {
   return {
     subscriptions: [],
     workspaceState: new FakeMemento(),
-    globalState: new FakeMemento()
+    globalState: new FakeMemento(),
+    environmentVariableCollection: new FakeEnvironmentVariableCollection()
   };
 }
 

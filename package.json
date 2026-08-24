@@ -12,7 +12,7 @@
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "icon": "images/icon.png",
-  "activationEvents": [],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
