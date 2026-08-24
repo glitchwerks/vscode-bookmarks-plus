@@ -4,6 +4,8 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-24
+
 ### Added
 
 - Optional descriptions on bookmarks and collections, set via the **Set Description** context-menu

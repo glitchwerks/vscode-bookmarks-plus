@@ -2,7 +2,7 @@
   "name": "vscode-bookmarks-plus",
   "displayName": "Bookmarks Plus",
   "description": "Bookmark files and folders (not just lines) in a workspace, with collections and git-repo awareness.",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "publisher": "cbeaulieu-gt",
   "repository": {
     "type": "git",
