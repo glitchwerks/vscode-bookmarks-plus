@@ -14,7 +14,12 @@ export interface Prompter {
   ): Thenable<T | undefined>;
   showWarningConfirm(message: string, confirmLabel: string): Thenable<boolean>;
   showInfo(message: string): Thenable<unknown>;
+  showActionPrompt(message: string, actions: string[]): Thenable<string | undefined>;
 }
+
+/** User-visible labels for the out-of-workspace global folder reveal prompt (issue #93). */
+export const ADD_TO_WORKSPACE_LABEL = 'Add to Workspace';
+export const OPEN_IN_NEW_WINDOW_LABEL = 'Open in New Window';
 
 export interface ScopedStores {
   workspace: BookmarkStore;
@@ -33,7 +38,9 @@ export function createPrompter(): Prompter {
       );
       return result === confirmLabel;
     },
-    showInfo: (message) => vscode.window.showInformationMessage(message)
+    showInfo: (message) => vscode.window.showInformationMessage(message),
+    showActionPrompt: (message, actions) =>
+      vscode.window.showInformationMessage(message, ...actions)
   };
 }
 
@@ -83,14 +90,48 @@ export function createRemoveHandler(
   };
 }
 
+export interface RevealDeps {
+  reveal: (uri: vscode.Uri) => Thenable<unknown>;
+  prompter: Pick<Prompter, 'showActionPrompt'>;
+  getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined;
+  addToWorkspace: (node: BookmarkNode) => Thenable<unknown>;
+  openInNewWindow: (uri: vscode.Uri) => Thenable<unknown>;
+}
+
+/**
+ * Reveals a bookmarked item in the explorer, except for an "addable" global folder bookmark
+ * (global scope, folder type, not already inside the current workspace) — `revealInExplorer` has
+ * nothing to reveal for a folder that isn't part of any open workspace folder, so instead this
+ * offers a two-action prompt to add it to the workspace or open it in a new window. Issue #93.
+ */
 export function createRevealHandler(
-  reveal: (uri: vscode.Uri) => Thenable<unknown>
+  deps: RevealDeps
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
     if (node.kind !== 'item') {
       return;
     }
-    await reveal(vscode.Uri.parse(node.item.uri));
+    const uri = vscode.Uri.parse(node.item.uri);
+    const isAddableGlobalFolder =
+      node.scope === 'global' &&
+      node.item.type === 'folder' &&
+      !isInsideWorkspace(uri, deps.getWorkspaceFolders());
+
+    if (!isAddableGlobalFolder) {
+      await deps.reveal(uri);
+      return;
+    }
+
+    const choice = await deps.prompter.showActionPrompt(
+      'This folder is not part of the open workspace. Add it to the workspace, or open it in ' +
+        'a new window.',
+      [ADD_TO_WORKSPACE_LABEL, OPEN_IN_NEW_WINDOW_LABEL]
+    );
+    if (choice === ADD_TO_WORKSPACE_LABEL) {
+      await deps.addToWorkspace(node);
+    } else if (choice === OPEN_IN_NEW_WINDOW_LABEL) {
+      await deps.openInNewWindow(uri);
+    }
   };
 }
 
@@ -313,14 +354,17 @@ export function registerItemCommands(
   context: vscode.ExtensionContext,
   stores: ScopedStores
 ): void {
+  const revealDeps: RevealDeps = {
+    reveal: (uri) => vscode.commands.executeCommand('revealInExplorer', uri),
+    prompter: createPrompter(),
+    getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
+    addToWorkspace: (node) => vscode.commands.executeCommand('bookmarks.addToWorkspace', node),
+    openInNewWindow: (uri) =>
+      vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true })
+  };
   context.subscriptions.push(
     vscode.commands.registerCommand('bookmarks.remove', createRemoveHandler(stores)),
-    vscode.commands.registerCommand(
-      'bookmarks.reveal',
-      createRevealHandler((uri) =>
-        vscode.commands.executeCommand('revealInExplorer', uri)
-      )
-    )
+    vscode.commands.registerCommand('bookmarks.reveal', createRevealHandler(revealDeps))
   );
 }
 
