@@ -150,6 +150,36 @@ appended to this plan before task T1 starts.
 **Gate rule:** if E1 shows git's badge suppresses ours on modified files, D1 option (a)
 (badge-and-tooltip only) is not viable as the sole signal and the decision returns to the user.
 
+**Findings (2026-08-26):** run by the user in a real Extension Development Host, using a throwaway
+hard-coded `FileDecorationProvider` probe (never committed) against a fixture workspace with a
+git-modified+bookmarked file, a bookmarked folder containing a git-modified file, and badge-length
+test files.
+
+- **E1 (badge vs. git's `M` on a file that is both bookmarked and git-modified):** both decorations
+  combined. The Explorer showed **both `M` and `★`** in the badge slot, and the tooltip showed
+  **both** "Modified" and "Bookmarked". Per the Gate rule above, this means D1 option (a) (badge +
+  tooltip, no `color`) stands — the gate does **not** reopen D1.
+- **E2 (folder color: no `color` property vs. `color: undefined` explicitly):** no difference was
+  observed between the two variants — the folder's color was the same either way. However, a
+  separate, unanticipated timing behavior was observed: our `★` badge was visible on the folder
+  briefly, then — once VS Code's built-in Git extension finished loading and computed status — git's
+  own "Modified" folder decoration fully **replaced** ours; the two did not combine the way they did
+  for the single-file case in E1. This is flagged as a **new open question for D3** (decorate
+  bookmarked folders too): unlike file-level decorations, a bookmarked+git-modified **folder** may
+  end up showing only git's decoration once git's extension finishes loading, not both. This should
+  be re-verified once the real (non-probe) decoration provider is implemented in T1, since provider
+  registration order/timing may behave differently than this throwaway probe. This does **not**
+  reopen D1 (which is about file-level decorations, where E1 passed above) but is a caveat to carry
+  into implementation and D3.
+- **E3 (badge length limit and glyph legibility):** confirmed as expected. The 1-character and
+  2-character badges rendered normally; the 3-character badge rendered as **nothing** (no badge
+  shown, no error/crash observed) rather than truncating or throwing visibly. The `★` glyph was
+  legible in both light and dark themes (Ctrl+K Ctrl+T toggle).
+
+**Overall:** the Phase-0 gate is now answered. D1 does not reopen (E1 passed). Task T1 may proceed.
+The one new item to carry forward is the folder-decoration-vs-git-timing observation from E2 above,
+noted as a caveat for D3/implementation, not a blocker.
+
 ## 5. Open decisions requiring user input
 
 The plan body below is written **AC-conformant** — issue #96 asks for "badge/color", so both are
@@ -166,11 +196,10 @@ carried as live options rather than one being silently dropped.
   - *Planner recommendation:* start at (a), promote to (b) if E2 clears. **Glyph needs a user pick:**
     `🔖` is a single grapheme cluster and reads unambiguously, but emoji rendering in the Explorer
     varies by platform and theme; a plain `★` or `B` is more predictable. E3 covers the render check.
-  - **Decision (2026-08-26, provisional pending T0):** option (a) — badge + tooltip only, no `color`.
-    Glyph: `★` (plain star character — not `🔖`, not `B`). This stays subject to the §4 **Gate rule**:
-    if T0's answer to E1 shows git's own change-badge suppresses ours on modified files, D1 reopens
-    and "the decision returns to the user" (§4) exactly as originally specified — this resolution does
-    not override that gate.
+  - **Decision (2026-08-26, confirmed 2026-08-26 by the T0 empirical gate — see §4 findings):**
+    option (a) — badge + tooltip only, no `color`. Glyph: `★` (plain star character — not `🔖`, not
+    `B`). The §4 **Gate rule** did not fire: T0's E1 result shows both our badge and git's badge
+    combine rather than one suppressing the other, so D1 does not reopen.
 
 - **D2 — which stores feed the decoration?** Workspace store only, or workspace ∪ global?
   *Recommendation:* the **union**. The user's question at the Explorer is "is this bookmarked?", not
