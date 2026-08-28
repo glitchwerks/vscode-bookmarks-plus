@@ -11,6 +11,7 @@ import {
   createAddFileHandler,
   createAddFolderHandler,
   createAddToWorkspaceHandler,
+  createPromoteSuggestionHandler,
   createRemoveHandler,
   createRevealHandler,
   OPEN_IN_NEW_WINDOW_LABEL,
@@ -1637,5 +1638,105 @@ suite('commands - reveal (out-of-workspace global folder prompt, #93)', () => {
     // constants are set to. This is the one assertion in the suite that pins the actual spec text.
     assert.strictEqual(ADD_TO_WORKSPACE_LABEL, 'Add to Workspace');
     assert.strictEqual(OPEN_IN_NEW_WINDOW_LABEL, 'Open in New Window');
+  });
+});
+
+// --- #95 R4: regression guards for the widened BookmarkNode union — createRemoveHandler and
+// createRevealHandler must keep treating a 'suggestion' node exactly like any other non-'item'
+// node (a no-op), the same way both already handle 'collection' / 'repoGroup' / 'globalRoot'
+// throughout this file. Built with `as unknown as BookmarkNode` so this file compiles against
+// both today's four-arm union and the widened one from T5 (plan docs/superpowers/plans/2026-08-25-
+// suggested-bookmarks-from-recent-items.md) — these prove today's `node.kind !== 'item'` guards
+// already cover the new kind, rather than being expected to start red.
+suite('commands - suggestion-kind regression guards (#95 R4)', () => {
+  function suggestionNode(uri = 'file:///suggested.txt'): BookmarkNode {
+    return {
+      kind: 'suggestion',
+      recentItem: { uri, firstSeen: 1000, previewCount: 0, promoted: true }
+    } as unknown as BookmarkNode;
+  }
+
+  test('remove handler ignores a suggestion node', async () => {
+    const stores = makeScopedStores();
+    await stores.workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
+    const handler = createRemoveHandler(stores);
+
+    await handler(suggestionNode());
+
+    assert.strictEqual(stores.workspace.getAll().items.length, 1, 'a suggestion node must not remove anything');
+  });
+
+  test('reveal handler ignores a suggestion node', async () => {
+    const fakes = makeRevealFakes();
+    await createRevealHandler(fakes.deps)(suggestionNode());
+    assert.deepStrictEqual(
+      fakes.calls,
+      [],
+      'a suggestion node must not reveal, prompt, addToWorkspace, or openInNewWindow'
+    );
+  });
+});
+
+// --- #95 T6: bookmarks.promoteSuggestion — routes through the exact same addBookmark() helper
+// every other add path uses (commands.ts:47-61), so DuplicateBookmarkError produces the identical
+// "already bookmarked" info toast. Promoting removes the item from the Suggested list on the next
+// render because it becomes bookmarked and C7/D9's either-store filter then excludes it — that
+// filter is exercised directly in bookmarksTreeDataProvider.test.ts ("excludes a uri already
+// bookmarked ..."); this suite only proves the store write and duplicate-handling contract of the
+// command itself.
+//
+// Assumption (not pinned by the plan, which leaves the exact signature to implementation time):
+// `createPromoteSuggestionHandler` is bound to a single (workspace) store, mirroring
+// `createAddFileHandler`'s shape — the same store `bookmarks.addFile` targets — rather than a
+// `ScopedStores` bag, since a recent-item has no scope of its own to route on.
+suite('commands - promoteSuggestion (#95 T6)', () => {
+  function suggestionNode(uri: string): BookmarkNode {
+    return {
+      kind: 'suggestion',
+      recentItem: { uri, firstSeen: 1000, previewCount: 0, promoted: true }
+    } as unknown as BookmarkNode;
+  }
+
+  test('adds the suggested uri as a file bookmark to the workspace store', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const uri = 'file:///suggested-a.txt';
+
+    await createPromoteSuggestionHandler(store, makePrompter())(suggestionNode(uri));
+
+    const items = store.getAll().items;
+    assert.strictEqual(items.length, 1);
+    assert.strictEqual(items[0].type, 'file');
+    assert.strictEqual(items[0].uri, uri);
+  });
+
+  test('shows the same "already bookmarked" info message as every other add path on a duplicate', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const uri = 'file:///suggested-a.txt';
+    await store.addItem({ type: 'file', uri });
+    const messages: string[] = [];
+    const prompter = makePrompter({
+      showInfo: async (message) => {
+        messages.push(message);
+      }
+    });
+
+    await createPromoteSuggestionHandler(store, prompter)(suggestionNode(uri));
+
+    assert.strictEqual(
+      store.getAll().items.length,
+      1,
+      'promoting an already-bookmarked uri must not create a duplicate'
+    );
+    assert.strictEqual(messages.length, 1);
+    assert.match(messages[0], /already bookmarked/i);
+  });
+
+  test('ignores non-suggestion nodes', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const nonSuggestionNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
+
+    await createPromoteSuggestionHandler(store, makePrompter())(nonSuggestionNode);
+
+    assert.strictEqual(store.getAll().items.length, 0, 'a non-suggestion node must not add anything');
   });
 });

@@ -2,8 +2,13 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { BookmarkDecorationProvider } from '../../bookmarkDecorationProvider';
-import { handleWorkspaceFoldersChanged, registerBookmarkDecorationProvider } from '../../extension';
-import { FakeMemento, FakeMirror, FakeOutput } from './fixtures';
+import {
+  handleWorkspaceFoldersChanged,
+  registerBookmarkDecorationProvider,
+  registerRecentItemsTracker
+} from '../../extension';
+import { loadRecentItems } from '../../recentItems';
+import { FakeMemento, fakeTab, FakeMirror, FakeOutput } from './fixtures';
 
 suite('Extension activation', () => {
   test('extension is present and activates', async () => {
@@ -34,7 +39,8 @@ suite('Extension activation', () => {
       'bookmarks.addFileGlobal',
       'bookmarks.addFolderGlobal',
       'bookmarks.newGlobalCollection',
-      'bookmarks.addToWorkspace'
+      'bookmarks.addToWorkspace',
+      'bookmarks.promoteSuggestion'
     ];
 
     for (const command of expected) {
@@ -119,6 +125,67 @@ suite('Extension activation', () => {
       'window',
       'bookmarksPlus.explorerDecoration.enabled must be declared with scope: "window"'
     );
+  });
+
+  // --- #95 T7 (plan docs/superpowers/plans/2026-08-25-suggested-bookmarks-from-recent-items.md):
+  // package.json manifest additions for suggested bookmarks — the new command, its command-palette
+  // suppression (C5), its view/item/context entry, and the maxItems setting (D3, RESOLVED).
+
+  test('bookmarks.promoteSuggestion is hidden from the command palette like its sibling node-argument commands (C5)', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const commandPalette: Array<{ command: string; when?: string }> =
+      ext!.packageJSON.contributes.menus.commandPalette;
+    const entry = commandPalette.find((item) => item.command === 'bookmarks.promoteSuggestion');
+    assert.ok(
+      entry,
+      'expected a contributes.menus.commandPalette entry for bookmarks.promoteSuggestion — it takes ' +
+        'a tree-node argument, so palette invocation (no argument) would fail'
+    );
+    assert.strictEqual(
+      entry!.when,
+      'false',
+      'bookmarks.promoteSuggestion must have when: "false" in contributes.menus.commandPalette to stay hidden from the palette'
+    );
+  });
+
+  test('view/item/context contributes a promoteSuggestion entry keyed on viewItem == bookmarkSuggestion (T5/T7)', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const viewItemContext: Array<{ command: string; when?: string }> =
+      ext!.packageJSON.contributes.menus['view/item/context'];
+    const entry = viewItemContext.find((item) => item.command === 'bookmarks.promoteSuggestion');
+    assert.ok(entry, 'expected a view/item/context entry for bookmarks.promoteSuggestion');
+    assert.ok(
+      entry!.when?.includes('viewItem == bookmarkSuggestion'),
+      'the promoteSuggestion menu entry must be keyed on viewItem == bookmarkSuggestion, matching ' +
+        'the contextValue T5 sets on a suggestion tree item'
+    );
+  });
+
+  test('contributes.configuration declares bookmarksPlus.suggestions.maxItems as a number, default 10 (D3, RESOLVED)', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const properties: Record<string, { type?: string; default?: unknown }> | undefined =
+      ext!.packageJSON.contributes?.configuration?.properties;
+    assert.ok(
+      properties && Object.prototype.hasOwnProperty.call(properties, 'bookmarksPlus.suggestions.maxItems'),
+      'expected package.json contributes.configuration.properties to declare bookmarksPlus.suggestions.maxItems'
+    );
+
+    const property = properties!['bookmarksPlus.suggestions.maxItems'];
+    assert.strictEqual(
+      property.type,
+      'number',
+      'bookmarksPlus.suggestions.maxItems must be declared with type: "number"'
+    );
+    assert.strictEqual(property.default, 10, 'bookmarksPlus.suggestions.maxItems must default to 10 (D3)');
   });
 });
 
@@ -530,5 +597,161 @@ suite('registerBookmarkDecorationProvider (T4, plan §6)', () => {
         'a still-live subscription would keep resyncing the decorated-key set even if firing the ' +
         'now-disposed onDidChangeFileDecorations event is a silent no-op'
     );
+  });
+});
+
+// --- #95 T4/T8: registerRecentItemsTracker — activation wiring for tracking recently-opened tabs
+// (plan docs/superpowers/plans/2026-08-25-suggested-bookmarks-from-recent-items.md). Mirrors the
+// registerBookmarkDecorationProvider (T4, #96) DI seam directly above: real
+// `vscode.window.tabGroups.onDidChangeTabs` is never monkey-patched (this file's established norm
+// — see the "no monkey-patch the read-only vscode module" framing on the decoration-provider suite
+// above); instead a fake tabGroups-shaped dependency is injected. `registerRecentItemsTracker` does
+// not exist yet, so this suite is expected to fail to compile until T4/T8 add it.
+//
+// Assumption (not pinned by the plan, which explicitly leaves this signature to implementation
+// time — plan T4/T8): `registerRecentItemsTracker(memento, subscriptions, deps)` where
+// `deps.getTabGroups()` returns a `{ onDidChangeTabs }`-shaped seam and `deps.maxItems` is the cap
+// to pass through to `recordOpen`. Any further fields the real implementation's `deps` type needs
+// (e.g. a change-notification callback, an injectable clock) must be optional, since the fakes
+// below construct `deps` with only these two fields.
+//
+// Scope note: the plan (T4) explicitly flags that whether repeated *preview* opens of the same uri
+// arrive via `TabChangeEvent.opened` or `.changed` needs empirical verification against real VS
+// Code behavior — this suite deliberately does not assert which array feeds the preview counter.
+// It covers only what the plan pins unconditionally: the subscription/disposal wiring, that a
+// plain non-preview open is recorded and persisted, that a single preview open is recorded without
+// promoting, that closed tabs are never recorded, and that a non-file-scheme / diff tab is
+// filtered out via extractTabUri (T3).
+suite('registerRecentItemsTracker (#95 T4/T8)', () => {
+  class FakeDisposable implements vscode.Disposable {
+    disposeCallCount = 0;
+    dispose(): void {
+      this.disposeCallCount++;
+    }
+  }
+
+  class FakeTabGroupsRegistration {
+    listeners: Array<(event: vscode.TabChangeEvent) => void> = [];
+    disposables: FakeDisposable[] = [];
+
+    onDidChangeTabs = (listener: (event: vscode.TabChangeEvent) => void): vscode.Disposable => {
+      this.listeners.push(listener);
+      const disposable = new FakeDisposable();
+      this.disposables.push(disposable);
+      return disposable;
+    };
+
+    fire(event: Partial<vscode.TabChangeEvent>): void {
+      const fullEvent: vscode.TabChangeEvent = { opened: [], closed: [], changed: [], ...event };
+      for (const listener of this.listeners) {
+        listener(fullEvent);
+      }
+    }
+  }
+
+  function createDeps(maxItems = 10): {
+    tabGroups: FakeTabGroupsRegistration;
+    deps: {
+      getTabGroups: () => Pick<vscode.TabGroups, 'onDidChangeTabs'>;
+      maxItems: number;
+    };
+  } {
+    const tabGroups = new FakeTabGroupsRegistration();
+    return {
+      tabGroups,
+      deps: {
+        getTabGroups: () => ({ onDidChangeTabs: tabGroups.onDidChangeTabs }),
+        maxItems
+      }
+    };
+  }
+
+  test('subscribes to tabGroups.onDidChangeTabs exactly once', () => {
+    const { tabGroups, deps } = createDeps();
+    registerRecentItemsTracker(new FakeMemento(), [], deps);
+    assert.strictEqual(tabGroups.listeners.length, 1);
+  });
+
+  test('pushes the subscription disposable onto subscriptions, disposed exactly once on teardown', () => {
+    const { tabGroups, deps } = createDeps();
+    const subscriptions: vscode.Disposable[] = [];
+
+    registerRecentItemsTracker(new FakeMemento(), subscriptions, deps);
+    for (const subscription of subscriptions) {
+      subscription.dispose();
+    }
+
+    assert.strictEqual(tabGroups.disposables.length, 1);
+    assert.strictEqual(tabGroups.disposables[0].disposeCallCount, 1);
+  });
+
+  test('records a non-preview opened text tab as a promoted entry, persisted to workspaceState', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentItems(memento);
+    const entry = list.find((i) => i.uri === uri.toString());
+    assert.ok(entry, 'expected the opened tab to be recorded');
+    assert.strictEqual(entry!.promoted, true, 'a non-preview open must promote immediately');
+  });
+
+  test('records a preview opened text tab without promoting it', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/preview.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: true })] });
+
+    const list = loadRecentItems(memento);
+    const entry = list.find((i) => i.uri === uri.toString());
+    assert.ok(entry, 'expected the preview tab to still be tracked (counter-only, per D2)');
+    assert.strictEqual(entry!.promoted, false, 'a single preview open must not promote (threshold 3, D2)');
+  });
+
+  test('a closed tab is never recorded', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/closed.txt');
+    tabGroups.fire({ closed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentItems(memento);
+    assert.strictEqual(
+      list.find((i) => i.uri === uri.toString()),
+      undefined
+    );
+  });
+
+  test('a non-file-scheme tab (e.g. output:) is filtered out via extractTabUri (T3/C6)', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    const uri = vscode.Uri.parse('output:some-channel');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentItems(memento);
+    assert.strictEqual(list.length, 0, 'a non-file-scheme tab must never be recorded');
+  });
+
+  test('a diff tab (TabInputTextDiff) is filtered out — no single uri to record (D1)', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    const original = vscode.Uri.file('/workspace/original.txt');
+    const modified = vscode.Uri.file('/workspace/modified.txt');
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputTextDiff(original, modified), { isPreview: false })]
+    });
+
+    const list = loadRecentItems(memento);
+    assert.strictEqual(list.length, 0, 'a diff tab must never be recorded (D1: skipped entirely in v1)');
   });
 });

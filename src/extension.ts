@@ -25,10 +25,13 @@ import {
   GitApiFactory,
   GitExtensionExports
 } from './gitInfo';
+import { extractTabUri, loadRecentItems, recordOpen, saveRecentItems } from './recentItems';
 import { applyWorkspaceEnv } from './workspaceEnv';
 
 const WATCHER_DEBOUNCE_MS = 150;
 const EXPLORER_DECORATION_ENABLED_KEY = 'bookmarksPlus.explorerDecoration.enabled';
+const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
+const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
 
 let activeStores: BookmarkStore[] = [];
 
@@ -123,6 +126,55 @@ export function registerBookmarkDecorationProvider(
   return provider;
 }
 
+/**
+ * Registers the recently-opened-items tracker (#95, T4/T8): subscribes to
+ * `window.tabGroups.onDidChangeTabs`, runs the pure tab adapter/list logic
+ * (`extractTabUri`/`recordOpen`), and persists the result to `memento` under
+ * `RECENT_STORAGE_KEY`. `deps` is injected — mirroring
+ * `registerBookmarkDecorationProvider` above — so this can be exercised without monkey-patching
+ * the read-only `vscode` module; `deps.getTabGroups` stands in for `vscode.window.tabGroups`.
+ *
+ * Only the `opened` array is consumed (D1/T4): the `TabChangeEvent` API docs describe `changed`
+ * as covering things like a tab's `isActive` state flipping, not an existing tab's `input` being
+ * replaced — VS Code reusing a single preview tab across successive Explorer single-clicks
+ * surfaces as a close-then-open pair (a `closed` entry for the vacated preview plus an `opened`
+ * entry for the newly selected file), so `opened` alone already sees every preview selection.
+ *
+ * The subscription disposable is pushed onto `subscriptions`, matching the
+ * `context.subscriptions` disposal pattern used throughout `activate()`.
+ */
+export function registerRecentItemsTracker(
+  memento: vscode.Memento,
+  subscriptions: vscode.Disposable[],
+  deps: {
+    getTabGroups: () => Pick<vscode.TabGroups, 'onDidChangeTabs'>;
+    maxItems: number;
+    onDidChange?: () => void;
+    now?: () => number;
+  }
+): void {
+  const now = deps.now ?? Date.now;
+  const subscription = deps.getTabGroups().onDidChangeTabs((event) => {
+    let list = loadRecentItems(memento);
+    let changed = false;
+
+    for (const tab of event.opened) {
+      const uri = extractTabUri(tab.input);
+      if (!uri) {
+        continue;
+      }
+      list = recordOpen(list, { uri: uri.toString(), isPreview: tab.isPreview }, deps.maxItems, now());
+      changed = true;
+    }
+
+    if (changed) {
+      void saveRecentItems(memento, list);
+      deps.onDidChange?.();
+    }
+  });
+  subscriptions.push(subscription);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Bookmarks Plus');
   const location = resolveMirrorLocation(vscode.workspace.workspaceFolders);
@@ -149,7 +201,15 @@ export function activate(context: vscode.ExtensionContext): void {
     () => provider?.refresh()
   );
   const cache = new FsGitCache(createCacheResolver(getGitApi));
-  provider = new BookmarksTreeDataProvider(store, cache, globalStore);
+  // Read once at activation (D3) — reacting live to a mid-session change of this setting is not
+  // required by the spec and is left out for simplicity; restarting the window picks it up.
+  const suggestionsMaxItems = vscode.workspace
+    .getConfiguration()
+    .get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT);
+  provider = new BookmarksTreeDataProvider(store, cache, globalStore, undefined, {
+    getRecentItems: () => loadRecentItems(context.workspaceState),
+    maxItems: suggestionsMaxItems
+  });
 
   const treeView = vscode.window.createTreeView('bookmarksView', {
     treeDataProvider: provider,
@@ -168,6 +228,12 @@ export function activate(context: vscode.ExtensionContext): void {
     registerFileDecorationProvider: (decorationProvider) =>
       vscode.window.registerFileDecorationProvider(decorationProvider),
     onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
+  });
+
+  registerRecentItemsTracker(context.workspaceState, context.subscriptions, {
+    getTabGroups: () => vscode.window.tabGroups,
+    maxItems: suggestionsMaxItems,
+    onDidChange: () => provider?.refresh()
   });
 
   registerAddCommands(context, stores);

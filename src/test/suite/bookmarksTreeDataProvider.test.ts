@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { FsGitCache } from '../../fsGitCache';
 import { BookmarksTreeDataProvider, BookmarkNode, DND_MIME_TYPE } from '../../bookmarksTreeDataProvider';
+import { RecentItem } from '../../recentItems';
 import { FakeMemento } from './fixtures';
 
 function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })) {
@@ -879,5 +880,266 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
 
     assert.strictEqual(treeItem.contextValue, 'bookmarkItem-addable');
+  });
+});
+
+// --- #95: Suggested bookmarks from recently opened items ---------------------------------------
+//
+// Plan: docs/superpowers/plans/2026-08-25-suggested-bookmarks-from-recent-items.md, T5.
+// New node kinds:
+//   { kind: 'suggestedRoot' }
+//   { kind: 'suggestion'; recentItem: RecentItem }
+// The constructor gains a 5th, optional `suggestions` argument — `{ getRecentItems, maxItems }` —
+// so every existing call site above (none of which pass it) keeps compiling and behaving exactly
+// as before: omitting it means the Suggested row is never synthesized. This is additive, not a
+// breaking change to anything above this comment.
+//
+// `src/recentItems.ts` does not exist yet, so the `RecentItem` import above — and every test in
+// this section — is expected to fail to compile until T2 adds it.
+
+function recentItem(overrides: Partial<RecentItem> = {}): RecentItem {
+  return {
+    uri: 'file:///suggested-a.txt',
+    firstSeen: 1000,
+    previewCount: 0,
+    promoted: true,
+    ...overrides
+  };
+}
+
+function makeProviderWithSuggestions(
+  recentItems: RecentItem[],
+  maxItems = 10,
+  options: {
+    resolve?: (uri: string) => Promise<{ exists: boolean; repoName?: string }>;
+    globalStore?: BookmarkStore;
+  } = {}
+) {
+  const store = new BookmarkStore(new FakeMemento());
+  const cache = new FsGitCache(options.resolve ?? (async () => ({ exists: true })));
+  const provider = new BookmarksTreeDataProvider(store, cache, options.globalStore, undefined, {
+    getRecentItems: () => recentItems,
+    maxItems
+  });
+  return { store, cache, provider };
+}
+
+function findSuggestedRoot(nodes: BookmarkNode[]): BookmarkNode | undefined {
+  return nodes.find((n) => n.kind === 'suggestedRoot');
+}
+
+suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
+  test('omitting the suggestions option leaves root children unaffected — no Suggested row is synthesized (regression guard)', async () => {
+    const { provider } = makeProvider(); // the pre-#95 constructor call shape, unchanged
+    const children = await provider.getChildren();
+    assert.ok(children.every((n) => n.kind !== 'suggestedRoot'));
+  });
+
+  test('the Suggested row is absent when there are zero promoted recent items', async () => {
+    const { provider } = makeProviderWithSuggestions([recentItem({ promoted: false, previewCount: 1 })]);
+    const children = await provider.getChildren();
+    assert.strictEqual(
+      findSuggestedRoot(children),
+      undefined,
+      'a preview-only (unpromoted) entry must not surface a Suggested row'
+    );
+  });
+
+  test('the Suggested row appears, positioned last, when at least one promoted suggestion exists (D8)', async () => {
+    const { provider } = makeProviderWithSuggestions([recentItem()]);
+    const children = await provider.getChildren();
+    assert.strictEqual(children[children.length - 1].kind, 'suggestedRoot');
+  });
+
+  test('the Suggested row sits below the Global row when both are present (D8)', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const { provider } = makeProviderWithSuggestions([recentItem()], 10, { globalStore });
+    const children = await provider.getChildren();
+    assert.strictEqual(children[0].kind, 'globalRoot');
+    assert.strictEqual(children[children.length - 1].kind, 'suggestedRoot');
+  });
+
+  test('the Suggested row still appears last in byRepo mode (D8: present in both group modes)', async () => {
+    const { store, provider } = makeProviderWithSuggestions([recentItem()]);
+    provider.setGroupMode('byRepo');
+    await store.addItem({ type: 'file', uri: 'file:///bookmarked.txt' });
+
+    const children = await provider.getChildren();
+    assert.strictEqual(children[children.length - 1].kind, 'suggestedRoot');
+  });
+
+  test('the Suggested row tree item defaults to collapsed (D8)', async () => {
+    const { provider } = makeProviderWithSuggestions([recentItem()]);
+    const children = await provider.getChildren();
+    const node = findSuggestedRoot(children)!;
+    const treeItem = await provider.getTreeItem(node);
+    assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+  });
+
+  test('a suggestion leaf tree item opens the file directly and carries the bookmarkSuggestion contextValue (T5)', async () => {
+    const uri = 'file:///suggested-a.txt';
+    const { provider } = makeProviderWithSuggestions([recentItem({ uri })]);
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual(leaves[0].kind, 'suggestion');
+
+    const treeItem = await provider.getTreeItem(leaves[0]);
+    assert.strictEqual(treeItem.contextValue, 'bookmarkSuggestion');
+    assert.strictEqual(treeItem.resourceUri?.toString(), uri);
+    assert.strictEqual(treeItem.command?.command, 'vscode.open');
+    assert.strictEqual((treeItem.command?.arguments?.[0] as vscode.Uri).toString(), uri);
+  });
+
+  test('getChildren for the Suggested row excludes a uri already bookmarked in the workspace store (C7/D9)', async () => {
+    const bookmarkedUri = 'file:///already.txt';
+    const otherUri = 'file:///still-suggested.txt';
+    const { store, provider } = makeProviderWithSuggestions([
+      recentItem({ uri: bookmarkedUri, firstSeen: 100 }),
+      recentItem({ uri: otherUri, firstSeen: 200 })
+    ]);
+    await store.addItem({ type: 'file', uri: bookmarkedUri });
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual((leaves[0] as unknown as { recentItem: RecentItem }).recentItem.uri, otherUri);
+  });
+
+  test('getChildren for the Suggested row excludes a uri already bookmarked in the global store (D9: either store)', async () => {
+    const bookmarkedUri = 'file:///already-global.txt';
+    const otherUri = 'file:///still-suggested.txt';
+    const globalStore = new BookmarkStore(new FakeMemento());
+    await globalStore.addItem({ type: 'file', uri: bookmarkedUri });
+
+    const { provider } = makeProviderWithSuggestions(
+      [recentItem({ uri: bookmarkedUri, firstSeen: 100 }), recentItem({ uri: otherUri, firstSeen: 200 })],
+      10,
+      { globalStore }
+    );
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual((leaves[0] as unknown as { recentItem: RecentItem }).recentItem.uri, otherUri);
+  });
+
+  test('getChildren for the Suggested row never includes a non-promoted (preview-only) entry', async () => {
+    const { provider } = makeProviderWithSuggestions([
+      recentItem({ uri: 'file:///promoted.txt', promoted: true, firstSeen: 100 }),
+      recentItem({ uri: 'file:///preview-only.txt', promoted: false, previewCount: 1, firstSeen: 200 })
+    ]);
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual((leaves[0] as unknown as { recentItem: RecentItem }).recentItem.uri, 'file:///promoted.txt');
+  });
+
+  test('getChildren for the Suggested row is capped by maxItems, keeping the most-recently-first-seen entries (D3/D6)', async () => {
+    const { provider } = makeProviderWithSuggestions(
+      [
+        recentItem({ uri: 'file:///oldest.txt', firstSeen: 100 }),
+        recentItem({ uri: 'file:///middle.txt', firstSeen: 200 }),
+        recentItem({ uri: 'file:///newest.txt', firstSeen: 300 })
+      ],
+      2
+    );
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    const uris = leaves.map((n) => (n as unknown as { recentItem: RecentItem }).recentItem.uri).sort();
+    assert.deepStrictEqual(uris, ['file:///middle.txt', 'file:///newest.txt'].sort());
+  });
+
+  test('a maxItems of 0 hides the Suggested row entirely, even with promoted entries present (D3)', async () => {
+    const { provider } = makeProviderWithSuggestions([recentItem()], 0);
+    const children = await provider.getChildren();
+    assert.strictEqual(findSuggestedRoot(children), undefined);
+  });
+
+  test('suggestion leaves render most-recently-first-seen first (D6 sort)', async () => {
+    const { provider } = makeProviderWithSuggestions([
+      recentItem({ uri: 'file:///older.txt', firstSeen: 100 }),
+      recentItem({ uri: 'file:///newer.txt', firstSeen: 200 })
+    ]);
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    assert.deepStrictEqual(
+      leaves.map((n) => (n as unknown as { recentItem: RecentItem }).recentItem.uri),
+      ['file:///newer.txt', 'file:///older.txt']
+    );
+  });
+});
+
+// --- #95 R4: regression guards for the widened BookmarkNode union at the four kind-switching
+// sites the plan names — handleDrag / handleDrop here; createRemoveHandler / createRevealHandler
+// in commands.test.ts. Each new-kind node is built with `as unknown as BookmarkNode` so this file
+// compiles against both today's four-arm union and the widened one from T5 — these prove today's
+// behavior already guards against the new kind (a widened union making a `switch`/`if` chain
+// silently fall through), rather than being expected to start red.
+suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', () => {
+  function suggestionNode(uri = 'file:///suggested.txt'): BookmarkNode {
+    return { kind: 'suggestion', recentItem: recentItem({ uri }) } as unknown as BookmarkNode;
+  }
+  function suggestedRootNode(): BookmarkNode {
+    return { kind: 'suggestedRoot' } as unknown as BookmarkNode;
+  }
+
+  test('handleDrag ignores a suggestion node mixed into an otherwise-draggable selection', async () => {
+    const { store, provider } = makeProvider();
+    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+
+    const dt = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace' }, suggestionNode()], dt, token);
+
+    const envelope = getTransferEnvelope(dt);
+    assert.ok(envelope, 'the real item must still be draggable despite the mixed-in suggestion node');
+    assert.deepStrictEqual(envelope!.ids, [item.id]);
+  });
+
+  test('handleDrag on an all-suggestion selection sets no transfer data', async () => {
+    const { provider } = makeProvider();
+    const dt = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag([suggestionNode('file:///a.txt'), suggestionNode('file:///b.txt')], dt, token);
+    assert.strictEqual(dt.get(DND_MIME_TYPE), undefined);
+  });
+
+  test('handleDrop on a suggestion node target is a no-op', async () => {
+    const { store, provider } = makeProvider();
+    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(suggestionNode(), makeDropTransfer('workspace', [item.id]), token);
+
+    const untouched = store.getAll().items.find((i) => i.id === item.id)!;
+    assert.strictEqual(untouched.collectionId, null);
+    assert.strictEqual(untouched.order, 0, 'a suggestion node is not a valid drop target');
+  });
+
+  test('handleDrop on a suggestedRoot node target is a no-op', async () => {
+    const { store, provider } = makeProvider();
+    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
+
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrop(suggestedRootNode(), makeDropTransfer('workspace', [item.id]), token);
+
+    const untouched = store.getAll().items.find((i) => i.id === item.id)!;
+    assert.strictEqual(untouched.collectionId, null);
+    assert.strictEqual(untouched.order, 0, 'a suggestedRoot node is not a valid drop target');
   });
 });
