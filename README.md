@@ -17,6 +17,10 @@ See `docs/superpowers/specs/` for the design spec.
 - Add an optional description to any bookmark or collection — shown on hover.
 - Workspace bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit
   them. Global bookmarks are never mirrored — see "The `.vscode/bookmarks.json` mirror" below.
+- Bookmarked files and folders show a `★` badge and a "Bookmarked" tooltip directly in VS Code's
+  built-in Explorer tree, so you can spot what's bookmarked without opening the Bookmarks Plus
+  panel. Covers both workspace and global bookmarks, and updates live as bookmarks change. On by
+  default; turn it off with the `bookmarksPlus.explorerDecoration.enabled` setting.
 - **Add to Workspace:** a global folder bookmark that isn't already inside the current workspace
   gets an inline "Add to Workspace" action, which adds it as a new workspace root. This is VS
   Code's own `updateWorkspaceFolders`, so it may restart the extension host — most likely when
