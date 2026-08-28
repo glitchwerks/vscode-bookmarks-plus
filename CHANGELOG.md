@@ -4,6 +4,13 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ## [Unreleased]
 
+### Added
+
+- Explorer decoration for bookmarked files and folders (#96): a `★` badge and "Bookmarked"
+  tooltip on bookmarked items in VS Code's built-in Explorer tree, covering both workspace and
+  global bookmarks. Updates live as bookmarks change. Controlled by the new
+  `bookmarksPlus.explorerDecoration.enabled` setting (default `true`).
+
 ## [1.1.0] — 2026-08-24
 
 ### Added

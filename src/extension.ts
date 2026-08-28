@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { BookmarkStore, OutputSink } from './bookmarkStore';
+import { BookmarkDecorationProvider } from './bookmarkDecorationProvider';
 import {
   MIRROR_RELATIVE_PATH,
   WorkspaceMirrorFile,
@@ -27,6 +28,7 @@ import {
 import { applyWorkspaceEnv } from './workspaceEnv';
 
 const WATCHER_DEBOUNCE_MS = 150;
+const EXPLORER_DECORATION_ENABLED_KEY = 'bookmarksPlus.explorerDecoration.enabled';
 
 let activeStores: BookmarkStore[] = [];
 
@@ -83,6 +85,44 @@ function createCacheResolver(getGitApi: GitApiFactory): ResolveFn {
   };
 }
 
+/**
+ * Registers a {@link BookmarkDecorationProvider} wired to `stores`, seeded from the
+ * `bookmarksPlus.explorerDecoration.enabled` setting (fallback `true`), and kept in sync with
+ * subsequent configuration changes (T4, plan §6). Registration and configuration dependencies are
+ * injected so this can be exercised without monkey-patching the read-only `vscode` module.
+ *
+ * Every disposable this creates — the provider registration, the configuration-change listener,
+ * and the store-wiring subscription(s) — is pushed onto `subscriptions`.
+ */
+export function registerBookmarkDecorationProvider(
+  stores: BookmarkStore[],
+  subscriptions: vscode.Disposable[],
+  deps: {
+    getConfiguration: () => { get<T>(section: string, defaultValue: T): T };
+    registerFileDecorationProvider: (provider: vscode.FileDecorationProvider) => vscode.Disposable;
+    onDidChangeConfiguration: (
+      listener: (event: vscode.ConfigurationChangeEvent) => void
+    ) => vscode.Disposable;
+  }
+): BookmarkDecorationProvider {
+  const provider = new BookmarkDecorationProvider(new Set());
+  const wireSubscription = provider.wire(stores);
+  provider.setEnabled(deps.getConfiguration().get<boolean>(EXPLORER_DECORATION_ENABLED_KEY, true));
+
+  const registrationSubscription = deps.registerFileDecorationProvider(provider);
+
+  const configChangeSubscription = deps.onDidChangeConfiguration((event) => {
+    if (!event.affectsConfiguration(EXPLORER_DECORATION_ENABLED_KEY)) {
+      return;
+    }
+    provider.setEnabled(deps.getConfiguration().get<boolean>(EXPLORER_DECORATION_ENABLED_KEY, true));
+  });
+
+  subscriptions.push(wireSubscription, registrationSubscription, configChangeSubscription);
+
+  return provider;
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Bookmarks Plus');
   const location = resolveMirrorLocation(vscode.workspace.workspaceFolders);
@@ -122,6 +162,13 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => store.dispose() },
     { dispose: () => globalStore.dispose() }
   );
+
+  registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
+    getConfiguration: () => vscode.workspace.getConfiguration(),
+    registerFileDecorationProvider: (decorationProvider) =>
+      vscode.window.registerFileDecorationProvider(decorationProvider),
+    onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
+  });
 
   registerAddCommands(context, stores);
   registerAddToWorkspaceCommand(context, store);

@@ -82,7 +82,18 @@
     },
     "jsonValidation": [
       { "fileMatch": ".vscode/bookmarks.json", "url": "./schemas/bookmarks.schema.json" }
-    ]
+    ],
+    "configuration": {
+      "title": "Bookmarks Plus",
+      "properties": {
+        "bookmarksPlus.explorerDecoration.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Show a badge and tooltip in the Explorer on files and folders that are bookmarked."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
