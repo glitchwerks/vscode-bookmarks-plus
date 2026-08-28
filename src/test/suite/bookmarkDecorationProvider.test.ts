@@ -6,6 +6,8 @@ import {
   BookmarkDecorationProvider
 } from '../../bookmarkDecorationProvider';
 import { BookmarkItem } from '../../types';
+import { BookmarkStore } from '../../bookmarkStore';
+import { FakeMemento, FakeMirror, FakeOutput } from './fixtures';
 
 function item(overrides: Partial<BookmarkItem> = {}): BookmarkItem {
   return {
@@ -143,5 +145,204 @@ suite('BookmarkDecorationProvider', () => {
 
     const isThenable = result !== null && typeof result === 'object' && typeof (result as { then?: unknown }).then === 'function';
     assert.strictEqual(isThenable, false, 'provideFileDecoration must not return a Promise/thenable');
+  });
+});
+
+// T2 (plan §6, C4): change-event wiring. The provider must subscribe to a BookmarkStore's
+// `onBookmarksChanged`, recompute its decorated-key set, and fire `onDidChangeFileDecorations`
+// exactly once per change, batched as the union of added+removed uris — never `undefined` (C4
+// explicitly rejects "just fire undefined" as the landed pattern, modelling
+// `GitDecorationProvider.onDidRunGitStatus`). `wire(stores)` and `onDidChangeFileDecorations` do
+// not exist on `BookmarkDecorationProvider` yet (T1 only shipped the synchronous lookup surface),
+// so these tests are expected to fail to compile until T2 adds them.
+suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
+  /** `onDidChangeFileDecorations`'s payload is `undefined | Uri | Uri[]` per the vscode.d.ts shape
+   * the plan cites (§2.2) — flatten it to a plain array regardless of which shape the
+   * implementation chooses for a single-uri batch. */
+  function flattenUris(event: vscode.Uri | vscode.Uri[] | undefined): vscode.Uri[] {
+    if (event === undefined) {
+      return [];
+    }
+    return Array.isArray(event) ? event : [event];
+  }
+
+  test('persist fire site: adding a bookmark through the store fires onDidChangeFileDecorations exactly once, including the added uri', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    await store.addItem({ type: 'file', uri: uri.toString() });
+
+    assert.strictEqual(
+      fired.length,
+      1,
+      'expected exactly one batched invalidation event for one persisted change'
+    );
+    assert.notStrictEqual(
+      fired[0],
+      undefined,
+      'C4: must fire a targeted uri/uri[] batch, not undefined'
+    );
+    const changedKeys = flattenUris(fired[0]).map((u) => decorationUriKey(u));
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uri)),
+      'fired event must include the newly-bookmarked uri'
+    );
+
+    const decoration = provider.provideFileDecoration(uri, NO_CANCELLATION);
+    assert.ok(
+      decoration,
+      'the provider must have recomputed its decorated-key set from the persisted change'
+    );
+  });
+
+  test('persist fire site: two sequential mutations each fire their own single batched event, not a combined or missing one', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    const uriA = vscode.Uri.file('/workspace/a.txt');
+    const uriB = vscode.Uri.file('/workspace/b.txt');
+    await store.addItem({ type: 'file', uri: uriA.toString() });
+    await store.addItem({ type: 'file', uri: uriB.toString() });
+
+    assert.strictEqual(fired.length, 2, 'expected one event per persisted mutation');
+    const secondChangedKeys = flattenUris(fired[1]).map((u) => decorationUriKey(u));
+    assert.ok(
+      secondChangedKeys.includes(decorationUriKey(uriB)),
+      'the second event must include the second added uri'
+    );
+    assert.ok(
+      !secondChangedKeys.includes(decorationUriKey(uriA)),
+      'C4: each event is the diff for that change only (added ∪ removed since the last recompute) — ' +
+        're-signalling every previously-decorated uri on every change is not the union-diff pattern the plan requires'
+    );
+  });
+
+  test('persist fire site: removing a bookmark fires onDidChangeFileDecorations exactly once with the removed uri (C4 union includes removals)', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    const added = await store.addItem({ type: 'file', uri: uri.toString() });
+
+    const provider = new BookmarkDecorationProvider(buildDecoratedUriKeys([store.getAll().items]));
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    await store.removeItem(added.id);
+
+    assert.strictEqual(
+      fired.length,
+      1,
+      'expected exactly one batched invalidation event for one persisted removal'
+    );
+    assert.notStrictEqual(
+      fired[0],
+      undefined,
+      'C4: must fire a targeted uri/uri[] batch, not undefined'
+    );
+    const changedKeys = flattenUris(fired[0]).map((u) => decorationUriKey(u));
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uri)),
+      'a removed bookmark must be signalled so its stale badge clears from the Explorer'
+    );
+
+    const decoration = provider.provideFileDecoration(uri, NO_CANCELLATION);
+    assert.strictEqual(
+      decoration,
+      undefined,
+      'the provider must have actually recomputed its decorated-key set, not merely fired an event'
+    );
+  });
+
+  test('mirror-reload fire site: adopting an externally-added bookmark fires onDidChangeFileDecorations exactly once, including the added uri', async () => {
+    const mirror = new FakeMirror();
+    const memento = new FakeMemento();
+    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+
+    // Establish the mirror hash via a normal, internally-originated write first — matching the
+    // existing "BookmarkStore - reloadFromMirror" fixture pattern in bookmarkStore.test.ts.
+    await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
+    await store.flushMirrorWrites();
+
+    const provider = new BookmarkDecorationProvider(buildDecoratedUriKeys([store.getAll().items]));
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    const externalUri = vscode.Uri.file('/workspace/b.txt');
+    mirror.content = `${JSON.stringify(
+      {
+        version: 2,
+        items: [
+          {
+            id: 'external',
+            type: 'file',
+            uri: externalUri.toString(),
+            collectionId: null,
+            order: 0
+          }
+        ],
+        collections: []
+      },
+      null,
+      2
+    )}\n`;
+
+    await store.reloadFromMirror();
+
+    assert.strictEqual(
+      fired.length,
+      1,
+      'expected exactly one batched invalidation event for one mirror-adopted change'
+    );
+    assert.notStrictEqual(
+      fired[0],
+      undefined,
+      'C4: must fire a targeted uri/uri[] batch, not undefined'
+    );
+    const changedKeys = flattenUris(fired[0]).map((u) => decorationUriKey(u));
+    assert.ok(
+      changedKeys.includes(decorationUriKey(externalUri)),
+      'fired event must include the externally-bookmarked uri'
+    );
+
+    const decoration = provider.provideFileDecoration(externalUri, NO_CANCELLATION);
+    assert.ok(
+      decoration,
+      'the provider must have recomputed its decorated-key set from the adopted mirror content'
+    );
+  });
+
+  test('mirror-reload fire site: a watcher echo of our own last write does not fire an invalidation event', async () => {
+    const mirror = new FakeMirror();
+    const memento = new FakeMemento();
+    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
+    await store.flushMirrorWrites();
+
+    const provider = new BookmarkDecorationProvider(buildDecoratedUriKeys([store.getAll().items]));
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    // No external edit — content is unchanged, so this models the watcher firing on our own write.
+    await store.reloadFromMirror();
+
+    assert.strictEqual(
+      fired.length,
+      0,
+      'an unchanged mirror echo must not produce a decoration invalidation'
+    );
   });
 });
