@@ -85,6 +85,41 @@ suite('Extension activation', () => {
       'expected package.json activationEvents to include "onStartupFinished" so terminals opened before the Bookmarks view is revealed still receive BOOKMARKS_PLUS_WORKSPACE'
     );
   });
+
+  // T5 (plan §6, docs/superpowers/plans/2026-08-25-explorer-decoration-for-bookmarked-files.md):
+  // package.json contribution and manifest assertion. D1 resolved to (a), so no
+  // contributes.colors section is needed — only the explorerDecoration.enabled setting. This
+  // property does not exist in package.json yet, so this test is expected to fail until T5 adds
+  // it.
+  test('contributes.configuration declares bookmarksPlus.explorerDecoration.enabled as a boolean, default true, window-scoped setting (T5, plan §6)', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const properties: Record<string, { type?: string; default?: unknown; scope?: string }> | undefined =
+      ext!.packageJSON.contributes?.configuration?.properties;
+    assert.ok(
+      properties && Object.prototype.hasOwnProperty.call(properties, 'bookmarksPlus.explorerDecoration.enabled'),
+      'expected package.json contributes.configuration.properties to declare bookmarksPlus.explorerDecoration.enabled'
+    );
+
+    const property = properties!['bookmarksPlus.explorerDecoration.enabled'];
+    assert.strictEqual(
+      property.type,
+      'boolean',
+      'bookmarksPlus.explorerDecoration.enabled must be declared with type: "boolean"'
+    );
+    assert.strictEqual(
+      property.default,
+      true,
+      'bookmarksPlus.explorerDecoration.enabled must default to true'
+    );
+    assert.strictEqual(
+      property.scope,
+      'window',
+      'bookmarksPlus.explorerDecoration.enabled must be declared with scope: "window"'
+    );
+  });
 });
 
 suite('Extension - workspace-folder mirror changes', () => {
