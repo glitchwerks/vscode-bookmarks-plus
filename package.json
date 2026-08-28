@@ -46,7 +46,8 @@
       { "command": "bookmarks.moveToCollection", "title": "Move to Collection", "category": "Bookmarks Plus", "icon": "$(folder-opened)" },
       { "command": "bookmarks.addToWorkspace", "title": "Add to Workspace", "category": "Bookmarks Plus", "icon": "$(root-folder)" },
       { "command": "bookmarks.toggleGroupByRepo", "title": "Toggle Group by Repo", "category": "Bookmarks Plus", "icon": "$(repo)" },
-      { "command": "bookmarks.refresh", "title": "Refresh", "category": "Bookmarks Plus", "icon": "$(refresh)" }
+      { "command": "bookmarks.refresh", "title": "Refresh", "category": "Bookmarks Plus", "icon": "$(refresh)" },
+      { "command": "bookmarks.promoteSuggestion", "title": "Add Bookmark from Suggestion", "category": "Bookmarks Plus", "icon": "$(add)" }
     ],
     "menus": {
       "explorer/context": [
@@ -69,7 +70,8 @@
         { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "bookmarks@1" },
         { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem == bookmarkCollection", "group": "bookmarks@1" },
         { "command": "bookmarks.addToWorkspace", "when": "view == bookmarksView && viewItem == bookmarkItem-addable", "group": "inline@4" },
-        { "command": "bookmarks.newGlobalCollection", "when": "view == bookmarksView && viewItem == bookmarkGlobalRoot", "group": "inline@1" }
+        { "command": "bookmarks.newGlobalCollection", "when": "view == bookmarksView && viewItem == bookmarkGlobalRoot", "group": "inline@1" },
+        { "command": "bookmarks.promoteSuggestion", "when": "view == bookmarksView && viewItem == bookmarkSuggestion", "group": "inline@1" }
       ],
       "commandPalette": [
         { "command": "bookmarks.addFile", "when": "false" },
@@ -77,7 +79,8 @@
         { "command": "bookmarks.addFileGlobal", "when": "false" },
         { "command": "bookmarks.addFolderGlobal", "when": "false" },
         { "command": "bookmarks.addToWorkspace", "when": "false" },
-        { "command": "bookmarks.newGlobalCollection", "when": "false" }
+        { "command": "bookmarks.newGlobalCollection", "when": "false" },
+        { "command": "bookmarks.promoteSuggestion", "when": "false" }
       ]
     },
     "jsonValidation": [
@@ -91,6 +94,13 @@
           "default": true,
           "scope": "window",
           "description": "Show a badge and tooltip in the Explorer on files and folders that are bookmarked."
+        },
+        "bookmarksPlus.suggestions.maxItems": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "scope": "window",
+          "description": "Maximum number of suggested bookmarks (recently opened items) to show in the Suggested section. Set to 0 to disable the section entirely."
         }
       }
     }

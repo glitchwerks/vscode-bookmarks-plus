@@ -4,6 +4,7 @@ import { BookmarkStore } from './bookmarkStore';
 import { BookmarkItem, BookmarkCollection, BookmarkScope } from './types';
 import { FsGitCache } from './fsGitCache';
 import { isInsideWorkspace } from './workspaceFolders';
+import { RecentItem } from './recentItems';
 
 export type GroupMode = 'default' | 'byRepo';
 
@@ -11,7 +12,19 @@ export type BookmarkNode =
   | { kind: 'globalRoot' }
   | { kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string; scope: BookmarkScope }
   | { kind: 'item'; item: BookmarkItem; scope: BookmarkScope }
-  | { kind: 'repoGroup'; label: string; repoKey: string };
+  | { kind: 'repoGroup'; label: string; repoKey: string }
+  | { kind: 'suggestedRoot' }
+  | { kind: 'suggestion'; recentItem: RecentItem };
+
+/**
+ * Optional 5th constructor argument (#95, T5): synthesizes a "Suggested" root row from recently
+ * opened, not-yet-bookmarked items. Omitted entirely by every existing call site, so the Suggested
+ * row is additive — it is never synthesized unless a caller opts in.
+ */
+export interface SuggestionsSource {
+  getRecentItems: () => RecentItem[];
+  maxItems: number;
+}
 
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
 export const UNKNOWN_REPO_LABEL = 'Unknown';
@@ -45,7 +58,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     private readonly cache: FsGitCache,
     private readonly globalStore?: BookmarkStore,
     private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () =>
-      vscode.workspace.workspaceFolders
+      vscode.workspace.workspaceFolders,
+    private readonly suggestions?: SuggestionsSource
   ) {
     this.store.onBookmarksChanged(() => {
       this.cache.invalidateAll();
@@ -176,6 +190,27 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       return treeItem;
     }
 
+    if (node.kind === 'suggestedRoot') {
+      // Collapsed by default, present in both group modes, positioned last (D8).
+      const treeItem = new vscode.TreeItem('Suggested', vscode.TreeItemCollapsibleState.Collapsed);
+      treeItem.contextValue = 'bookmarkSuggestedRoot';
+      treeItem.iconPath = new vscode.ThemeIcon('lightbulb');
+      return treeItem;
+    }
+
+    if (node.kind === 'suggestion') {
+      const uri = vscode.Uri.parse(node.recentItem.uri);
+      const label = path.basename(uri.fsPath) || uri.fsPath;
+      const treeItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+      treeItem.contextValue = 'bookmarkSuggestion';
+      treeItem.resourceUri = uri;
+      treeItem.iconPath = new vscode.ThemeIcon('file');
+      // Independently clickable to open in an editor tab while it stays in the recent list —
+      // promoting into a real bookmark is a separate action (bookmarks.promoteSuggestion, T6).
+      treeItem.command = { command: 'vscode.open', title: 'Open', arguments: [uri] };
+      return treeItem;
+    }
+
     if (node.kind === 'collection') {
       const treeItem = new vscode.TreeItem(node.collection.name, vscode.TreeItemCollapsibleState.Collapsed);
       treeItem.contextValue = 'bookmarkCollection';
@@ -226,6 +261,10 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   async getChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
+    if (node?.kind === 'suggestedRoot') {
+      return this.getSuggestedLeaves();
+    }
+
     if (node?.kind === 'globalRoot' || (node?.kind === 'collection' && node.scope === 'global')) {
       if (!this.globalStore) {
         return [];
@@ -238,10 +277,56 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
     if (this.groupMode === 'byRepo') {
       const children = await this.getChildrenByRepo(node, data.items, data.collections);
-      return !node && this.globalStore ? [{ kind: 'globalRoot' }, ...children] : children;
+      return !node ? await this.withRoots(children) : children;
     }
     const children = this.getChildrenDefault(node, data.items, data.collections, 'workspace');
-    return !node && this.globalStore ? [{ kind: 'globalRoot' }, ...children] : children;
+    return !node ? await this.withRoots(children) : children;
+  }
+
+  /** Prepends the Global row and appends the Suggested row (D8) to a set of root-level children. */
+  private async withRoots(children: BookmarkNode[]): Promise<BookmarkNode[]> {
+    const suggestedLeaves = await this.getSuggestedLeaves();
+    return [
+      ...(this.globalStore ? [{ kind: 'globalRoot' } as BookmarkNode] : []),
+      ...children,
+      ...(suggestedLeaves.length > 0 ? [{ kind: 'suggestedRoot' } as BookmarkNode] : [])
+    ];
+  }
+
+  /**
+   * The Suggested row's children (T5): promoted recent items not already bookmarked in either
+   * store (C7/D9), sorted most-recent-first-seen first, filtered for staleness (CodeRabbit: stale
+   * persisted suggestion URIs — D4's filter-at-render choice, reusing the same `FsGitCache`
+   * existence-check seam `getTreeItem` uses for the "missing" bookmark warning icon), and only
+   * then capped at `maxItems` (D3/D6) — staleness filtering must happen before the cap so a stale
+   * entry never crowds out a valid one. Returns `[]` — hiding the row entirely (D8) — when no
+   * `suggestions` source was supplied, when `maxItems` is 0 (the setting's off-switch, D3), or
+   * when every candidate turns out to be stale.
+   */
+  private async getSuggestedLeaves(): Promise<BookmarkNode[]> {
+    if (!this.suggestions || this.suggestions.maxItems <= 0) {
+      return [];
+    }
+    const bookmarkedUris = new Set([
+      ...this.store.getAll().items.map((i) => i.uri),
+      ...(this.globalStore?.getAll().items.map((i) => i.uri) ?? [])
+    ]);
+    const candidates = this.suggestions
+      .getRecentItems()
+      .filter((recentItem) => recentItem.promoted && !bookmarkedUris.has(recentItem.uri))
+      .sort((a, b) => b.firstSeen - a.firstSeen);
+
+    const existing: RecentItem[] = [];
+    for (const recentItem of candidates) {
+      const entry = await this.cache.get(recentItem.uri);
+      if (entry.exists) {
+        existing.push(recentItem);
+      }
+    }
+
+    return existing
+      .slice(0, this.suggestions.maxItems)
+      .map((recentItem): BookmarkNode => ({ kind: 'suggestion', recentItem }));
   }
 
   private getChildrenDefault(

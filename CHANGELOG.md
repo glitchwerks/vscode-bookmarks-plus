@@ -10,6 +10,12 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   tooltip on bookmarked items in VS Code's built-in Explorer tree, covering both workspace and
   global bookmarks. Updates live as bookmarks change. Controlled by the new
   `bookmarksPlus.explorerDecoration.enabled` setting (default `true`).
+- Suggested bookmarks from recently opened items (#95): a "Suggested" row at the bottom of the
+  tree, listing recently opened files that aren't bookmarked yet, with a one-click action to
+  promote a suggestion into a real bookmark. Repeated preview-tab opens of the same file promote
+  it into a suggestion after the third preview; a real (non-preview) open promotes it immediately.
+  Controlled by the new `bookmarksPlus.suggestions.maxItems` setting (default `10`; `0` disables
+  the section).
 
 ## [1.1.0] — 2026-08-24
 

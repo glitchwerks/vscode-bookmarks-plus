@@ -78,6 +78,25 @@ export function createAddFolderHandler(
   };
 }
 
+/**
+ * Promotes a suggested item (issue #95, T6) into a real workspace-scoped file bookmark, routed
+ * through the same `addBookmark` helper every other add path uses so `DuplicateBookmarkError`
+ * produces the identical "already bookmarked" info toast. A recent item has no scope of its own,
+ * so this targets a single (workspace) store, mirroring `createAddFileHandler`'s shape rather than
+ * a `ScopedStores` bag.
+ */
+export function createPromoteSuggestionHandler(
+  store: BookmarkStore,
+  prompter: Pick<Prompter, 'showInfo'>
+): (node: BookmarkNode) => Promise<void> {
+  return async (node: BookmarkNode): Promise<void> => {
+    if (node.kind !== 'suggestion') {
+      return;
+    }
+    await addBookmark(store, prompter, 'file', vscode.Uri.parse(node.recentItem.uri));
+  };
+}
+
 export function createRemoveHandler(
   stores: ScopedStores
 ): (node: BookmarkNode) => Promise<void> {
@@ -173,7 +192,13 @@ export function createSetDescriptionHandler(
   prompter: Pick<Prompter, 'showInputBox'>
 ): (node?: BookmarkNode) => Promise<void> {
   return async (node?: BookmarkNode): Promise<void> => {
-    if (node === undefined || node.kind === 'repoGroup' || node.kind === 'globalRoot') {
+    if (
+      node === undefined ||
+      node.kind === 'repoGroup' ||
+      node.kind === 'globalRoot' ||
+      node.kind === 'suggestedRoot' ||
+      node.kind === 'suggestion'
+    ) {
       return;
     }
     const store = stores[node.scope];
@@ -364,7 +389,11 @@ export function registerItemCommands(
   };
   context.subscriptions.push(
     vscode.commands.registerCommand('bookmarks.remove', createRemoveHandler(stores)),
-    vscode.commands.registerCommand('bookmarks.reveal', createRevealHandler(revealDeps))
+    vscode.commands.registerCommand('bookmarks.reveal', createRevealHandler(revealDeps)),
+    vscode.commands.registerCommand(
+      'bookmarks.promoteSuggestion',
+      createPromoteSuggestionHandler(stores.workspace, createPrompter())
+    )
   );
 }
 

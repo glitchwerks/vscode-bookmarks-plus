@@ -143,6 +143,29 @@ export class FakeMirror implements MirrorPort {
   }
 }
 
+/**
+ * A minimal `vscode.Tab`-shaped fixture for #95 (suggested bookmarks from recently opened items).
+ * `vscode.Tab` is an interface, not a constructible class, so this is a plain object literal cast
+ * to the type rather than a real instance — `group` is stubbed since none of `extractTabUri` or
+ * `registerRecentItemsTracker` read anything from it. `input` is left as `unknown` so callers can
+ * pass any of the real `vscode.TabInput*` classes (`TabInputText`, `TabInputCustom`,
+ * `TabInputNotebook`, `TabInputTextDiff`, ...) or a non-instance value for negative-path tests.
+ */
+export function fakeTab(
+  input: unknown,
+  options: { isPreview?: boolean; isPinned?: boolean; isActive?: boolean } = {}
+): vscode.Tab {
+  return {
+    label: 'fake-tab',
+    group: {} as vscode.TabGroup,
+    input,
+    isActive: options.isActive ?? false,
+    isDirty: false,
+    isPinned: options.isPinned ?? false,
+    isPreview: options.isPreview ?? false
+  } as vscode.Tab;
+}
+
 export interface FakePrompterOptions {
   inputBoxResult?: string | undefined;
   quickPickResult?: unknown;
