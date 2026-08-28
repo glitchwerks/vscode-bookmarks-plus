@@ -152,9 +152,7 @@ suite('BookmarkDecorationProvider', () => {
 // `onBookmarksChanged`, recompute its decorated-key set, and fire `onDidChangeFileDecorations`
 // exactly once per change, batched as the union of added+removed uris — never `undefined` (C4
 // explicitly rejects "just fire undefined" as the landed pattern, modelling
-// `GitDecorationProvider.onDidRunGitStatus`). `wire(stores)` and `onDidChangeFileDecorations` do
-// not exist on `BookmarkDecorationProvider` yet (T1 only shipped the synchronous lookup surface),
-// so these tests are expected to fail to compile until T2 adds them.
+// `GitDecorationProvider.onDidRunGitStatus`).
 suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
   /** `onDidChangeFileDecorations`'s payload is `undefined | Uri | Uri[]` per the vscode.d.ts shape
    * the plan cites (§2.2) — flatten it to a plain array regardless of which shape the
@@ -347,9 +345,8 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
   });
 });
 
-// T3 (plan §6): enabled-state behavior. `setEnabled(enabled: boolean): void` does not exist on
-// `BookmarkDecorationProvider` yet, so these tests are expected to fail to compile until T3 adds
-// it. Per the plan: no-op when the value is unchanged; when changed, update the state and fire
+// T3 (plan §6): enabled-state behavior of `setEnabled(enabled: boolean): void`.
+// Per the plan: no-op when the value is unchanged; when changed, update the state and fire
 // `onDidChangeFileDecorations` exactly once with every currently indexed uri, so the Explorer
 // updates immediately in either direction.
 suite('BookmarkDecorationProvider - enabled state (T3)', () => {
