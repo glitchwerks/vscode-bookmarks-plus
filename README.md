@@ -31,8 +31,10 @@ See `docs/superpowers/specs/` for the design spec.
   caveats, including a command-palette gap tracked as a follow-up, are in
   [the design spec](docs/superpowers/specs/2026-07-22-vscode-bookmarks-plus-design.md#5-commands).
 - **Suggested bookmarks:** a "Suggested" row at the bottom of the tree lists recently opened files
-  that aren't bookmarked yet, most-recently-opened first. Each suggestion opens directly in an
-  editor tab, and a one-click action promotes it into a real bookmark. Preview tabs (a single
+  that aren't bookmarked yet, most-recently-promoted first. Reopening a file that's already a
+  suggestion does not move it — its position is set once, when it's first promoted into the list.
+  Each suggestion opens directly in an editor tab, and a one-click action promotes it into a real
+  bookmark. Preview tabs (a single
   click in the Explorer) only turn into a suggestion once the same file has been previewed three
   times, so briefly glancing at a file doesn't clutter the list; opening a file for real (double
   click, or editing it) surfaces it immediately. Controlled by the
