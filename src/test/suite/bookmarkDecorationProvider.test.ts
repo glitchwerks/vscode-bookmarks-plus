@@ -346,3 +346,163 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
     );
   });
 });
+
+// T3 (plan §6): enabled-state behavior. `setEnabled(enabled: boolean): void` does not exist on
+// `BookmarkDecorationProvider` yet, so these tests are expected to fail to compile until T3 adds
+// it. Per the plan: no-op when the value is unchanged; when changed, update the state and fire
+// `onDidChangeFileDecorations` exactly once with every currently indexed uri, so the Explorer
+// updates immediately in either direction.
+suite('BookmarkDecorationProvider - enabled state (T3)', () => {
+  function keysFor(...items: BookmarkItem[]): Set<string> {
+    return buildDecoratedUriKeys([items]);
+  }
+
+  /** Mirrors the T2 suite's flattening helper — see its comment above for the payload shape. */
+  function flattenUris(event: vscode.Uri | vscode.Uri[] | undefined): vscode.Uri[] {
+    if (event === undefined) {
+      return [];
+    }
+    return Array.isArray(event) ? event : [event];
+  }
+
+  test('default-enabled: provideFileDecoration returns the badge for a bookmarked uri without any setEnabled call', () => {
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    const provider = new BookmarkDecorationProvider(keysFor(item({ uri: uri.toString() })));
+
+    const decoration = provider.provideFileDecoration(uri, NO_CANCELLATION);
+
+    assert.ok(decoration, 'a freshly constructed provider must be enabled by default');
+    assert.strictEqual((decoration as vscode.FileDecoration).badge, '★');
+  });
+
+  test('disabled: provideFileDecoration returns undefined for a bookmarked uri after setEnabled(false)', () => {
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    const provider = new BookmarkDecorationProvider(keysFor(item({ uri: uri.toString() })));
+
+    provider.setEnabled(false);
+    const decoration = provider.provideFileDecoration(uri, NO_CANCELLATION);
+
+    assert.strictEqual(
+      decoration,
+      undefined,
+      'the decoration must be suppressed for a bookmarked uri while disabled'
+    );
+  });
+
+  test('enabled -> disabled: setEnabled(false) fires onDidChangeFileDecorations exactly once with every currently indexed uri', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    const uriA = vscode.Uri.file('/workspace/a.txt');
+    const uriB = vscode.Uri.file('/workspace/b.txt');
+    await store.addItem({ type: 'file', uri: uriA.toString() });
+    await store.addItem({ type: 'file', uri: uriB.toString() });
+
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    provider.setEnabled(false);
+
+    assert.strictEqual(
+      fired.length,
+      1,
+      'expected exactly one invalidation event for the enabled -> disabled transition'
+    );
+    assert.notStrictEqual(fired[0], undefined, 'must fire a targeted uri/uri[] batch, not undefined');
+    const changedKeys = flattenUris(fired[0]).map((u) => decorationUriKey(u));
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uriA)),
+      'the batch must include every currently indexed uri, including uriA'
+    );
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uriB)),
+      'the batch must include every currently indexed uri, including uriB'
+    );
+
+    const decoration = provider.provideFileDecoration(uriA, NO_CANCELLATION);
+    assert.strictEqual(
+      decoration,
+      undefined,
+      'the provider must actually be disabled after the transition, not merely have fired an event'
+    );
+  });
+
+  test('disabled -> enabled: setEnabled(true) fires onDidChangeFileDecorations exactly once with every currently indexed uri', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    const uriA = vscode.Uri.file('/workspace/a.txt');
+    const uriB = vscode.Uri.file('/workspace/b.txt');
+    await store.addItem({ type: 'file', uri: uriA.toString() });
+    await store.addItem({ type: 'file', uri: uriB.toString() });
+
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+    provider.setEnabled(false);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    provider.setEnabled(true);
+
+    assert.strictEqual(
+      fired.length,
+      1,
+      'expected exactly one invalidation event for the disabled -> enabled transition'
+    );
+    assert.notStrictEqual(fired[0], undefined, 'must fire a targeted uri/uri[] batch, not undefined');
+    const changedKeys = flattenUris(fired[0]).map((u) => decorationUriKey(u));
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uriA)),
+      'the batch must include every currently indexed uri, including uriA'
+    );
+    assert.ok(
+      changedKeys.includes(decorationUriKey(uriB)),
+      'the batch must include every currently indexed uri, including uriB'
+    );
+
+    const decoration = provider.provideFileDecoration(uriA, NO_CANCELLATION);
+    assert.ok(
+      decoration,
+      'the provider must actually be re-enabled after the transition, not merely have fired an event'
+    );
+  });
+
+  test('setEnabled(true) when already enabled (the default) is a no-op and does not fire onDidChangeFileDecorations', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    await store.addItem({ type: 'file', uri: vscode.Uri.file('/workspace/a.txt').toString() });
+
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    provider.setEnabled(true);
+
+    assert.strictEqual(
+      fired.length,
+      0,
+      'setEnabled(true) must be a no-op when the provider is already enabled'
+    );
+  });
+
+  test('setEnabled(false) when already disabled is a no-op and does not fire onDidChangeFileDecorations', async () => {
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput());
+    await store.addItem({ type: 'file', uri: vscode.Uri.file('/workspace/a.txt').toString() });
+
+    const provider = new BookmarkDecorationProvider(new Set());
+    provider.wire([store]);
+    provider.setEnabled(false);
+
+    const fired: (vscode.Uri | vscode.Uri[] | undefined)[] = [];
+    provider.onDidChangeFileDecorations((event) => fired.push(event));
+
+    provider.setEnabled(false);
+
+    assert.strictEqual(
+      fired.length,
+      0,
+      'setEnabled(false) must be a no-op when the provider is already disabled'
+    );
+  });
+});

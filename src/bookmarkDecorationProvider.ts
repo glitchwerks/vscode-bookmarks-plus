@@ -65,16 +65,34 @@ export class BookmarkDecorationProvider implements vscode.FileDecorationProvider
   /** Uri, keyed by `decorationUriKey`, for every currently-decorated item across wired stores. */
   private uriByKey = new Map<string, vscode.Uri>();
 
+  /** T3 (plan §6): whether decorations are currently shown. Defaults to enabled. */
+  private enabled = true;
+
   constructor(private decoratedUriKeys: Set<string>) {}
 
   provideFileDecoration(uri: vscode.Uri, _token: vscode.CancellationToken): vscode.FileDecoration | undefined {
-    if (!this.decoratedUriKeys.has(decorationUriKey(uri))) {
+    if (!this.enabled || !this.decoratedUriKeys.has(decorationUriKey(uri))) {
       return undefined;
     }
     return {
       badge: '★',
       tooltip: 'Bookmarked'
     };
+  }
+
+  /**
+   * T3 (plan §6): toggles whether decorations are shown, without touching the underlying
+   * decorated-key index. A no-op (no state change, no event) if `enabled` already matches the
+   * current state. Otherwise updates the state and fires `onDidChangeFileDecorations` exactly
+   * once with every currently-indexed uri (from `uriByKey`, populated by `wire()`/`resync()`),
+   * so the Explorer immediately reflects the toggle in either direction.
+   */
+  setEnabled(enabled: boolean): void {
+    if (enabled === this.enabled) {
+      return;
+    }
+    this.enabled = enabled;
+    this._onDidChangeFileDecorations.fire(Array.from(this.uriByKey.values()));
   }
 
   /**
