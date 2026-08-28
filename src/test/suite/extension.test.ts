@@ -7,7 +7,7 @@ import {
   registerBookmarkDecorationProvider,
   registerRecentItemsTracker
 } from '../../extension';
-import { loadRecentItems } from '../../recentItems';
+import { loadRecentItems, normalizeMaxItems } from '../../recentItems';
 import { FakeMemento, fakeTab, FakeMirror, FakeOutput } from './fixtures';
 
 suite('Extension activation', () => {
@@ -186,6 +186,23 @@ suite('Extension activation', () => {
       'bookmarksPlus.suggestions.maxItems must be declared with type: "number"'
     );
     assert.strictEqual(property.default, 10, 'bookmarksPlus.suggestions.maxItems must default to 10 (D3)');
+  });
+
+  test('contributes.configuration declares bookmarksPlus.suggestions.maxItems with minimum: 0 (CodeRabbit: reject negative config values at the schema)', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+
+    const properties: Record<string, { minimum?: unknown }> | undefined =
+      ext!.packageJSON.contributes?.configuration?.properties;
+    const property = properties?.['bookmarksPlus.suggestions.maxItems'];
+    assert.ok(property, 'expected package.json contributes.configuration.properties to declare bookmarksPlus.suggestions.maxItems');
+    assert.strictEqual(
+      property!.minimum,
+      0,
+      'bookmarksPlus.suggestions.maxItems must declare minimum: 0 — a negative value can evict every ' +
+        'promoted suggestion (see recentItems.test.ts, "recentItems - normalizeMaxItems")'
+    );
   });
 });
 
@@ -753,5 +770,31 @@ suite('registerRecentItemsTracker (#95 T4/T8)', () => {
 
     const list = loadRecentItems(memento);
     assert.strictEqual(list.length, 0, 'a diff tab must never be recorded (D1: skipped entirely in v1)');
+  });
+
+  // CodeRabbit finding (PR #103, package.json review): maxItems config normalization. This is the
+  // integration point showing the normalized cap actually reaches `recordOpen` through the full
+  // `registerRecentItemsTracker` pipeline — `deps.maxItems` is documented as the already-normalized
+  // value the config-read site in `activate()` is expected to compute via `normalizeMaxItems`
+  // before injecting it here (see recentItems.test.ts, "recentItems - normalizeMaxItems", for the
+  // pure-function unit tests and the direct recordOpen-composition tests).
+  test('a normalized (floored) maxItems value caps the tracked promoted list through the tracker, not just at the raw config value (CodeRabbit: maxItems config normalization)', () => {
+    const normalizedCap = normalizeMaxItems(3.7); // expected 3
+    const { tabGroups, deps } = createDeps(normalizedCap);
+    const memento = new FakeMemento();
+    registerRecentItemsTracker(memento, [], deps);
+
+    for (const name of ['a', 'b', 'c', 'd']) {
+      const uri = vscode.Uri.file(`/workspace/${name}.txt`);
+      tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    }
+
+    const promoted = loadRecentItems(memento).filter((i) => i.promoted);
+    assert.strictEqual(
+      promoted.length,
+      3,
+      'a fractional maxItems of 3.7, normalized to 3 before reaching the tracker, must cap the ' +
+        'tracked promoted list at 3 entries, not 4'
+    );
   });
 });

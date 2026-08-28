@@ -277,15 +277,15 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
     if (this.groupMode === 'byRepo') {
       const children = await this.getChildrenByRepo(node, data.items, data.collections);
-      return !node ? this.withRoots(children) : children;
+      return !node ? await this.withRoots(children) : children;
     }
     const children = this.getChildrenDefault(node, data.items, data.collections, 'workspace');
-    return !node ? this.withRoots(children) : children;
+    return !node ? await this.withRoots(children) : children;
   }
 
   /** Prepends the Global row and appends the Suggested row (D8) to a set of root-level children. */
-  private withRoots(children: BookmarkNode[]): BookmarkNode[] {
-    const suggestedLeaves = this.getSuggestedLeaves();
+  private async withRoots(children: BookmarkNode[]): Promise<BookmarkNode[]> {
+    const suggestedLeaves = await this.getSuggestedLeaves();
     return [
       ...(this.globalStore ? [{ kind: 'globalRoot' } as BookmarkNode] : []),
       ...children,
@@ -295,11 +295,15 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
   /**
    * The Suggested row's children (T5): promoted recent items not already bookmarked in either
-   * store (C7/D9), sorted most-recent-first-seen first and capped at `maxItems` (D3/D6). Returns
-   * `[]` — hiding the row entirely (D8) — when no `suggestions` source was supplied, or when
-   * `maxItems` is 0 (the setting's off-switch, D3).
+   * store (C7/D9), sorted most-recent-first-seen first, filtered for staleness (CodeRabbit: stale
+   * persisted suggestion URIs — D4's filter-at-render choice, reusing the same `FsGitCache`
+   * existence-check seam `getTreeItem` uses for the "missing" bookmark warning icon), and only
+   * then capped at `maxItems` (D3/D6) — staleness filtering must happen before the cap so a stale
+   * entry never crowds out a valid one. Returns `[]` — hiding the row entirely (D8) — when no
+   * `suggestions` source was supplied, when `maxItems` is 0 (the setting's off-switch, D3), or
+   * when every candidate turns out to be stale.
    */
-  private getSuggestedLeaves(): BookmarkNode[] {
+  private async getSuggestedLeaves(): Promise<BookmarkNode[]> {
     if (!this.suggestions || this.suggestions.maxItems <= 0) {
       return [];
     }
@@ -307,10 +311,20 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       ...this.store.getAll().items.map((i) => i.uri),
       ...(this.globalStore?.getAll().items.map((i) => i.uri) ?? [])
     ]);
-    return this.suggestions
+    const candidates = this.suggestions
       .getRecentItems()
       .filter((recentItem) => recentItem.promoted && !bookmarkedUris.has(recentItem.uri))
-      .sort((a, b) => b.firstSeen - a.firstSeen)
+      .sort((a, b) => b.firstSeen - a.firstSeen);
+
+    const existing: RecentItem[] = [];
+    for (const recentItem of candidates) {
+      const entry = await this.cache.get(recentItem.uri);
+      if (entry.exists) {
+        existing.push(recentItem);
+      }
+    }
+
+    return existing
       .slice(0, this.suggestions.maxItems)
       .map((recentItem): BookmarkNode => ({ kind: 'suggestion', recentItem }));
   }

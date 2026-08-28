@@ -25,7 +25,7 @@ import {
   GitApiFactory,
   GitExtensionExports
 } from './gitInfo';
-import { extractTabUri, loadRecentItems, recordOpen, saveRecentItems } from './recentItems';
+import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
 import { applyWorkspaceEnv } from './workspaceEnv';
 
 const WATCHER_DEBOUNCE_MS = 150;
@@ -203,9 +203,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const cache = new FsGitCache(createCacheResolver(getGitApi));
   // Read once at activation (D3) — reacting live to a mid-session change of this setting is not
   // required by the spec and is left out for simplicity; restarting the window picks it up.
-  const suggestionsMaxItems = vscode.workspace
-    .getConfiguration()
-    .get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT);
+  // Normalized once here (CodeRabbit: maxItems config normalization) so both consumers below
+  // (the tracker's `deps.maxItems` and the tree provider's `SuggestionsSource.maxItems`) receive
+  // an already-clamped-and-floored value rather than a raw, possibly negative/fractional setting.
+  const suggestionsMaxItems = normalizeMaxItems(
+    vscode.workspace.getConfiguration().get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT)
+  );
   provider = new BookmarksTreeDataProvider(store, cache, globalStore, undefined, {
     getRecentItems: () => loadRecentItems(context.workspaceState),
     maxItems: suggestionsMaxItems

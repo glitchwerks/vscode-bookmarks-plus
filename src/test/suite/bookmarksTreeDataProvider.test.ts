@@ -1084,6 +1084,102 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 });
 
+// --- CodeRabbit finding (PR #103, bookmarksTreeDataProvider.ts review): stale persisted
+// suggestion URIs -------------------------------------------------------------------------------
+//
+// `loadRecentItems` retains valid records after a file is deleted or renamed (D4, plan §4: the
+// persisted list intentionally "can point at deleted/renamed files" — that's what makes it survive
+// a window reload). Without an existence check at render time, a stale record still renders as a
+// clickable Suggested leaf whose `vscode.open` command fails silently against a path that no
+// longer exists.
+//
+// D4's staleness sub-decision was left open at implementation time (filter-at-render vs.
+// prune-on-read; "pick exactly one, do not do both" — plan §4 D4). This test-implementer picks
+// **filter-at-render via FsGitCache**, for reasons worth recording here since the plan explicitly
+// deferred the choice:
+//   - `FsGitCache` is already the existence-check seam this same file uses for bookmarked `item`
+//     nodes (`getTreeItem`'s `entry.exists` branch, driving the "missing" warning icon) — reusing
+//     it for suggestion nodes is the smallest, most consistent change, and the test fixture below
+//     (`makeProviderWithSuggestions`'s `options.resolve`) already exists for exactly this purpose.
+//   - `getChildren`/`getTreeItem` are already `async` and already `await this.cache.get(...)`
+//     elsewhere in this class, so filtering at render composes with the existing shape without a
+//     new synchronous/asynchronous seam.
+//   - Prune-on-read would require turning the currently-synchronous, pure `loadRecentItems(memento)`
+//     into an async, cache-dependent function that also re-persists on every read — a materially
+//     larger change for the same observable, user-visible result (a stale suggestion never
+//     appears), which the plan's D4 note treats as equivalent ("pick exactly one").
+//
+// These tests assert the observable outcome the CodeRabbit finding and the plan actually require:
+// a persisted suggestion whose FsGitCache existence check resolves `exists: false` must not appear
+// as a clickable Suggested leaf. They do not assert *how* the row/leaf list is assembled inside
+// `getSuggestedLeaves`/`withRoots` (e.g. sync vs. async, exact intermediate shape). They do,
+// however, pin filter-at-render specifically: `makeProviderWithSuggestions` injects
+// `getRecentItems: () => recentItems` directly, bypassing `loadRecentItems(memento)` entirely, so
+// a prune-on-read implementation (one that only prunes inside `loadRecentItems`) would leave these
+// three tests failing — the provider itself must consult `FsGitCache` when consuming
+// `getRecentItems()`'s result, which is the filter-at-render strategy chosen above.
+suite('BookmarksTreeDataProvider - suggested bookmarks staleness filtering (CodeRabbit: stale persisted suggestion URIs)', () => {
+  test('a persisted suggestion whose file no longer exists on disk is filtered out of the Suggested leaves', async () => {
+    const staleUri = 'file:///deleted.txt';
+    const validUri = 'file:///still-there.txt';
+    const { provider } = makeProviderWithSuggestions(
+      [recentItem({ uri: staleUri, firstSeen: 100 }), recentItem({ uri: validUri, firstSeen: 200 })],
+      10,
+      { resolve: async (uri) => ({ exists: uri !== staleUri }) }
+    );
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+
+    assert.strictEqual(leaves.length, 1, 'the stale (non-existent) suggestion must not render as a clickable node');
+    assert.strictEqual((leaves[0] as unknown as { recentItem: RecentItem }).recentItem.uri, validUri);
+  });
+
+  test('when every persisted suggestion is stale, the Suggested row does not appear at all (D8: hidden when empty)', async () => {
+    const staleUri = 'file:///deleted-only.txt';
+    const { provider } = makeProviderWithSuggestions([recentItem({ uri: staleUri })], 10, {
+      resolve: async () => ({ exists: false })
+    });
+
+    const children = await provider.getChildren();
+    assert.strictEqual(
+      findSuggestedRoot(children),
+      undefined,
+      'a Suggested row with zero surviving (existing) suggestions must not render at all, matching ' +
+        'the zero-promoted-items case'
+    );
+  });
+
+  test('a stale suggestion is excluded before maxItems eviction, so it does not crowd out a valid entry that would otherwise be capped', async () => {
+    const staleUri = 'file:///stale-cap.txt';
+    const validA = 'file:///valid-a.txt';
+    const validB = 'file:///valid-b.txt';
+    const { provider } = makeProviderWithSuggestions(
+      [
+        // Most recently first-seen, so a cap-then-filter (wrong order) would keep the stale entry
+        // and evict a valid one; filter-then-cap (required) must not.
+        recentItem({ uri: staleUri, firstSeen: 300 }),
+        recentItem({ uri: validA, firstSeen: 200 }),
+        recentItem({ uri: validB, firstSeen: 100 })
+      ],
+      2,
+      { resolve: async (uri) => ({ exists: uri !== staleUri }) }
+    );
+
+    const rootChildren = await provider.getChildren();
+    const suggestedRoot = findSuggestedRoot(rootChildren)!;
+    const leaves = await provider.getChildren(suggestedRoot);
+    const uris = leaves.map((n) => (n as unknown as { recentItem: RecentItem }).recentItem.uri).sort();
+
+    assert.deepStrictEqual(
+      uris,
+      [validA, validB].sort(),
+      'stale entries must be excluded before the maxItems cap is applied, not counted against it'
+    );
+  });
+});
+
 // --- #95 R4: regression guards for the widened BookmarkNode union at the four kind-switching
 // sites the plan names — handleDrag / handleDrop here; createRemoveHandler / createRevealHandler
 // in commands.test.ts. Each new-kind node is built with `as unknown as BookmarkNode` so this file

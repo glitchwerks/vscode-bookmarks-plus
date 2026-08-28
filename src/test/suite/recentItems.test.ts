@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import {
   extractTabUri,
   loadRecentItems,
+  normalizeMaxItems,
   PREVIEW_PROMOTION_THRESHOLD,
   RECENT_STORAGE_KEY,
   RecentItem,
@@ -86,6 +87,22 @@ suite('recentItems - recordOpen (T1/T2)', () => {
     assert.strictEqual(promotedEntry!.promoted, true);
     assert.ok(previewEntry, 'a sub-threshold preview entry must still be recorded even at the promoted cap');
     assert.strictEqual(previewEntry!.promoted, false);
+  });
+
+  test('a raw fractional cap must not retain more promoted entries than its floor (CodeRabbit: maxItems config normalization — recordOpen/enforceCap must floor its own cap defensively, not assume every caller has already normalized it)', () => {
+    let list: RecentItem[] = [];
+    list = recordOpen(list, { uri: 'file:///a.txt', isPreview: false }, 3.7, 100);
+    list = recordOpen(list, { uri: 'file:///b.txt', isPreview: false }, 3.7, 200);
+    list = recordOpen(list, { uri: 'file:///c.txt', isPreview: false }, 3.7, 300);
+    list = recordOpen(list, { uri: 'file:///d.txt', isPreview: false }, 3.7, 400);
+
+    assert.strictEqual(
+      list.filter((i) => i.promoted).length,
+      3,
+      'a raw fractional cap of 3.7 must retain at most 3 promoted entries — passing 3.7 straight ' +
+        "into enforceCap's overflow arithmetic (4 - 3.7 = 0.3) lets Array#slice's end-index " +
+        'truncation (slice(0, 0.3) evicts nothing) retain all 4, one more than the cap allows'
+    );
   });
 });
 
@@ -265,5 +282,97 @@ suite('recentItems - extractTabUri (T3 tab adapter)', () => {
     // Duck-typing must not be enough — C2 requires runtime instanceof narrowing against the real
     // vscode.TabInput* classes, since Tab.input bottoms out in `unknown` with no discriminator.
     assert.strictEqual(extractTabUri({ uri: vscode.Uri.file('/workspace/a.txt') }), undefined);
+  });
+});
+
+// --- CodeRabbit finding (PR #103, package.json review): maxItems config normalization ----------
+//
+// `extension.ts` reads `bookmarksPlus.suggestions.maxItems` straight from
+// `vscode.workspace.getConfiguration()` and passes it directly to `recordOpen` (via
+// `registerRecentItemsTracker`'s `deps.maxItems`) and to the tree provider's `SuggestionsSource`.
+// Because the setting is user-editable JSON, it can be negative or fractional:
+//   - A negative cap makes `enforceCap`'s `overflow = promotedByAge.length - cap` computation
+//     always positive and larger than the list, so `slice(0, overflow)` evicts every promoted
+//     entry — not what "invalid input" should mean.
+//   - A fractional cap (e.g. 3.7) makes `overflow` fractional too (e.g. `4 - 3.7 = 0.3`), and
+//     `Array.prototype.slice`'s end index truncates via `ToIntegerOrInfinity` (floors positive
+//     values), so `slice(0, 0.3)` evicts *zero* entries where an integer cap of 3 should have
+//     evicted one — retaining more promoted entries than the configured cap.
+//
+// `normalizeMaxItems` is the fix: a small pure helper, exported alongside `recordOpen` since it
+// exists to produce the value `recordOpen`'s `cap` parameter already assumes it receives (see the
+// `@param cap` docstring on `recordOpen` above). `src/extension.ts`'s config-read site is expected
+// to call it once and pass the result to both `registerRecentItemsTracker`'s `deps.maxItems` and
+// the tree provider's `SuggestionsSource.maxItems`.
+//
+// Floor-value choice (documented per the test-implementer briefing): negative input clamps to 0,
+// not to some other floor. 0 is not an arbitrary choice — D3 (plan §4) already defines `maxItems:
+// 0` as the section's off-switch ("0 disables the section entirely"), so clamping a negative,
+// nonsensical cap to 0 reuses an existing, already-tested semantic instead of inventing a new one.
+//
+// Signature assumption: `normalizeMaxItems(value: number): number`. Non-number shapes (NaN, a
+// string, `undefined`) are deliberately out of scope here — `package.json` already declares
+// `bookmarksPlus.suggestions.maxItems` with `type: "number"` (see the extension.test.ts manifest
+// test), so VS Code's settings UI/schema is the primary defense against a non-numeric value; this
+// helper's contract is scoped to "a number that may be negative or fractional," matching the
+// CodeRabbit finding's own wording ("a negative value" / "a fractional value").
+suite('recentItems - normalizeMaxItems (CodeRabbit: maxItems config normalization)', () => {
+  test("a negative value clamps to 0 (D3's existing \"disabled\" floor, not a new floor value)", () => {
+    assert.strictEqual(normalizeMaxItems(-1), 0);
+  });
+
+  test('a large negative value also clamps to 0', () => {
+    assert.strictEqual(normalizeMaxItems(-100), 0);
+  });
+
+  test('a negative fractional value clamps to 0, not to a floored negative like -1', () => {
+    assert.strictEqual(normalizeMaxItems(-0.5), 0);
+  });
+
+  test('a fractional value is floored to an integer', () => {
+    assert.strictEqual(normalizeMaxItems(3.7), 3);
+  });
+
+  test('a fractional value just below an integer boundary floors down, not up', () => {
+    assert.strictEqual(normalizeMaxItems(2.999), 2);
+  });
+
+  test('zero is already normalized and is returned unchanged', () => {
+    assert.strictEqual(normalizeMaxItems(0), 0);
+  });
+
+  test('a valid positive integer passes through unchanged', () => {
+    assert.strictEqual(normalizeMaxItems(10), 10);
+  });
+
+  test('composed with recordOpen: a negative configured cap, once normalized, evicts every promoted entry — the D3 off-switch semantics — rather than the raw-negative slice bug', () => {
+    let list: RecentItem[] = [];
+    list = recordOpen(list, { uri: 'file:///a.txt', isPreview: false }, 10, 100);
+    list = recordOpen(list, { uri: 'file:///b.txt', isPreview: false }, 10, 200);
+
+    const normalizedCap = normalizeMaxItems(-5);
+    list = recordOpen(list, { uri: 'file:///c.txt', isPreview: false }, normalizedCap, 300);
+
+    assert.deepStrictEqual(
+      list.filter((i) => i.promoted),
+      [],
+      'a negative maxItems, normalized to 0, must evict every promoted entry (matching the existing cap-0 behavior)'
+    );
+  });
+
+  test('composed with recordOpen: a fractional configured cap, once normalized, retains exactly the floored integer count', () => {
+    const normalizedCap = normalizeMaxItems(3.7); // expected 3
+
+    let list: RecentItem[] = [];
+    list = recordOpen(list, { uri: 'file:///a.txt', isPreview: false }, normalizedCap, 100);
+    list = recordOpen(list, { uri: 'file:///b.txt', isPreview: false }, normalizedCap, 200);
+    list = recordOpen(list, { uri: 'file:///c.txt', isPreview: false }, normalizedCap, 300);
+    list = recordOpen(list, { uri: 'file:///d.txt', isPreview: false }, normalizedCap, 400);
+
+    assert.strictEqual(
+      list.filter((i) => i.promoted).length,
+      3,
+      'a maxItems of 3.7, normalized to 3, must retain at most 3 promoted entries, not 4'
+    );
   });
 });

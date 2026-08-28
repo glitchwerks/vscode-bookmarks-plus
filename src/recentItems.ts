@@ -57,12 +57,32 @@ function isValidRecentItem(value: unknown): value is RecentItem {
  */
 function enforceCap(list: RecentItem[], cap: number): RecentItem[] {
   const promotedByAge = list.filter((i) => i.promoted).sort((a, b) => a.firstSeen - b.firstSeen);
-  const overflow = promotedByAge.length - cap;
+  // Floor defensively (CodeRabbit: maxItems config normalization) — a raw fractional cap (e.g.
+  // 3.7) would otherwise make `overflow` fractional too, and Array#slice's end-index truncation
+  // (ToIntegerOrInfinity floors positive values) would evict fewer entries than the cap allows.
+  // Callers are expected to pass an already-normalized cap (see `normalizeMaxItems`), but
+  // `enforceCap` does not assume that — it floors again here so it is correct on its own.
+  const flooredCap = Math.floor(cap);
+  const overflow = promotedByAge.length - flooredCap;
   if (overflow <= 0) {
     return list;
   }
   const evictUris = new Set(promotedByAge.slice(0, overflow).map((i) => i.uri));
   return list.filter((i) => !evictUris.has(i.uri));
+}
+
+/**
+ * Normalizes a raw `bookmarksPlus.suggestions.maxItems` config value before it reaches
+ * `recordOpen`'s `cap` parameter or `SuggestionsSource.maxItems` (CodeRabbit: maxItems config
+ * normalization). The setting is user-editable JSON, so it can be negative or fractional:
+ *
+ * - A negative value clamps to 0, reusing the existing "0 disables the section" semantics (D3)
+ *   rather than inventing a new floor.
+ * - A fractional value is floored to an integer.
+ * - 0 and valid positive integers pass through unchanged.
+ */
+export function normalizeMaxItems(value: number): number {
+  return Math.max(0, Math.floor(value));
 }
 
 /**

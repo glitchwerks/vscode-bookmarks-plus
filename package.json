@@ -98,6 +98,7 @@
         "bookmarksPlus.suggestions.maxItems": {
           "type": "number",
           "default": 10,
+          "minimum": 0,
           "scope": "window",
           "description": "Maximum number of suggested bookmarks (recently opened items) to show in the Suggested section. Set to 0 to disable the section entirely."
         }
