@@ -7,6 +7,11 @@ import {
   registerBookmarkDecorationProvider,
   registerRecentItemsTracker
 } from '../../extension';
+// Namespace import (not a named import) so `registerSuggestionsMaxItemsLiveReload` (#102, not yet
+// implemented) can be resolved dynamically below without a compile-time failure on the missing
+// export — a compile error is not a valid "red" for this suite; the assertion inside
+// `requireRegisterFn()` is the intended failure mode until T-#102 adds the export.
+import * as extensionModule from '../../extension';
 import { loadRecentItems, normalizeMaxItems } from '../../recentItems';
 import { FakeMemento, fakeTab, FakeMirror, FakeOutput } from './fixtures';
 
@@ -795,6 +800,378 @@ suite('registerRecentItemsTracker (#95 T4/T8)', () => {
       3,
       'a fractional maxItems of 3.7, normalized to 3 before reaching the tracker, must cap the ' +
         'tracked promoted list at 3 entries, not 4'
+    );
+  });
+});
+
+// --- #102: live-reload of bookmarksPlus.suggestions.maxItems -------------------------------
+//
+// Today (pre-#102) `activate()` reads bookmarksPlus.suggestions.maxItems exactly once, at
+// activation time, and hands the normalized value to two consumers: `registerRecentItemsTracker`'s
+// `deps.maxItems` (read live inside its tab-change listener — extension.ts, not hoisted to a local)
+// and the `BookmarksTreeDataProvider`'s `SuggestionsSource.maxItems` (read live inside
+// `getSuggestedLeaves`/`withRoots`, not captured). Because both consumers already re-read their
+// backing value on every use rather than snapshotting it once, neither `recentItems.ts` nor
+// `bookmarksTreeDataProvider.ts` needs to change for the cap to become live-reloadable — only
+// `extension.ts` needs a new `workspace.onDidChangeConfiguration` listener that re-reads,
+// re-normalizes, and pushes the fresh cap into both consumers, then forces a tree refresh (VS Code
+// does not re-query `getChildren` just because a backing value changed out from under it).
+//
+// Test-author design choice (this function does not exist yet — T-#102 must add it): a third DI
+// helper, `registerSuggestionsMaxItemsLiveReload(subscriptions, deps)`, mirroring the two existing
+// precedents immediately above (`registerBookmarkDecorationProvider`, `registerRecentItemsTracker`)
+// rather than adding untestable inline logic to `activate()` itself. `deps` exposes:
+//   - `getConfiguration()` / `onDidChangeConfiguration(listener)` — the same
+//     `vscode.workspace`-shaped seams `registerBookmarkDecorationProvider` already uses.
+//   - `setTrackerMaxItems(maxItems)` / `setSuggestionsMaxItems(maxItems)` — callbacks the
+//     implementation invokes with the freshly re-read, re-normalized cap. Deliberately callbacks,
+//     not "hand back a mutable object and mutate its .maxItems field" — that would bake one
+//     particular propagation mechanism into a frozen test contract instead of asserting the
+//     observable result. In the real `activate()` wiring these callbacks are expected to close over
+//     the same `deps.maxItems` object already passed to `registerRecentItemsTracker` and the same
+//     `SuggestionsSource` object already passed to `BookmarksTreeDataProvider`, but that wiring
+//     detail is `activate()`'s to choose, not this suite's to assert.
+//   - `refresh()` — called to force the tree to re-render (e.g. `provider?.refresh()`).
+// The helper subscribes exactly one `onDidChangeConfiguration` listener, pushed onto
+// `subscriptions` per the established disposal convention, whose body is a no-op unless
+// `event.affectsConfiguration('bookmarksPlus.suggestions.maxItems')` is true.
+//
+// Coverage gap (report, not to solve here): every test below exercises the helper directly, not
+// `activate()` itself. `activate()` returns `void` and exposes no DI seam of its own, so whether
+// `activate()` actually calls this helper is unverifiable at this granularity — same limitation
+// already accepted for `registerBookmarkDecorationProvider`/`registerRecentItemsTracker` above,
+// neither of which has an `activate()`-level wiring test either.
+suite('registerSuggestionsMaxItemsLiveReload (#102)', () => {
+  const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
+  const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
+
+  class FakeDisposable implements vscode.Disposable {
+    disposeCallCount = 0;
+    dispose(): void {
+      this.disposeCallCount++;
+    }
+  }
+
+  /** Fake of the `vscode.WorkspaceConfiguration` subset the helper reads from — copied from the
+   * `registerBookmarkDecorationProvider` suite above rather than shared, matching this file's
+   * existing convention of duplicating these small per-suite fakes instead of lifting them to
+   * fixtures.ts. */
+  class FakeConfiguration {
+    calls: { section: string; defaultValue: unknown }[] = [];
+    constructor(private readonly values: Record<string, unknown> = {}) {}
+
+    get<T>(section: string, defaultValue: T): T {
+      this.calls.push({ section, defaultValue });
+      return Object.prototype.hasOwnProperty.call(this.values, section)
+        ? (this.values[section] as T)
+        : defaultValue;
+    }
+
+    set(section: string, value: unknown): void {
+      this.values[section] = value;
+    }
+  }
+
+  class FakeConfigurationChangeEvent implements vscode.ConfigurationChangeEvent {
+    affectsConfigurationCalls: string[] = [];
+    constructor(private readonly response: boolean) {}
+
+    affectsConfiguration(section: string): boolean {
+      this.affectsConfigurationCalls.push(section);
+      return this.response;
+    }
+  }
+
+  class FakeConfigurationChangeRegistration {
+    listeners: ((event: vscode.ConfigurationChangeEvent) => void)[] = [];
+    disposables: FakeDisposable[] = [];
+
+    onDidChangeConfiguration = (
+      listener: (event: vscode.ConfigurationChangeEvent) => void
+    ): vscode.Disposable => {
+      this.listeners.push(listener);
+      const disposable = new FakeDisposable();
+      this.disposables.push(disposable);
+      return disposable;
+    };
+
+    fire(event: vscode.ConfigurationChangeEvent): void {
+      for (const listener of this.listeners) {
+        listener(event);
+      }
+    }
+  }
+
+  interface MaxItemsLiveReloadDeps {
+    getConfiguration: () => { get<T>(section: string, defaultValue: T): T };
+    onDidChangeConfiguration: (
+      listener: (event: vscode.ConfigurationChangeEvent) => void
+    ) => vscode.Disposable;
+    setTrackerMaxItems: (maxItems: number) => void;
+    setSuggestionsMaxItems: (maxItems: number) => void;
+    refresh: () => void;
+  }
+
+  type MaxItemsLiveReloadFn = (subscriptions: vscode.Disposable[], deps: MaxItemsLiveReloadDeps) => void;
+
+  interface MaxItemsLiveReloadModule {
+    registerSuggestionsMaxItemsLiveReload?: MaxItemsLiveReloadFn;
+  }
+
+  /** Resolves `registerSuggestionsMaxItemsLiveReload` off the module namespace without a
+   * compile-time named import (see the import comment at the top of this file), then asserts it
+   * exists. Until #102 is implemented this assertion is the intended failure for every test in
+   * this suite — a clean, message-bearing "missing behavior" red rather than a tsc error. */
+  function requireRegisterFn(): MaxItemsLiveReloadFn {
+    const fn = (extensionModule as MaxItemsLiveReloadModule).registerSuggestionsMaxItemsLiveReload;
+    assert.ok(
+      typeof fn === 'function',
+      'expected extension.ts to export registerSuggestionsMaxItemsLiveReload(subscriptions, deps) ' +
+        '(#102) — the live-reload wiring for bookmarksPlus.suggestions.maxItems does not exist yet'
+    );
+    return fn as MaxItemsLiveReloadFn;
+  }
+
+  function createDeps(configValues: Record<string, unknown> = {}): {
+    configuration: FakeConfiguration;
+    configChangeRegistration: FakeConfigurationChangeRegistration;
+    trackerCalls: number[];
+    suggestionsCalls: number[];
+    refreshCallCount: () => number;
+    deps: MaxItemsLiveReloadDeps;
+  } {
+    const configuration = new FakeConfiguration(configValues);
+    const configChangeRegistration = new FakeConfigurationChangeRegistration();
+    const trackerCalls: number[] = [];
+    const suggestionsCalls: number[] = [];
+    let refreshCount = 0;
+    return {
+      configuration,
+      configChangeRegistration,
+      trackerCalls,
+      suggestionsCalls,
+      refreshCallCount: () => refreshCount,
+      deps: {
+        getConfiguration: () => configuration,
+        onDidChangeConfiguration: configChangeRegistration.onDidChangeConfiguration,
+        setTrackerMaxItems: (maxItems: number) => {
+          trackerCalls.push(maxItems);
+        },
+        setSuggestionsMaxItems: (maxItems: number) => {
+          suggestionsCalls.push(maxItems);
+        },
+        refresh: () => {
+          refreshCount++;
+        }
+      }
+    };
+  }
+
+  test('registers exactly one onDidChangeConfiguration listener', () => {
+    const fn = requireRegisterFn();
+    const { deps, configChangeRegistration } = createDeps();
+
+    fn([], deps);
+
+    assert.strictEqual(
+      configChangeRegistration.listeners.length,
+      1,
+      'expected exactly one onDidChangeConfiguration listener to be registered'
+    );
+  });
+
+  test('pushes the configuration-change listener disposable onto subscriptions, disposed exactly once on teardown', () => {
+    const fn = requireRegisterFn();
+    const { deps, configChangeRegistration } = createDeps();
+    const subscriptions: vscode.Disposable[] = [];
+
+    fn(subscriptions, deps);
+    for (const subscription of subscriptions) {
+      subscription.dispose();
+    }
+
+    assert.strictEqual(configChangeRegistration.disposables.length, 1);
+    assert.strictEqual(
+      configChangeRegistration.disposables[0].disposeCallCount,
+      1,
+      'disposing everything pushed onto subscriptions must dispose the configuration-listener disposable exactly once'
+    );
+  });
+
+  test('ignores a configuration-change event whose affectsConfiguration returns false for the watched key: no cap propagation, no refresh', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls, refreshCallCount } =
+      createDeps();
+    fn([], deps);
+
+    // The setting value on disk changed, but this particular event does not report it as
+    // affected — e.g. it fired for an unrelated configuration key.
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 5);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(false));
+
+    assert.strictEqual(
+      trackerCalls.length,
+      0,
+      'setTrackerMaxItems must not be called when affectsConfiguration returns false for the watched key'
+    );
+    assert.strictEqual(
+      suggestionsCalls.length,
+      0,
+      'setSuggestionsMaxItems must not be called when affectsConfiguration returns false for the watched key'
+    );
+    assert.strictEqual(
+      refreshCallCount(),
+      0,
+      'refresh must not be called when affectsConfiguration returns false for the watched key'
+    );
+  });
+
+  test('calls affectsConfiguration with bookmarksPlus.suggestions.maxItems', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration } = createDeps();
+    fn([], deps);
+
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 4);
+    const event = new FakeConfigurationChangeEvent(true);
+    configChangeRegistration.fire(event);
+
+    assert.ok(
+      event.affectsConfigurationCalls.includes(SUGGESTIONS_MAX_ITEMS_KEY),
+      'expected the listener to call affectsConfiguration with bookmarksPlus.suggestions.maxItems'
+    );
+  });
+
+  test('propagates the freshly read cap to both the tracker and the suggestions source when the change affects the watched key', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls } = createDeps();
+    fn([], deps);
+
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 4);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    assert.deepStrictEqual(
+      trackerCalls,
+      [4],
+      'expected setTrackerMaxItems to be called once with the freshly configured value'
+    );
+    assert.deepStrictEqual(
+      suggestionsCalls,
+      [4],
+      'expected setSuggestionsMaxItems to be called once with the freshly configured value'
+    );
+  });
+
+  test('re-reads the configuration at change time rather than a stale value captured at registration', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls } = createDeps({
+      [SUGGESTIONS_MAX_ITEMS_KEY]: 10
+    });
+    fn([], deps);
+
+    // Changed after registration, before the change event fires — the listener must not have
+    // captured/closed over the value that was present when `fn` was called.
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 2);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    assert.deepStrictEqual(
+      trackerCalls,
+      [2],
+      'expected the listener to re-read the config value at change time (2), not the value present at registration time (10)'
+    );
+    assert.deepStrictEqual(
+      suggestionsCalls,
+      [2],
+      'expected the listener to re-read the config value at change time (2), not the value present at registration time (10)'
+    );
+  });
+
+  test('re-reads bookmarksPlus.suggestions.maxItems using a fallback default of 10 when calling get()', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration } = createDeps();
+    fn([], deps);
+
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    const readCall = configuration.calls.find((call) => call.section === SUGGESTIONS_MAX_ITEMS_KEY);
+    assert.ok(readCall, 'expected the change listener to re-read bookmarksPlus.suggestions.maxItems');
+    assert.strictEqual(
+      readCall!.defaultValue,
+      SUGGESTIONS_MAX_ITEMS_DEFAULT,
+      'the fallback default passed to get() must be 10, matching SUGGESTIONS_MAX_ITEMS_DEFAULT'
+    );
+  });
+
+  test('normalizes a negative raw config value (-5) to 0 before propagating, matching normalizeMaxItems', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls } = createDeps();
+    fn([], deps);
+
+    assert.strictEqual(normalizeMaxItems(-5), 0, 'sanity check on normalizeMaxItems itself');
+
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, -5);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    assert.deepStrictEqual(trackerCalls, [0], 'a negative raw value must be clamped to 0 before reaching the tracker');
+    assert.deepStrictEqual(
+      suggestionsCalls,
+      [0],
+      'a negative raw value must be clamped to 0 before reaching the suggestions source'
+    );
+  });
+
+  test('normalizes a fractional raw config value (2.7) to 2 before propagating, matching normalizeMaxItems', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls } = createDeps();
+    fn([], deps);
+
+    assert.strictEqual(normalizeMaxItems(2.7), 2, 'sanity check on normalizeMaxItems itself');
+
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 2.7);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    assert.deepStrictEqual(trackerCalls, [2], 'a fractional raw value must be floored to 2 before reaching the tracker');
+    assert.deepStrictEqual(
+      suggestionsCalls,
+      [2],
+      'a fractional raw value must be floored to 2 before reaching the suggestions source'
+    );
+  });
+
+  test('triggers exactly one tree refresh after a scoped, valid change', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, refreshCallCount } = createDeps();
+    fn([], deps);
+
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 6);
+    configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+
+    assert.strictEqual(refreshCallCount(), 1, 'expected exactly one tree refresh after a scoped maxItems change');
+  });
+
+  test('re-saving the same maxItems value re-applies safely without throwing (regression)', () => {
+    const fn = requireRegisterFn();
+    const { deps, configuration, configChangeRegistration, trackerCalls, suggestionsCalls } = createDeps({
+      [SUGGESTIONS_MAX_ITEMS_KEY]: 5
+    });
+    fn([], deps);
+
+    // Re-saving the exact same value: VS Code still fires a configuration-change event for this,
+    // and affectsConfiguration still reports it as affected — the listener must not throw or skip
+    // re-propagating just because the value is unchanged from what was last applied.
+    configuration.set(SUGGESTIONS_MAX_ITEMS_KEY, 5);
+    assert.doesNotThrow(() => {
+      configChangeRegistration.fire(new FakeConfigurationChangeEvent(true));
+    });
+
+    assert.deepStrictEqual(
+      trackerCalls,
+      [5],
+      'an unchanged value must still be safely re-applied to the tracker'
+    );
+    assert.deepStrictEqual(
+      suggestionsCalls,
+      [5],
+      'an unchanged value must still be safely re-applied to the suggestions source'
     );
   });
 });
