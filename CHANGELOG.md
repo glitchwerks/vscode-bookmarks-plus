@@ -4,6 +4,8 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-08-29
+
 ### Added
 
 - Explorer decoration for bookmarked files and folders (#96): a `★` badge and "Bookmarked"
@@ -15,7 +17,7 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   promote a suggestion into a real bookmark. Repeated preview-tab opens of the same file promote
   it into a suggestion after the third preview; a real (non-preview) open promotes it immediately.
   Controlled by the new `bookmarksPlus.suggestions.maxItems` setting (default `10`; `0` disables
-  the section).
+  the section). The setting live-reloads on change, with no reload required (#102).
 
 ## [1.1.0] — 2026-08-24
 
