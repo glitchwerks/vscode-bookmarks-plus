@@ -7,7 +7,7 @@ import {
   WorkspaceMirrorFile,
   resolveMirrorLocation
 } from './bookmarkMirror';
-import { BookmarksTreeDataProvider } from './bookmarksTreeDataProvider';
+import { BookmarksTreeDataProvider, SuggestionsSource } from './bookmarksTreeDataProvider';
 import {
   registerAddCommands,
   registerAddToWorkspaceCommand,
@@ -175,6 +175,51 @@ export function registerRecentItemsTracker(
   subscriptions.push(subscription);
 }
 
+/**
+ * Live-reloads `bookmarksPlus.suggestions.maxItems` (#102): mirrors
+ * `registerBookmarkDecorationProvider` above by subscribing a single scoped
+ * `onDidChangeConfiguration` listener, injected via `deps` so this can be exercised without
+ * monkey-patching the read-only `vscode` module.
+ *
+ * Pre-#102, `activate()` only reads this setting once, at activation time, and hands the
+ * normalized value to the recent-items tracker and the tree provider's `SuggestionsSource`. Both
+ * of those consumers already re-read their backing value live on every use rather than
+ * snapshotting it once (see the tracker's `deps.maxItems` and `SuggestionsSource.maxItems`
+ * accesses), so this listener only needs to re-read and re-normalize the setting and push the
+ * fresh value into both consumers via callbacks, then force a tree refresh — VS Code does not
+ * re-query `getChildren` just because a backing value changed out from under it.
+ *
+ * The configuration-change listener disposable is pushed onto `subscriptions`, matching the
+ * `context.subscriptions` disposal pattern used throughout `activate()`.
+ */
+export function registerSuggestionsMaxItemsLiveReload(
+  subscriptions: vscode.Disposable[],
+  deps: {
+    getConfiguration: () => { get<T>(section: string, defaultValue: T): T };
+    onDidChangeConfiguration: (
+      listener: (event: vscode.ConfigurationChangeEvent) => void
+    ) => vscode.Disposable;
+    setTrackerMaxItems: (maxItems: number) => void;
+    setSuggestionsMaxItems: (maxItems: number) => void;
+    refresh: () => void;
+  }
+): void {
+  const configChangeSubscription = deps.onDidChangeConfiguration((event) => {
+    if (!event.affectsConfiguration(SUGGESTIONS_MAX_ITEMS_KEY)) {
+      return;
+    }
+
+    const maxItems = normalizeMaxItems(
+      deps.getConfiguration().get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT)
+    );
+    deps.setTrackerMaxItems(maxItems);
+    deps.setSuggestionsMaxItems(maxItems);
+    deps.refresh();
+  });
+
+  subscriptions.push(configChangeSubscription);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Bookmarks Plus');
   const location = resolveMirrorLocation(vscode.workspace.workspaceFolders);
@@ -201,18 +246,21 @@ export function activate(context: vscode.ExtensionContext): void {
     () => provider?.refresh()
   );
   const cache = new FsGitCache(createCacheResolver(getGitApi));
-  // Read once at activation (D3) — reacting live to a mid-session change of this setting is not
-  // required by the spec and is left out for simplicity; restarting the window picks it up.
-  // Normalized once here (CodeRabbit: maxItems config normalization) so both consumers below
-  // (the tracker's `deps.maxItems` and the tree provider's `SuggestionsSource.maxItems`) receive
-  // an already-clamped-and-floored value rather than a raw, possibly negative/fractional setting.
+  // Read once at activation, normalized (CodeRabbit: maxItems config normalization) so both
+  // consumers below receive an already-clamped-and-floored value rather than a raw, possibly
+  // negative/fractional setting. Held as a mutable field on each consumer's own DI object
+  // (`suggestionsSource`/`recentItemsTrackerDeps`, both already re-read live on every use — see
+  // `SuggestionsSource.maxItems` and `registerRecentItemsTracker`'s `deps.maxItems`) rather than a
+  // captured local, so `registerSuggestionsMaxItemsLiveReload` (#102) can push a freshly configured
+  // value into both without either consumer needing its own live-reload logic.
   const suggestionsMaxItems = normalizeMaxItems(
     vscode.workspace.getConfiguration().get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT)
   );
-  provider = new BookmarksTreeDataProvider(store, cache, globalStore, undefined, {
+  const suggestionsSource: SuggestionsSource = {
     getRecentItems: () => loadRecentItems(context.workspaceState),
     maxItems: suggestionsMaxItems
-  });
+  };
+  provider = new BookmarksTreeDataProvider(store, cache, globalStore, undefined, suggestionsSource);
 
   const treeView = vscode.window.createTreeView('bookmarksView', {
     treeDataProvider: provider,
@@ -233,10 +281,23 @@ export function activate(context: vscode.ExtensionContext): void {
     onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
   });
 
-  registerRecentItemsTracker(context.workspaceState, context.subscriptions, {
+  const recentItemsTrackerDeps = {
     getTabGroups: () => vscode.window.tabGroups,
     maxItems: suggestionsMaxItems,
     onDidChange: () => provider?.refresh()
+  };
+  registerRecentItemsTracker(context.workspaceState, context.subscriptions, recentItemsTrackerDeps);
+
+  registerSuggestionsMaxItemsLiveReload(context.subscriptions, {
+    getConfiguration: () => vscode.workspace.getConfiguration(),
+    onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener),
+    setTrackerMaxItems: (maxItems) => {
+      recentItemsTrackerDeps.maxItems = maxItems;
+    },
+    setSuggestionsMaxItems: (maxItems) => {
+      suggestionsSource.maxItems = maxItems;
+    },
+    refresh: () => provider?.refresh()
   });
 
   registerAddCommands(context, stores);
