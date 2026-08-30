@@ -1,6 +1,7 @@
 .vscode/**
 .vscode-test/**
 .claude/**
+.worktrees/**
 .github/**
 .superpowers/**
 mcp-server/**
