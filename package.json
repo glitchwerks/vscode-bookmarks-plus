@@ -47,7 +47,8 @@
       { "command": "bookmarks.addToWorkspace", "title": "Add to Workspace", "category": "Bookmarks Plus", "icon": "$(root-folder)" },
       { "command": "bookmarks.toggleGroupByRepo", "title": "Toggle Group by Repo", "category": "Bookmarks Plus", "icon": "$(repo)" },
       { "command": "bookmarks.refresh", "title": "Refresh", "category": "Bookmarks Plus", "icon": "$(refresh)" },
-      { "command": "bookmarks.promoteSuggestion", "title": "Add Bookmark from Suggestion", "category": "Bookmarks Plus", "icon": "$(add)" }
+      { "command": "bookmarks.promoteSuggestion", "title": "Add Bookmark from Suggestion", "category": "Bookmarks Plus", "icon": "$(add)" },
+      { "command": "bookmarks.promoteRecentItem", "title": "Add Bookmark from Recent", "category": "Bookmarks Plus", "icon": "$(add)" }
     ],
     "menus": {
       "explorer/context": [
@@ -55,6 +56,14 @@
         { "command": "bookmarks.addFolder", "when": "explorerResourceIsFolder", "group": "bookmarksPlus" },
         { "command": "bookmarks.addFileGlobal", "when": "!explorerResourceIsFolder", "group": "bookmarksPlus" },
         { "command": "bookmarks.addFolderGlobal", "when": "explorerResourceIsFolder", "group": "bookmarksPlus" }
+      ],
+      "editor/context": [
+        { "command": "bookmarks.addFile", "when": "resourceScheme == file", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file", "group": "bookmarksPlus" }
+      ],
+      "editor/title/context": [
+        { "command": "bookmarks.addFile", "when": "resourceScheme == file", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file", "group": "bookmarksPlus" }
       ],
       "view/title": [
         { "command": "bookmarks.newCollection", "when": "view == bookmarksView", "group": "navigation@1" },
@@ -71,7 +80,8 @@
         { "command": "bookmarks.setDescription", "when": "view == bookmarksView && viewItem == bookmarkCollection", "group": "bookmarks@1" },
         { "command": "bookmarks.addToWorkspace", "when": "view == bookmarksView && viewItem == bookmarkItem-addable", "group": "inline@4" },
         { "command": "bookmarks.newGlobalCollection", "when": "view == bookmarksView && viewItem == bookmarkGlobalRoot", "group": "inline@1" },
-        { "command": "bookmarks.promoteSuggestion", "when": "view == bookmarksView && viewItem == bookmarkSuggestion", "group": "inline@1" }
+        { "command": "bookmarks.promoteSuggestion", "when": "view == bookmarksView && viewItem == bookmarkSuggestion", "group": "inline@1" },
+        { "command": "bookmarks.promoteRecentItem", "when": "view == bookmarksView && viewItem == bookmarkRecentItem", "group": "inline@1" }
       ],
       "commandPalette": [
         { "command": "bookmarks.addFile", "when": "false" },
@@ -80,7 +90,8 @@
         { "command": "bookmarks.addFolderGlobal", "when": "false" },
         { "command": "bookmarks.addToWorkspace", "when": "false" },
         { "command": "bookmarks.newGlobalCollection", "when": "false" },
-        { "command": "bookmarks.promoteSuggestion", "when": "false" }
+        { "command": "bookmarks.promoteSuggestion", "when": "false" },
+        { "command": "bookmarks.promoteRecentItem", "when": "false" }
       ]
     },
     "jsonValidation": [

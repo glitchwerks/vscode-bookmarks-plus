@@ -14,7 +14,9 @@ export type BookmarkNode =
   | { kind: 'item'; item: BookmarkItem; scope: BookmarkScope }
   | { kind: 'repoGroup'; label: string; repoKey: string }
   | { kind: 'suggestedRoot' }
-  | { kind: 'suggestion'; recentItem: RecentItem };
+  | { kind: 'suggestion'; recentItem: RecentItem }
+  | { kind: 'recentRoot' }
+  | { kind: 'recentItem'; uri: string };
 
 /**
  * Optional 5th constructor argument (#95, T5): synthesizes a "Suggested" root row from recently
@@ -24,6 +26,16 @@ export type BookmarkNode =
 export interface SuggestionsSource {
   getRecentItems: () => RecentItem[];
   maxItems: number;
+}
+
+/**
+ * Optional 6th constructor argument (#108): synthesizes a "Recent" root row from the plain MRU
+ * recently-viewed list (`recentlyViewed.ts`). No `maxItems` field — unlike `SuggestionsSource`, the
+ * cap is fixed (`RECENTLY_VIEWED_MAX_ITEMS`) and already enforced by `recordView` before the uris
+ * ever reach this source, so the provider has nothing left to cap.
+ */
+export interface RecentlyViewedSource {
+  getUris: () => string[];
 }
 
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
@@ -59,7 +71,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     private readonly globalStore?: BookmarkStore,
     private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () =>
       vscode.workspace.workspaceFolders,
-    private readonly suggestions?: SuggestionsSource
+    private readonly suggestions?: SuggestionsSource,
+    private readonly recentlyViewed?: RecentlyViewedSource
   ) {
     this.store.onBookmarksChanged(() => {
       this.cache.invalidateAll();
@@ -211,6 +224,28 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       return treeItem;
     }
 
+    if (node.kind === 'recentRoot') {
+      // Collapsed by default, positioned last (after Suggested — D8 for #95 extends naturally to
+      // #108: Recent is the newer, even-less-curated row, so it goes after Suggested, not before).
+      const treeItem = new vscode.TreeItem('Recent', vscode.TreeItemCollapsibleState.Collapsed);
+      treeItem.contextValue = 'bookmarkRecentRoot';
+      treeItem.iconPath = new vscode.ThemeIcon('history');
+      return treeItem;
+    }
+
+    if (node.kind === 'recentItem') {
+      const uri = vscode.Uri.parse(node.uri);
+      const label = path.basename(uri.fsPath) || uri.fsPath;
+      const treeItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+      treeItem.contextValue = 'bookmarkRecentItem';
+      treeItem.resourceUri = uri;
+      treeItem.iconPath = new vscode.ThemeIcon('file');
+      // Independently clickable to open in an editor tab, mirroring the 'suggestion' leaf above —
+      // promoting into a real bookmark is a separate action (bookmarks.promoteRecentItem, #108).
+      treeItem.command = { command: 'vscode.open', title: 'Open', arguments: [uri] };
+      return treeItem;
+    }
+
     if (node.kind === 'collection') {
       const treeItem = new vscode.TreeItem(node.collection.name, vscode.TreeItemCollapsibleState.Collapsed);
       treeItem.contextValue = 'bookmarkCollection';
@@ -265,6 +300,10 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       return this.getSuggestedLeaves();
     }
 
+    if (node?.kind === 'recentRoot') {
+      return this.getRecentLeaves();
+    }
+
     if (node?.kind === 'globalRoot' || (node?.kind === 'collection' && node.scope === 'global')) {
       if (!this.globalStore) {
         return [];
@@ -283,13 +322,19 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     return !node ? await this.withRoots(children) : children;
   }
 
-  /** Prepends the Global row and appends the Suggested row (D8) to a set of root-level children. */
+  /**
+   * Prepends the Global row and appends the Suggested row (D8), then the Recent row (#108), to a
+   * set of root-level children. Recent is positioned after Suggested — both are hidden entirely
+   * when their backing source is absent or yields no entries.
+   */
   private async withRoots(children: BookmarkNode[]): Promise<BookmarkNode[]> {
     const suggestedLeaves = await this.getSuggestedLeaves();
+    const recentLeaves = this.getRecentLeaves();
     return [
       ...(this.globalStore ? [{ kind: 'globalRoot' } as BookmarkNode] : []),
       ...children,
-      ...(suggestedLeaves.length > 0 ? [{ kind: 'suggestedRoot' } as BookmarkNode] : [])
+      ...(suggestedLeaves.length > 0 ? [{ kind: 'suggestedRoot' } as BookmarkNode] : []),
+      ...(recentLeaves.length > 0 ? [{ kind: 'recentRoot' } as BookmarkNode] : [])
     ];
   }
 
@@ -327,6 +372,23 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     return existing
       .slice(0, this.suggestions.maxItems)
       .map((recentItem): BookmarkNode => ({ kind: 'suggestion', recentItem }));
+  }
+
+  /**
+   * The Recent row's children (#108): every uri `recentlyViewed.getUris()` returns, verbatim, in
+   * the source's own order. Deliberately does NOT apply Suggested's already-bookmarked filter or
+   * its filesystem-existence/staleness filter (`getSuggestedLeaves` above) — Recent is a raw "what
+   * did I look at" history, not a curated set of bookmark candidates, so an already-bookmarked or
+   * no-longer-existing uri is still meaningful history and still belongs here. The cap is already
+   * enforced by `recordView` (`recentlyViewed.ts`) before uris ever reach this source, so there is
+   * no `maxItems`/slicing step here the way `getSuggestedLeaves` has one. Returns `[]` — hiding the
+   * row entirely — when no `recentlyViewed` source was supplied or it returns no uris.
+   */
+  private getRecentLeaves(): BookmarkNode[] {
+    if (!this.recentlyViewed) {
+      return [];
+    }
+    return this.recentlyViewed.getUris().map((uri): BookmarkNode => ({ kind: 'recentItem', uri }));
   }
 
   private getChildrenDefault(

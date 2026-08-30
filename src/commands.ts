@@ -97,6 +97,25 @@ export function createPromoteSuggestionHandler(
   };
 }
 
+/**
+ * Promotes a recent-item leaf (issue #108) into a real workspace-scoped file bookmark. Mirrors
+ * `createPromoteSuggestionHandler` exactly — same `addBookmark` routing, same workspace-only scope
+ * (a `recentItem` node has no scope of its own, just like a `suggestion` node) — but keys off
+ * `kind === 'recentItem'` rather than `kind === 'suggestion'`, so a suggestion node (or any other
+ * node kind) is correctly ignored by this handler.
+ */
+export function createPromoteRecentItemHandler(
+  store: BookmarkStore,
+  prompter: Pick<Prompter, 'showInfo'>
+): (node: BookmarkNode) => Promise<void> {
+  return async (node: BookmarkNode): Promise<void> => {
+    if (node.kind !== 'recentItem') {
+      return;
+    }
+    await addBookmark(store, prompter, 'file', vscode.Uri.parse(node.uri));
+  };
+}
+
 export function createRemoveHandler(
   stores: ScopedStores
 ): (node: BookmarkNode) => Promise<void> {
@@ -197,7 +216,9 @@ export function createSetDescriptionHandler(
       node.kind === 'repoGroup' ||
       node.kind === 'globalRoot' ||
       node.kind === 'suggestedRoot' ||
-      node.kind === 'suggestion'
+      node.kind === 'suggestion' ||
+      node.kind === 'recentRoot' ||
+      node.kind === 'recentItem'
     ) {
       return;
     }
@@ -393,6 +414,10 @@ export function registerItemCommands(
     vscode.commands.registerCommand(
       'bookmarks.promoteSuggestion',
       createPromoteSuggestionHandler(stores.workspace, createPrompter())
+    ),
+    vscode.commands.registerCommand(
+      'bookmarks.promoteRecentItem',
+      createPromoteRecentItemHandler(stores.workspace, createPrompter())
     )
   );
 }

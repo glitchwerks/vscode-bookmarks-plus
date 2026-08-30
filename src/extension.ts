@@ -7,7 +7,7 @@ import {
   WorkspaceMirrorFile,
   resolveMirrorLocation
 } from './bookmarkMirror';
-import { BookmarksTreeDataProvider, SuggestionsSource } from './bookmarksTreeDataProvider';
+import { BookmarksTreeDataProvider, RecentlyViewedSource, SuggestionsSource } from './bookmarksTreeDataProvider';
 import {
   registerAddCommands,
   registerAddToWorkspaceCommand,
@@ -26,6 +26,12 @@ import {
   GitExtensionExports
 } from './gitInfo';
 import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
+import {
+  loadRecentlyViewed,
+  RECENTLY_VIEWED_MAX_ITEMS,
+  recordView,
+  saveRecentlyViewed
+} from './recentlyViewed';
 import { applyWorkspaceEnv } from './workspaceEnv';
 
 const WATCHER_DEBOUNCE_MS = 150;
@@ -176,6 +182,49 @@ export function registerRecentItemsTracker(
 }
 
 /**
+ * Registers the recently-*viewed* tracker (#108) — a SEPARATE, independent `onDidChangeTabs`
+ * subscription from `registerRecentItemsTracker` above, backing the plain MRU "Recent" tree row
+ * rather than the #95 suggestion-promotion pipeline. Deliberately its own tracker against its own
+ * storage key (`recentlyViewed.ts`'s `RECENTLY_VIEWED_STORAGE_KEY`), for the same reason
+ * `recentItems.ts` is independent of `BookmarkData` — a per-user browsing-history concern must not
+ * be folded into another one. Mirrors `registerRecentItemsTracker`'s DI shape, minus anything
+ * preview-count/threshold/`now`-related: this tracker has no preview concept (every open, preview
+ * or not, moves the uri to front) and no configurable cap (`RECENTLY_VIEWED_MAX_ITEMS` is fixed and
+ * enforced entirely inside `recordView`), so `deps` carries no `maxItems`/`now` fields at all.
+ *
+ * The subscription disposable is pushed onto `subscriptions`, matching the
+ * `context.subscriptions` disposal pattern used throughout `activate()`.
+ */
+export function registerRecentlyViewedTracker(
+  memento: vscode.Memento,
+  subscriptions: vscode.Disposable[],
+  deps: {
+    getTabGroups: () => Pick<vscode.TabGroups, 'onDidChangeTabs'>;
+    onDidChange?: () => void;
+  }
+): void {
+  const subscription = deps.getTabGroups().onDidChangeTabs((event) => {
+    let list = loadRecentlyViewed(memento);
+    let changed = false;
+
+    for (const tab of event.opened) {
+      const uri = extractTabUri(tab.input);
+      if (!uri) {
+        continue;
+      }
+      list = recordView(list, uri.toString(), RECENTLY_VIEWED_MAX_ITEMS);
+      changed = true;
+    }
+
+    if (changed) {
+      void saveRecentlyViewed(memento, list);
+      deps.onDidChange?.();
+    }
+  });
+  subscriptions.push(subscription);
+}
+
+/**
  * Live-reloads `bookmarksPlus.suggestions.maxItems` (#102): mirrors
  * `registerBookmarkDecorationProvider` above by subscribing a single scoped
  * `onDidChangeConfiguration` listener, injected via `deps` so this can be exercised without
@@ -260,7 +309,17 @@ export function activate(context: vscode.ExtensionContext): void {
     getRecentItems: () => loadRecentItems(context.workspaceState),
     maxItems: suggestionsMaxItems
   };
-  provider = new BookmarksTreeDataProvider(store, cache, globalStore, undefined, suggestionsSource);
+  const recentlyViewedSource: RecentlyViewedSource = {
+    getUris: () => loadRecentlyViewed(context.workspaceState)
+  };
+  provider = new BookmarksTreeDataProvider(
+    store,
+    cache,
+    globalStore,
+    undefined,
+    suggestionsSource,
+    recentlyViewedSource
+  );
 
   const treeView = vscode.window.createTreeView('bookmarksView', {
     treeDataProvider: provider,
@@ -287,6 +346,10 @@ export function activate(context: vscode.ExtensionContext): void {
     onDidChange: () => provider?.refresh()
   };
   registerRecentItemsTracker(context.workspaceState, context.subscriptions, recentItemsTrackerDeps);
+  registerRecentlyViewedTracker(context.workspaceState, context.subscriptions, {
+    getTabGroups: () => vscode.window.tabGroups,
+    onDidChange: () => provider?.refresh()
+  });
 
   registerSuggestionsMaxItemsLiveReload(context.subscriptions, {
     getConfiguration: () => vscode.workspace.getConfiguration(),
