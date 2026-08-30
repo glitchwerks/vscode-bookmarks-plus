@@ -11,6 +11,7 @@ import {
   createAddFileHandler,
   createAddFolderHandler,
   createAddToWorkspaceHandler,
+  createPromoteRecentItemHandler,
   createPromoteSuggestionHandler,
   createRemoveHandler,
   createRevealHandler,
@@ -1738,5 +1739,73 @@ suite('commands - promoteSuggestion (#95 T6)', () => {
     await createPromoteSuggestionHandler(store, makePrompter())(nonSuggestionNode);
 
     assert.strictEqual(store.getAll().items.length, 0, 'a non-suggestion node must not add anything');
+  });
+});
+
+// --- #108: bookmarks promote-from-Recent — mirrors createPromoteSuggestionHandler exactly in
+// shape: routed through the same addBookmark() helper (commands.ts) so DuplicateBookmarkError
+// produces the identical "already bookmarked" info toast. Workspace-scoped, same as
+// promoteSuggestion, since a recentItem node has no scope of its own to route on.
+//
+// `createPromoteRecentItemHandler` does not exist yet — this suite is expected to fail to compile
+// until it is added.
+suite('commands - promoteRecentItem (#108)', () => {
+  function recentItemNode(uri: string): BookmarkNode {
+    return { kind: 'recentItem', uri } as unknown as BookmarkNode;
+  }
+
+  test('adds the recent uri as a file bookmark to the workspace store', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const uri = 'file:///recent-a.txt';
+
+    await createPromoteRecentItemHandler(store, makePrompter())(recentItemNode(uri));
+
+    const items = store.getAll().items;
+    assert.strictEqual(items.length, 1);
+    assert.strictEqual(items[0].type, 'file');
+    assert.strictEqual(items[0].uri, uri);
+  });
+
+  test('shows the same "already bookmarked" info message as every other add path on a duplicate', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const uri = 'file:///recent-a.txt';
+    await store.addItem({ type: 'file', uri });
+    const messages: string[] = [];
+    const prompter = makePrompter({
+      showInfo: async (message) => {
+        messages.push(message);
+      }
+    });
+
+    await createPromoteRecentItemHandler(store, prompter)(recentItemNode(uri));
+
+    assert.strictEqual(
+      store.getAll().items.length,
+      1,
+      'promoting an already-bookmarked recent uri must not create a duplicate'
+    );
+    assert.strictEqual(messages.length, 1);
+    assert.match(messages[0], /already bookmarked/i);
+  });
+
+  test('ignores non-recentItem nodes', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const nonRecentItemNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
+
+    await createPromoteRecentItemHandler(store, makePrompter())(nonRecentItemNode);
+
+    assert.strictEqual(store.getAll().items.length, 0, 'a non-recentItem node must not add anything');
+  });
+
+  test('ignores a suggestion node too (only recentItem nodes are promoted by this handler)', async () => {
+    const store = new BookmarkStore(new FakeMemento());
+    const suggestionNode: BookmarkNode = {
+      kind: 'suggestion',
+      recentItem: { uri: 'file:///suggested.txt', firstSeen: 1000, previewCount: 0, promoted: true }
+    } as unknown as BookmarkNode;
+
+    await createPromoteRecentItemHandler(store, makePrompter())(suggestionNode);
+
+    assert.strictEqual(store.getAll().items.length, 0);
   });
 });

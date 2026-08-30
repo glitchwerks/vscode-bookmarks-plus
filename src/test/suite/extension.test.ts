@@ -5,7 +5,8 @@ import { BookmarkDecorationProvider } from '../../bookmarkDecorationProvider';
 import {
   handleWorkspaceFoldersChanged,
   registerBookmarkDecorationProvider,
-  registerRecentItemsTracker
+  registerRecentItemsTracker,
+  registerRecentlyViewedTracker
 } from '../../extension';
 // Namespace import (not a named import) so `registerSuggestionsMaxItemsLiveReload` (#102, not yet
 // implemented) can be resolved dynamically below without a compile-time failure on the missing
@@ -13,6 +14,7 @@ import {
 // `requireRegisterFn()` is the intended failure mode until T-#102 adds the export.
 import * as extensionModule from '../../extension';
 import { loadRecentItems, normalizeMaxItems } from '../../recentItems';
+import { loadRecentlyViewed } from '../../recentlyViewed';
 import { FakeMemento, fakeTab, FakeMirror, FakeOutput } from './fixtures';
 
 suite('Extension activation', () => {
@@ -800,6 +802,219 @@ suite('registerRecentItemsTracker (#95 T4/T8)', () => {
       3,
       'a fractional maxItems of 3.7, normalized to 3 before reaching the tracker, must cap the ' +
         'tracked promoted list at 3 entries, not 4'
+    );
+  });
+});
+
+// --- #108: registerRecentlyViewedTracker — a SEPARATE, independent tracker from
+// registerRecentItemsTracker above (its own onDidChangeTabs subscription), for the plain MRU
+// recently-viewed list backing the new "Recent" tree row. Mirrors registerRecentItemsTracker's DI
+// shape exactly, minus anything preview-count/threshold/`now`-related — this tracker has none of
+// that; the cap is the fixed RECENTLY_VIEWED_MAX_ITEMS constant enforced entirely inside
+// recordView, so `deps` carries no `maxItems`/`now` fields at all.
+//
+// `registerRecentlyViewedTracker` and `src/recentlyViewed.ts` do not exist yet — this suite is
+// expected to fail to compile until #108 adds them.
+suite('registerRecentlyViewedTracker (#108)', () => {
+  class FakeDisposable implements vscode.Disposable {
+    disposeCallCount = 0;
+    dispose(): void {
+      this.disposeCallCount++;
+    }
+  }
+
+  class FakeTabGroupsRegistration {
+    listeners: Array<(event: vscode.TabChangeEvent) => void> = [];
+    disposables: FakeDisposable[] = [];
+
+    onDidChangeTabs = (listener: (event: vscode.TabChangeEvent) => void): vscode.Disposable => {
+      this.listeners.push(listener);
+      const disposable = new FakeDisposable();
+      this.disposables.push(disposable);
+      return disposable;
+    };
+
+    fire(event: Partial<vscode.TabChangeEvent>): void {
+      const fullEvent: vscode.TabChangeEvent = { opened: [], closed: [], changed: [], ...event };
+      for (const listener of this.listeners) {
+        listener(fullEvent);
+      }
+    }
+  }
+
+  function createDeps(): {
+    tabGroups: FakeTabGroupsRegistration;
+    deps: {
+      getTabGroups: () => Pick<vscode.TabGroups, 'onDidChangeTabs'>;
+    };
+  } {
+    const tabGroups = new FakeTabGroupsRegistration();
+    return {
+      tabGroups,
+      deps: {
+        getTabGroups: () => ({ onDidChangeTabs: tabGroups.onDidChangeTabs })
+      }
+    };
+  }
+
+  test('subscribes to tabGroups.onDidChangeTabs exactly once', () => {
+    const { tabGroups, deps } = createDeps();
+    registerRecentlyViewedTracker(new FakeMemento(), [], deps);
+    assert.strictEqual(tabGroups.listeners.length, 1);
+  });
+
+  test('pushes the subscription disposable onto subscriptions, disposed exactly once on teardown', () => {
+    const { tabGroups, deps } = createDeps();
+    const subscriptions: vscode.Disposable[] = [];
+
+    registerRecentlyViewedTracker(new FakeMemento(), subscriptions, deps);
+    for (const subscription of subscriptions) {
+      subscription.dispose();
+    }
+
+    assert.strictEqual(tabGroups.disposables.length, 1);
+    assert.strictEqual(tabGroups.disposables[0].disposeCallCount, 1);
+  });
+
+  test('records an opened text tab uri, persisted to workspaceState', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(list, [uri.toString()]);
+  });
+
+  test('a preview-opened tab is recorded too — there is no preview concept for this tracker', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/preview.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: true })] });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(
+      list,
+      [uri.toString()],
+      'a preview open must be recorded just like a non-preview open — this tracker has no ' +
+        'preview/promotion concept at all'
+    );
+  });
+
+  test('re-opening an already-recorded uri moves it to front without duplicating it', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const uriA = vscode.Uri.file('/workspace/a.txt');
+    const uriB = vscode.Uri.file('/workspace/b.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false })] });
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriB), { isPreview: false })] });
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false })] });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(list, [uriA.toString(), uriB.toString()]);
+  });
+
+  test('a closed tab is never recorded', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const uri = vscode.Uri.file('/workspace/closed.txt');
+    tabGroups.fire({ closed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(list, []);
+  });
+
+  test('a non-file-scheme tab (e.g. output:) is filtered out via extractTabUri (T3/C6)', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const uri = vscode.Uri.parse('output:some-channel');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(list, [], 'a non-file-scheme tab must never be recorded');
+  });
+
+  test('an undefined/absent uri (e.g. a diff tab) is filtered out — no single uri to record', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    registerRecentlyViewedTracker(memento, [], deps);
+
+    const original = vscode.Uri.file('/workspace/original.txt');
+    const modified = vscode.Uri.file('/workspace/modified.txt');
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputTextDiff(original, modified), { isPreview: false })]
+    });
+
+    const list = loadRecentlyViewed(memento);
+    assert.deepStrictEqual(list, []);
+  });
+
+  test('deps.onDidChange fires when a tab open changes the list', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    let changeCount = 0;
+    registerRecentlyViewedTracker(memento, [], { ...deps, onDidChange: () => changeCount++ });
+
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    assert.strictEqual(changeCount, 1);
+  });
+
+  test('deps.onDidChange does not fire when nothing changed (e.g. only a non-file-scheme tab was opened)', () => {
+    const { tabGroups, deps } = createDeps();
+    const memento = new FakeMemento();
+    let changeCount = 0;
+    registerRecentlyViewedTracker(memento, [], { ...deps, onDidChange: () => changeCount++ });
+
+    const uri = vscode.Uri.parse('output:some-channel');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    assert.strictEqual(changeCount, 0, 'a filtered-out tab must not trigger onDidChange');
+  });
+
+  test('is a SEPARATE tracker from registerRecentItemsTracker: registering both against the same memento and tab groups populates both independent lists from a single fired open', () => {
+    const tabGroups = new FakeTabGroupsRegistration();
+    const memento = new FakeMemento();
+
+    registerRecentItemsTracker(memento, [], {
+      getTabGroups: () => ({ onDidChangeTabs: tabGroups.onDidChangeTabs }),
+      maxItems: 10
+    });
+    registerRecentlyViewedTracker(memento, [], {
+      getTabGroups: () => ({ onDidChangeTabs: tabGroups.onDidChangeTabs })
+    });
+
+    assert.strictEqual(
+      tabGroups.listeners.length,
+      2,
+      'each tracker must register its own onDidChangeTabs subscription, not share one'
+    );
+
+    const uri = vscode.Uri.file('/workspace/shared.txt');
+    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+
+    const suggestionsList = loadRecentItems(memento);
+    const recentlyViewedList = loadRecentlyViewed(memento);
+
+    assert.ok(
+      suggestionsList.find((i) => i.uri === uri.toString()),
+      'the #95 recentItems tracker must still independently record the open'
+    );
+    assert.deepStrictEqual(
+      recentlyViewedList,
+      [uri.toString()],
+      'the #108 recentlyViewed tracker must independently record the open under its own storage key'
     );
   });
 });

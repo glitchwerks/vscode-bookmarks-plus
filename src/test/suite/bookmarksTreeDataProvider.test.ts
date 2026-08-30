@@ -1239,3 +1239,173 @@ suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', 
     assert.strictEqual(untouched.order, 0, 'a suggestedRoot node is not a valid drop target');
   });
 });
+
+// --- #108: "Recent" root row from plain MRU recently-viewed uris -------------------------------
+//
+// New node kinds: { kind: 'recentRoot' } and { kind: 'recentItem'; uri: string }. The constructor
+// gains a 6th, optional argument after `suggestions` — `recentlyViewed?: { getUris: () => string[] }`
+// — a minimal DI seam with no `maxItems` field, since the cap is fixed (RECENTLY_VIEWED_MAX_ITEMS)
+// and enforced entirely by `recentlyViewed.ts`'s `recordView`, not by the tree provider.
+//
+// `src/recentlyViewed.ts` does not exist yet, so this suite is expected to fail to compile until
+// it is added.
+//
+// Deliberately does NOT test Recent's position in byRepo mode — the spec does not pin that, and
+// inventing an assertion here would over-constrain the implementer beyond the contract.
+
+function findRecentRoot(nodes: BookmarkNode[]): BookmarkNode | undefined {
+  return nodes.find((n) => n.kind === 'recentRoot');
+}
+
+function makeProviderWithRecentlyViewed(
+  uris: string[],
+  options: {
+    resolve?: (uri: string) => Promise<{ exists: boolean; repoName?: string }>;
+    globalStore?: BookmarkStore;
+    suggestions?: { getRecentItems: () => RecentItem[]; maxItems: number };
+  } = {}
+) {
+  const store = new BookmarkStore(new FakeMemento());
+  const cache = new FsGitCache(options.resolve ?? (async () => ({ exists: true })));
+  const provider = new BookmarksTreeDataProvider(
+    store,
+    cache,
+    options.globalStore,
+    undefined,
+    options.suggestions,
+    { getUris: () => uris }
+  );
+  return { store, cache, provider };
+}
+
+suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
+  test('omitting the recentlyViewed option leaves root children unaffected — no Recent row is synthesized (regression guard)', async () => {
+    const { provider } = makeProvider(); // the pre-#108 constructor call shape, unchanged
+    const children = await provider.getChildren();
+    assert.ok(children.every((n) => n.kind !== 'recentRoot'));
+  });
+
+  test('the Recent row is absent when recentlyViewed.getUris() returns an empty list', async () => {
+    const { provider } = makeProviderWithRecentlyViewed([]);
+    const children = await provider.getChildren();
+    assert.strictEqual(findRecentRoot(children), undefined);
+  });
+
+  test('the Recent row appears when recentlyViewed.getUris() returns at least one uri', async () => {
+    const { provider } = makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
+    const children = await provider.getChildren();
+    assert.ok(findRecentRoot(children), 'expected a recentRoot node among root children');
+  });
+
+  test('the Recent row is positioned after the Suggested row: Global, ...normal children, Suggested, Recent', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const store = new BookmarkStore(new FakeMemento());
+    const cache = new FsGitCache(async () => ({ exists: true }));
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      cache,
+      globalStore,
+      undefined,
+      { getRecentItems: () => [recentItem()], maxItems: 10 },
+      { getUris: () => ['file:///recent-a.txt'] }
+    );
+    await store.addItem({ type: 'file', uri: 'file:///bookmarked.txt' });
+
+    const children = await provider.getChildren();
+
+    const kinds = children.map((n) => n.kind);
+    assert.strictEqual(kinds[0], 'globalRoot', 'Global must be first');
+    assert.strictEqual(
+      kinds[kinds.length - 1],
+      'recentRoot',
+      'Recent must be the very last root child, after Suggested'
+    );
+    assert.strictEqual(
+      kinds[kinds.length - 2],
+      'suggestedRoot',
+      'Suggested must immediately precede Recent'
+    );
+  });
+
+  test('the Recent row tree item: label "Recent", collapsed, contextValue bookmarkRecentRoot, ThemeIcon set', async () => {
+    const { provider } = makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
+    const children = await provider.getChildren();
+    const node = findRecentRoot(children)!;
+
+    const treeItem = await provider.getTreeItem(node);
+    assert.strictEqual(treeItem.label, 'Recent');
+    assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+    assert.strictEqual(treeItem.contextValue, 'bookmarkRecentRoot');
+    assert.ok(treeItem.iconPath instanceof vscode.ThemeIcon, 'expected iconPath to be a ThemeIcon');
+  });
+
+  test('a recentItem tree item: label is the uri basename, no children, contextValue bookmarkRecentItem, resourceUri set, opens via vscode.open', async () => {
+    const uri = 'file:///workspace/recent-file.txt';
+    const { provider } = makeProviderWithRecentlyViewed([uri]);
+    const rootChildren = await provider.getChildren();
+    const recentRoot = findRecentRoot(rootChildren)!;
+    const leaves = await provider.getChildren(recentRoot);
+
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual(leaves[0].kind, 'recentItem');
+
+    const treeItem = await provider.getTreeItem(leaves[0]);
+    assert.strictEqual(treeItem.label, 'recent-file.txt');
+    assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.None);
+    assert.strictEqual(treeItem.contextValue, 'bookmarkRecentItem');
+    assert.strictEqual(treeItem.resourceUri?.toString(), uri);
+    assert.strictEqual(treeItem.command?.command, 'vscode.open');
+    assert.strictEqual((treeItem.command?.arguments?.[0] as vscode.Uri).toString(), uri);
+  });
+
+  test('getChildren(recentRoot) returns one recentItem per uri, in the same order the source returns them (source owns MRU ordering, provider does not re-sort)', async () => {
+    const uris = ['file:///c.txt', 'file:///a.txt', 'file:///b.txt'];
+    const { provider } = makeProviderWithRecentlyViewed(uris);
+
+    const rootChildren = await provider.getChildren();
+    const recentRoot = findRecentRoot(rootChildren)!;
+    const leaves = await provider.getChildren(recentRoot);
+
+    assert.deepStrictEqual(
+      leaves.map((n) => (n as unknown as { uri: string }).uri),
+      uris,
+      'the provider must preserve the source order verbatim, not re-sort it'
+    );
+  });
+
+  test('a uri that is already bookmarked in the store still appears as a recentItem — Recent does NOT filter out already-bookmarked items, unlike Suggested', async () => {
+    const uri = 'file:///already-bookmarked.txt';
+    const { store, provider } = makeProviderWithRecentlyViewed([uri]);
+    await store.addItem({ type: 'file', uri });
+
+    const rootChildren = await provider.getChildren();
+    const recentRoot = findRecentRoot(rootChildren)!;
+    const leaves = await provider.getChildren(recentRoot);
+
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual(
+      (leaves[0] as unknown as { uri: string }).uri,
+      uri,
+      'an already-bookmarked uri must still surface under Recent — this is the key design ' +
+        'difference from Suggested, which excludes already-bookmarked uris'
+    );
+  });
+
+  test('a uri that no longer exists on disk still appears as a recentItem — Recent is not filtered for filesystem existence/staleness, unlike Suggested', async () => {
+    const uri = 'file:///stale-recent.txt';
+    const { provider } = makeProviderWithRecentlyViewed([uri], {
+      resolve: async () => ({ exists: false })
+    });
+
+    const rootChildren = await provider.getChildren();
+    const recentRoot = findRecentRoot(rootChildren)!;
+    const leaves = await provider.getChildren(recentRoot);
+
+    assert.strictEqual(
+      leaves.length,
+      1,
+      'a stale (non-existent) recent uri must still render as a clickable node under Recent'
+    );
+    assert.strictEqual((leaves[0] as unknown as { uri: string }).uri, uri);
+  });
+});
