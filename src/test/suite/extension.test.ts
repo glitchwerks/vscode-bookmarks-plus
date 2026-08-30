@@ -876,25 +876,36 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     assert.strictEqual(tabGroups.disposables[0].disposeCallCount, 1);
   });
 
+  // isActive: true added (CodeRabbit PR #109 fix, extension.ts:210) — this suite's contract now
+  // records a view only for a tab reported active in the fired event; a plain opened-tab fixture
+  // with no isActive at all defaults to isActive: false via fakeTab (fixtures.ts) and would no
+  // longer be recorded, which would falsify this test's original "a normal open is recorded"
+  // intent for reasons unrelated to what the test means to check. See the isActive-focused tests
+  // in the "corrected contract (CodeRabbit PR #109)" block below for the negative-path coverage.
   test('records an opened text tab uri, persisted to workspaceState', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
     registerRecentlyViewedTracker(memento, [], deps);
 
     const uri = vscode.Uri.file('/workspace/a.txt');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(list, [uri.toString()]);
   });
 
+  // isActive: true added — see the note on the test above.
   test('a preview-opened tab is recorded too — there is no preview concept for this tracker', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
     registerRecentlyViewedTracker(memento, [], deps);
 
     const uri = vscode.Uri.file('/workspace/preview.txt');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: true })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: true, isActive: true })]
+    });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(
@@ -905,6 +916,8 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     );
   });
 
+  // isActive: true added on all three fires — see the note above; each fire in this sequence must
+  // still land in the recorded list for the dedupe/reorder behavior under test to be observable.
   test('re-opening an already-recorded uri moves it to front without duplicating it', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
@@ -912,38 +925,58 @@ suite('registerRecentlyViewedTracker (#108)', () => {
 
     const uriA = vscode.Uri.file('/workspace/a.txt');
     const uriB = vscode.Uri.file('/workspace/b.txt');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false })] });
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriB), { isPreview: false })] });
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false, isActive: true })]
+    });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uriB), { isPreview: false, isActive: true })]
+    });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uriA), { isPreview: false, isActive: true })]
+    });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(list, [uriA.toString(), uriB.toString()]);
   });
 
+  // isActive: true added — without it, this fixture would be filtered by the new isActive gate
+  // before the implementation ever consults `closed` vs `opened`/`changed`, so a wrong
+  // implementation that iterated `closed` too would still pass "by accident." Keeping isActive
+  // true here means this test still specifically guards against reading `closed` at all.
   test('a closed tab is never recorded', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
     registerRecentlyViewedTracker(memento, [], deps);
 
     const uri = vscode.Uri.file('/workspace/closed.txt');
-    tabGroups.fire({ closed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      closed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(list, []);
   });
 
+  // isActive: true added — without it, this fixture would be filtered by the new isActive gate
+  // before extractTabUri's scheme check ever ran, so a wrong implementation with scheme filtering
+  // deleted entirely would still (wrongly) pass this test. isActive: true isolates the assertion
+  // to the scheme filter it names.
   test('a non-file-scheme tab (e.g. output:) is filtered out via extractTabUri (T3/C6)', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
     registerRecentlyViewedTracker(memento, [], deps);
 
     const uri = vscode.Uri.parse('output:some-channel');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(list, [], 'a non-file-scheme tab must never be recorded');
   });
 
+  // isActive: true added — see the note above; isolates this assertion to the "no single uri"
+  // filter it names, rather than letting it pass vacuously via the isActive gate.
   test('an undefined/absent uri (e.g. a diff tab) is filtered out — no single uri to record', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
@@ -952,13 +985,21 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     const original = vscode.Uri.file('/workspace/original.txt');
     const modified = vscode.Uri.file('/workspace/modified.txt');
     tabGroups.fire({
-      opened: [fakeTab(new vscode.TabInputTextDiff(original, modified), { isPreview: false })]
+      opened: [
+        fakeTab(new vscode.TabInputTextDiff(original, modified), {
+          isPreview: false,
+          isActive: true
+        })
+      ]
     });
 
     const list = loadRecentlyViewed(memento);
     assert.deepStrictEqual(list, []);
   });
 
+  // isActive: true added — see the note on the "records an opened text tab uri" test above; without
+  // it the open would no longer be recorded under the corrected contract and onDidChange would
+  // never fire, for reasons unrelated to what this test means to check.
   test('deps.onDidChange fires when a tab open changes the list', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
@@ -966,11 +1007,15 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     registerRecentlyViewedTracker(memento, [], { ...deps, onDidChange: () => changeCount++ });
 
     const uri = vscode.Uri.file('/workspace/a.txt');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     assert.strictEqual(changeCount, 1);
   });
 
+  // isActive: true added — without it, this test would pass because of the new isActive gate
+  // rather than the scheme filter its name and message describe, weakening the guard.
   test('deps.onDidChange does not fire when nothing changed (e.g. only a non-file-scheme tab was opened)', () => {
     const { tabGroups, deps } = createDeps();
     const memento = new FakeMemento();
@@ -978,11 +1023,18 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     registerRecentlyViewedTracker(memento, [], { ...deps, onDidChange: () => changeCount++ });
 
     const uri = vscode.Uri.parse('output:some-channel');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     assert.strictEqual(changeCount, 0, 'a filtered-out tab must not trigger onDidChange');
   });
 
+  // isActive: true added on the shared fire below — see the note on "records an opened text tab
+  // uri" above. registerRecentItemsTracker (#95) has no isActive concept (confirmed by the #95
+  // suite above, none of whose fixtures set isActive), so this addition does not change that
+  // tracker's half of the assertion — it is needed solely so the #108 recentlyViewed half still
+  // observes the open as originally intended.
   test('is a SEPARATE tracker from registerRecentItemsTracker: registering both against the same memento and tab groups populates both independent lists from a single fired open', () => {
     const tabGroups = new FakeTabGroupsRegistration();
     const memento = new FakeMemento();
@@ -1002,7 +1054,9 @@ suite('registerRecentlyViewedTracker (#108)', () => {
     );
 
     const uri = vscode.Uri.file('/workspace/shared.txt');
-    tabGroups.fire({ opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false })] });
+    tabGroups.fire({
+      opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+    });
 
     const suggestionsList = loadRecentItems(memento);
     const recentlyViewedList = loadRecentlyViewed(memento);
@@ -1016,6 +1070,75 @@ suite('registerRecentlyViewedTracker (#108)', () => {
       [uri.toString()],
       'the #108 recentlyViewed tracker must independently record the open under its own storage key'
     );
+  });
+
+  // --- CodeRabbit finding (PR #109 review, inline comment on src/extension.ts:210): the tracker
+  // must record a view only for a tab reported *active* by the fired event — from either
+  // `event.opened` or `event.changed` — never an inactive one. Pre-fix, the tracker records every
+  // `event.opened` tab regardless of `isActive` (so a background/inactive open wrongly enters the
+  // MRU list) and ignores `event.changed` entirely (so an existing tab that becomes active by
+  // switching focus is never recorded at all). These three tests pin the corrected contract.
+  suite('corrected contract: only active tabs record a view, from either opened or changed (CodeRabbit PR #109)', () => {
+    test('a tab reported in event.changed that is active records a view', () => {
+      const { tabGroups, deps } = createDeps();
+      const memento = new FakeMemento();
+      registerRecentlyViewedTracker(memento, [], deps);
+
+      const uri = vscode.Uri.file('/workspace/changed-active.txt');
+      tabGroups.fire({
+        opened: [],
+        changed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: true })]
+      });
+
+      const list = loadRecentlyViewed(memento);
+      assert.deepStrictEqual(
+        list,
+        [uri.toString()],
+        'an existing tab that becomes active (reported via event.changed) must be recorded — ' +
+          'e.g. the user switching focus to an already-open tab'
+      );
+    });
+
+    test('a tab reported in event.opened that is inactive (a background open) does not record a view', () => {
+      const { tabGroups, deps } = createDeps();
+      const memento = new FakeMemento();
+      registerRecentlyViewedTracker(memento, [], deps);
+
+      const uri = vscode.Uri.file('/workspace/opened-inactive.txt');
+      tabGroups.fire({
+        opened: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: false })],
+        changed: []
+      });
+
+      const list = loadRecentlyViewed(memento);
+      assert.deepStrictEqual(
+        list,
+        [],
+        'a background open (e.g. a tab opened by "Open All" or a diff comparison base, never ' +
+          'brought into focus) must not enter the MRU list'
+      );
+    });
+
+    test('a tab reported in event.changed that is inactive (e.g. losing focus) does not record a view', () => {
+      const { tabGroups, deps } = createDeps();
+      const memento = new FakeMemento();
+      registerRecentlyViewedTracker(memento, [], deps);
+
+      const uri = vscode.Uri.file('/workspace/changed-inactive.txt');
+      tabGroups.fire({
+        opened: [],
+        changed: [fakeTab(new vscode.TabInputText(uri), { isPreview: false, isActive: false })]
+      });
+
+      const list = loadRecentlyViewed(memento);
+      assert.deepStrictEqual(
+        list,
+        [],
+        'a changed event for a tab that is not (or no longer) active — e.g. the previously-active ' +
+          'tab losing focus when the user switches away — must not be recorded; recording on every ' +
+          'changed event regardless of isActive would re-introduce the bug'
+      );
+    });
   });
 });
 

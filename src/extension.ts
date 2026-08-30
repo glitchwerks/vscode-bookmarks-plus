@@ -207,7 +207,16 @@ export function registerRecentlyViewedTracker(
     let list = loadRecentlyViewed(memento);
     let changed = false;
 
-    for (const tab of event.opened) {
+    // CodeRabbit finding (PR #109 review, inline comment on this file): a "view" must be gated on
+    // `tab.isActive`, and must be read from BOTH `event.opened` and `event.changed`. `event.opened`
+    // alone over-records — a tab opened in the background (e.g. "Open All", a diff comparison base)
+    // fires `opened` without ever being looked at — and under-records — VS Code reports switching
+    // focus to an already-open tab via `event.changed`, not a new `opened` event, so that case was
+    // silently dropped entirely pre-fix.
+    for (const tab of [...event.opened, ...event.changed]) {
+      if (!tab.isActive) {
+        continue;
+      }
       const uri = extractTabUri(tab.input);
       if (!uri) {
         continue;
