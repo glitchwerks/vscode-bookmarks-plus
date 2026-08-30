@@ -1,8 +1,14 @@
 #!/usr/bin/env node
-// Copies build-time assets that `tsc` does not handle (it only compiles
-// `.ts`) into `dist/`. Run after `tsc` from both the `build` and `test`
-// npm scripts.
-import { existsSync, mkdirSync, copyFileSync, cpSync } from 'node:fs';
+// Copies the authored JSON schema (a build-time asset `tsc` does not handle,
+// since it only compiles `.ts`) into `dist/bookmarks.schema.json`. Run after
+// `tsc` from both the `build` and `test` npm scripts.
+//
+// This script does the schema copy ONLY. It must never write anything under
+// `dist/test` -- that would leak test fixtures into the publishable `dist/`
+// tree on every plain `npm run build` (issue #66 / T1, constraint 3.1(a)).
+// The test-fixture copy lives in the sibling script
+// scripts/copy-test-fixtures.mjs, invoked only from the `test` npm script.
+import { existsSync, mkdirSync, copyFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,11 +25,3 @@ if (!existsSync(schemaSrc)) {
 
 mkdirSync(dirname(schemaDest), { recursive: true });
 copyFileSync(schemaSrc, schemaDest);
-
-const fixturesSrc = join(mcpServerRoot, 'test', 'fixtures');
-const fixturesDest = join(mcpServerRoot, 'dist', 'test', 'fixtures');
-
-if (existsSync(fixturesSrc)) {
-  mkdirSync(fixturesDest, { recursive: true });
-  cpSync(fixturesSrc, fixturesDest, { recursive: true });
-}
