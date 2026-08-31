@@ -17,6 +17,14 @@ jobs:
       contents: write
 
     steps:
+      - name: Guard against non-extension tags
+        run: |
+          TAG=${{ inputs.tag || github.ref_name }}
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "::error::Tag '$TAG' does not match the extension-release pattern ^v[0-9] -- refusing to run the VSIX publish workflow"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
