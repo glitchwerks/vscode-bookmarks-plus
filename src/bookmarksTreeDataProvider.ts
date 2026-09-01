@@ -3,7 +3,7 @@ import * as path from 'path';
 import { BookmarkStore } from './bookmarkStore';
 import { BookmarkItem, BookmarkCollection, BookmarkScope } from './types';
 import { FsGitCache } from './fsGitCache';
-import { isInsideWorkspace } from './workspaceFolders';
+import { isInsideWorkspace, getWorkspaceRelativePath } from './workspaceFolders';
 import { RecentItem } from './recentItems';
 
 export type GroupMode = 'default' | 'byRepo';
@@ -38,6 +38,9 @@ export interface RecentlyViewedSource {
   getUris: () => string[];
 }
 
+/** Memento key #115's `viewState` seam persists the "Show Full Path" toggle under. */
+const SHOW_FULL_PATH_STATE_KEY = 'bookmarksPlus.showFullPath';
+
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
 export const UNKNOWN_REPO_LABEL = 'Unknown';
 
@@ -64,6 +67,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   readonly onDidChangeTreeData: vscode.Event<BookmarkNode | undefined | void> = this._onDidChangeTreeData.event;
 
   private groupMode: GroupMode = 'default';
+  private showFullPath: boolean;
 
   constructor(
     private readonly store: BookmarkStore,
@@ -72,8 +76,14 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () =>
       vscode.workspace.workspaceFolders,
     private readonly suggestions?: SuggestionsSource,
-    private readonly recentlyViewed?: RecentlyViewedSource
+    private readonly recentlyViewed?: RecentlyViewedSource,
+    // Optional 7th constructor argument (#115): persists the "Show Full Path" toggle across
+    // reloads when supplied. Omitted entirely by every existing call site, so the toggle stays
+    // in-memory-only (default off) unless a caller opts in — mirrors the additive-optional-DI-arg
+    // convention `suggestions`/`recentlyViewed` already established above.
+    private readonly viewState?: vscode.Memento
   ) {
+    this.showFullPath = this.viewState?.get<boolean>(SHOW_FULL_PATH_STATE_KEY, false) ?? false;
     this.store.onBookmarksChanged(() => {
       this.cache.invalidateAll();
       this._onDidChangeTreeData.fire();
@@ -183,6 +193,16 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     this._onDidChangeTreeData.fire();
   }
 
+  getShowFullPath(): boolean {
+    return this.showFullPath;
+  }
+
+  setShowFullPath(value: boolean): void {
+    this.showFullPath = value;
+    void this.viewState?.update(SHOW_FULL_PATH_STATE_KEY, value);
+    this._onDidChangeTreeData.fire();
+  }
+
   refresh(): void {
     this.cache.invalidateAll();
     this._onDidChangeTreeData.fire();
@@ -259,7 +279,16 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     const bookmark = node.item;
     const uri = vscode.Uri.parse(bookmark.uri);
     const entry = await this.cache.get(bookmark.uri);
-    const label = path.basename(uri.fsPath) || uri.fsPath;
+    const filenameLabel = path.basename(uri.fsPath) || uri.fsPath;
+    // #115: root-relative label (per-URI fallback to filename-only when `uri` isn't inside any
+    // current workspace folder — checked against the URI itself, not the bookmark's scope, so a
+    // global-scoped bookmark inside a folder still gets a relative path and a workspace-scoped
+    // bookmark outside every folder still falls back). Always goes in `label`, never
+    // `description` — `description` is already the repo-name/"missing" badge below.
+    const relativePath = this.showFullPath ? getWorkspaceRelativePath(uri, this.getWorkspaceFolders()) : undefined;
+    // `relativePath` can legitimately be '' when the bookmark IS a workspace folder root itself —
+    // that's still "no relative path worth showing", so fall back to filename-only for it too.
+    const label = relativePath || filenameLabel;
 
     const treeItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
     treeItem.id = `item:${bookmark.id}`;

@@ -48,3 +48,37 @@ export function isInsideWorkspace(
     return isSegmentPrefix(pathSegments(folderUri.path), uriSegments);
   });
 }
+
+/**
+ * #115: the path of `uri` relative to whichever workspace folder contains it, joined with `/`
+ * (POSIX-style, unconditionally — never `path.sep`, so the label is identical on Windows and
+ * POSIX hosts). Returns `undefined` — the "no root to be relative to" case — when `uri` is not
+ * inside any of `folders` (including when `folders` is `undefined` or empty), matching
+ * `isInsideWorkspace`'s own case-insensitive, segment-boundary comparison so the two stay
+ * consistent. Case is preserved in the returned path (unlike `isInsideWorkspace`'s internal
+ * comparison, which lowercases only for matching).
+ */
+export function getWorkspaceRelativePath(
+  uri: vscode.Uri,
+  folders: readonly vscode.WorkspaceFolder[] | undefined
+): string | undefined {
+  if (!folders || folders.length === 0) {
+    return undefined;
+  }
+
+  const uriSegments = uri.path.split('/').filter((segment) => segment.length > 0);
+  const uriSegmentsLower = uriSegments.map((segment) => segment.toLowerCase());
+
+  for (const folder of folders) {
+    const folderUri = folder.uri;
+    if (uri.scheme !== folderUri.scheme || uri.authority !== folderUri.authority) {
+      continue;
+    }
+    const folderSegments = pathSegments(folderUri.path);
+    if (isSegmentPrefix(folderSegments, uriSegmentsLower)) {
+      return uriSegments.slice(folderSegments.length).join('/');
+    }
+  }
+
+  return undefined;
+}

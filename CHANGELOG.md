@@ -4,6 +4,13 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ## [Unreleased]
 
+### Added
+
+- Toggle Show Full Path (#115): a view-title-bar button switches bookmark labels between
+  filename-only (the default) and the path relative to the workspace root, using `/` separators.
+  Combines cleanly with Group by Repo (no duplicated repo-name prefix); a bookmark outside every
+  workspace folder falls back to filename-only. The toggle state persists across window reloads.
+
 ## [1.3.0] — 2026-08-29
 
 ### Added

@@ -46,6 +46,7 @@
       { "command": "bookmarks.moveToCollection", "title": "Move to Collection", "category": "Bookmarks Plus", "icon": "$(folder-opened)" },
       { "command": "bookmarks.addToWorkspace", "title": "Add to Workspace", "category": "Bookmarks Plus", "icon": "$(root-folder)" },
       { "command": "bookmarks.toggleGroupByRepo", "title": "Toggle Group by Repo", "category": "Bookmarks Plus", "icon": "$(repo)" },
+      { "command": "bookmarks.toggleShowFullPath", "title": "Toggle Show Full Path", "category": "Bookmarks Plus", "icon": "$(list-tree)" },
       { "command": "bookmarks.refresh", "title": "Refresh", "category": "Bookmarks Plus", "icon": "$(refresh)" },
       { "command": "bookmarks.promoteSuggestion", "title": "Add Bookmark from Suggestion", "category": "Bookmarks Plus", "icon": "$(add)" },
       { "command": "bookmarks.promoteRecentItem", "title": "Add Bookmark from Recent", "category": "Bookmarks Plus", "icon": "$(add)" }
@@ -68,7 +69,8 @@
       "view/title": [
         { "command": "bookmarks.newCollection", "when": "view == bookmarksView", "group": "navigation@1" },
         { "command": "bookmarks.toggleGroupByRepo", "when": "view == bookmarksView", "group": "navigation@2" },
-        { "command": "bookmarks.refresh", "when": "view == bookmarksView", "group": "navigation@3" }
+        { "command": "bookmarks.toggleShowFullPath", "when": "view == bookmarksView", "group": "navigation@3" },
+        { "command": "bookmarks.refresh", "when": "view == bookmarksView", "group": "navigation@4" }
       ],
       "view/item/context": [
         { "command": "bookmarks.remove", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@1" },
