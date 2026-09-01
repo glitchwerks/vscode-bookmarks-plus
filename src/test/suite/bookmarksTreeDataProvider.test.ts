@@ -1084,6 +1084,183 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 });
 
+// --- #115: "Toggle Show Full Path" ---------------------------------------------------------
+//
+// Adds `provider.getShowFullPath()` / `provider.setShowFullPath(boolean)`, mirroring the existing
+// `getGroupMode()` / `setGroupMode()` pair exactly (default off, in-memory flag, no store
+// mutation). `src/bookmarksTreeDataProvider.ts` does not have these members yet, so this whole
+// suite — and every suite below it in this file — is expected to fail to compile until they are
+// added, matching this file's own precedent for introducing new provider API (see the header
+// comments above the #95 and #108 suites).
+//
+// Design decisions this test-implementer is pinning (none of these are stated by issue #115
+// itself, so flag them for router/implementer confirmation):
+//
+//   1. Slot: the relative path replaces `TreeItem.label`, never `TreeItem.description`. The
+//      "descriptions" suite above already pins `description` to the repo-name badge / "missing"
+//      badge, so `label` is the only free slot — using `description` would contradict tests this
+//      implementer cannot edit. See "does not displace" tests below for the explicit AC-2 pin.
+//   2. Path separator: labels always use `/`, even on Windows (`path.relative` would otherwise
+//      yield `src\index.ts` on a Windows CI/dev box). Assert the POSIX form explicitly.
+//   3. Fallback rule is per-URI, not per-scope: "no workspace root to be relative to" means the
+//      bookmark's own URI falls outside every current `getWorkspaceFolders()` entry — checked with
+//      the same `getWorkspaceFolders` DI seam the T9 suite above already uses (an *empty* or
+//      *undefined* folder list, or a URI outside every folder, all count as "no root"). A
+//      global-scoped bookmark *inside* a workspace folder still gets a relative path; a
+//      workspace-scoped bookmark *outside* every folder still falls back to filename-only. The
+//      fallback display is filename-only (the pre-#115 baseline), not the absolute path.
+//   4. Persistence seam (AC: "Toggle state persists across window reloads, matching existing
+//      toggleGroupByRepo persistence behavior"): no test anywhere in this suite (checked) actually
+//      exercises `groupMode` surviving a reload — `registerViewCommands` is only ever exercised
+//      with a bare `{ subscriptions }` stub context (see commands.test.ts), so there is nothing to
+//      literally mirror. This test-implementer invents the minimal seam instead: an *optional 7th
+//      constructor argument*, `viewState?: vscode.Memento` (after `recentlyViewed`), matching this
+//      file's existing convention of additive optional DI params (`globalStore`,
+//      `getWorkspaceFolders`, `suggestions`, `recentlyViewed`). `setShowFullPath()` writes through
+//      to `viewState` (key/shape left to the implementer); the constructor reads the persisted
+//      value back if `viewState` is supplied. Omitting `viewState` must keep working exactly like
+//      today (in-memory only, default off) — every existing call site above passes none of the new
+//      args and must keep compiling and behaving unchanged.
+
+suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
+  test('defaults to off', async () => {
+    const { provider } = makeProvider();
+    assert.strictEqual(provider.getShowFullPath(), false);
+  });
+
+  test('sanity: toggle off keeps the pre-#115 filename-only label unchanged', async () => {
+    const { store, provider } = makeProvider();
+    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'index.ts');
+  });
+
+  test('toggle on: label becomes the path relative to the workspace root, using "/" separators', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'src/index.ts');
+  });
+
+  test('toggle on + Group by Repo: relative-path label has no duplicated repo-name prefix (AC-2)', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
+    provider.setGroupMode('byRepo');
+    provider.setShowFullPath(true);
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+
+    const roots = await provider.getChildren();
+    const repoGroup = roots.find((n) => n.kind === 'repoGroup' && (n as { label: string }).label === 'repo-a')!;
+    assert.ok(repoGroup, 'expected a repo-a group to drill into');
+    const children = await provider.getChildren(repoGroup);
+    assert.strictEqual(children.length, 1);
+    const treeItem = await provider.getTreeItem(children[0]);
+
+    assert.strictEqual(treeItem.label, 'src/index.ts');
+    assert.ok(
+      !(treeItem.label as string).startsWith('repo-a'),
+      'the relative-path label must not repeat the repo-name prefix the Group-by-Repo grouping already shows'
+    );
+  });
+
+  test('toggle on does not displace the repo-name description badge', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'src/index.ts');
+    assert.strictEqual(treeItem.description, 'repo-a', 'the repo-name description badge must survive the full-path toggle');
+  });
+
+  test('toggle on does not displace the "missing" description badge', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: false }), () => folders);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/gone.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.description, 'missing', 'the "missing" badge must survive the full-path toggle');
+  });
+
+  test('toggle on, no workspace root available (folders undefined): falls back to filename-only (D-115.3)', async () => {
+    const { store, provider } = makeProviderWithGlobal(undefined, () => undefined);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///anywhere/index.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'index.ts');
+  });
+
+  test('toggle on, empty workspace folder list: falls back to filename-only', async () => {
+    const { store, provider } = makeProviderWithGlobal(undefined, () => []);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///anywhere/index.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'index.ts');
+  });
+
+  test('toggle on: a global-scoped bookmark inside a current workspace folder still gets a relative-path label (fallback is per-URI, not per-scope)', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const item = await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/util.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+
+    assert.strictEqual(treeItem.label, 'src/util.ts');
+  });
+
+  test('toggle on: a workspace-scoped bookmark outside every workspace folder falls back to filename-only', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const item = await store.addItem({ type: 'file', uri: 'file:///elsewhere/outside.ts' });
+
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+
+    assert.strictEqual(treeItem.label, 'outside.ts');
+  });
+
+  test('setShowFullPath persists through an optional viewState memento, read back by a freshly constructed provider (simulated reload)', async () => {
+    const viewState = new FakeMemento();
+    const store = new BookmarkStore(new FakeMemento());
+    const cache = new FsGitCache(async () => ({ exists: true }));
+
+    const provider1 = new BookmarksTreeDataProvider(store, cache, undefined, undefined, undefined, undefined, viewState);
+    assert.strictEqual(provider1.getShowFullPath(), false);
+    provider1.setShowFullPath(true);
+    assert.strictEqual(provider1.getShowFullPath(), true);
+
+    // Simulated reload: a brand-new provider instance over the *same* viewState memento (a fresh
+    // provider over a fresh memento, by contrast, must come back false — checked below).
+    const provider2 = new BookmarksTreeDataProvider(store, cache, undefined, undefined, undefined, undefined, viewState);
+    assert.strictEqual(
+      provider2.getShowFullPath(),
+      true,
+      'a freshly constructed provider must read the persisted toggle state back from viewState'
+    );
+  });
+
+  test('omitting viewState leaves the toggle in-memory only — no persistence, no throw (regression guard)', async () => {
+    const { provider } = makeProvider(); // the pre-#115 constructor call shape, unchanged
+    provider.setShowFullPath(true);
+    assert.strictEqual(provider.getShowFullPath(), true, 'in-memory toggling must still work with no viewState supplied');
+  });
+});
+
 // --- CodeRabbit finding (PR #103, bookmarksTreeDataProvider.ts review): stale persisted
 // suggestion URIs -------------------------------------------------------------------------------
 //

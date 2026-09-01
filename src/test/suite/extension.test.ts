@@ -42,6 +42,7 @@ suite('Extension activation', () => {
       'bookmarks.moveToCollection',
       'bookmarks.setDescription',
       'bookmarks.toggleGroupByRepo',
+      'bookmarks.toggleShowFullPath', // #115: Toggle Show Full Path, registered alongside toggleGroupByRepo
       'bookmarks.refresh',
       'bookmarks.addFileGlobal',
       'bookmarks.addFolderGlobal',
