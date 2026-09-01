@@ -31,10 +31,43 @@ jobs:
       - name: Run tests
         run: xvfb-run -a npm test
 
-      - name: Install mcp-server dependencies
+  # Issue #66 / T4 (plan docs/superpowers/plans/2026-08-30-publish-mcp-server-to-npm.md,
+  # §6 T4, D9 = Option B): separate job (not a matrix on `test` above) because
+  # the extension's own steps use xvfb-run, which is Linux-only and cannot run
+  # on windows-latest. windows-latest closes the isEntrypoint() Windows
+  # coverage gap for the npx/global-install shim (§4 E2, §8).
+  mcp-server:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20.x'
+          cache: npm
+          cache-dependency-path: mcp-server/package-lock.json
+
+      - name: Install dependencies
         working-directory: mcp-server
         run: npm ci
 
+      # T4 specific 1: lint and the plain unit-test run stay on both legs
+      # (no `if:` conditions) rather than ubuntu-only. Decision recorded here
+      # per the plan's requirement to make this explicit: the base suite is
+      # fast (~10s, no network) and lint is cheap, so a uniform matrix is
+      # simpler and more robust than a partial one with implicit skips.
+      # Verified locally on Windows 11 / Node 20 before enabling both legs:
+      # `npm test` -> 117 tests, 116 pass, 1 skip (the expected packaging.test.ts
+      # self-skip), 0 fail, ~11s -- not just reasoned as cheap.
       - name: Lint mcp-server
         working-directory: mcp-server
         run: npm run lint
@@ -42,3 +75,21 @@ jobs:
       - name: Test mcp-server
         working-directory: mcp-server
         run: npm test
+
+      - name: Build mcp-server
+        working-directory: mcp-server
+        run: npm run build
+
+      - name: Verify pack contents
+        working-directory: mcp-server
+        run: npm run verify-pack
+
+      # T4 specific 1 continued: both matrix legs run this -- that is the
+      # whole point of the windows-latest leg (D9-B, closing the
+      # isEntrypoint() Windows coverage gap). Must be invoked via the npm
+      # script, not a direct `node --test` path: the test self-skips unless
+      # `npm_lifecycle_event === 'test:packaging'` (see
+      # mcp-server/test/packaging.test.ts's header comment).
+      - name: Packaging smoke test (npx entrypoint)
+        working-directory: mcp-server
+        run: npm run test:packaging
