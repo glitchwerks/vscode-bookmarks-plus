@@ -18,8 +18,9 @@ jobs:
 
     steps:
       - name: Guard against non-extension tags
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG=${{ inputs.tag || github.ref_name }}
           if [[ ! "$TAG" =~ ^v[0-9] ]]; then
             echo "::error::Tag '$TAG' does not match the extension-release pattern ^v[0-9] -- refusing to run the VSIX publish workflow"
             exit 1
@@ -46,8 +47,9 @@ jobs:
         run: xvfb-run -a npm test
 
       - name: Derive channel
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG=${{ inputs.tag || github.ref_name }}
           VERSION=${TAG#v}
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           if [ $((MINOR % 2)) -eq 0 ]; then
@@ -60,7 +62,7 @@ jobs:
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
 
       - name: Publish
-        run: npm run publish:${{ env.CHANNEL }}
+        run: npm run "publish:$CHANNEL"
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
