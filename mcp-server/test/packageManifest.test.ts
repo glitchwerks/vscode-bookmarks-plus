@@ -192,14 +192,34 @@ test('the `build` script never invokes copy-test-fixtures.mjs (T1 constraint 3.1
 });
 
 test('the `test` script invokes copy-test-fixtures.mjs', () => {
-  // Substring check only, deliberately: this project's `test` script also
-  // has a separately-tracked, in-flight fix to its `node --test` invocation
-  // args that is out of this contract's scope -- this assertion must not
-  // pin the rest of that command's shape.
+  // Substring check only, deliberately: this assertion must not pin the
+  // rest of the command's shape (see the sibling glob-metacharacter test
+  // below for the `node --test` argument itself).
   const scripts = readManifest().scripts ?? {};
   assert.ok(
     typeof scripts.test === 'string' && scripts.test.includes('copy-test-fixtures.mjs'),
     'fixtures must still reach dist/test/fixtures via the `test` script after the split ' +
       '(scripts/copy-test-fixtures.mjs, invoked from `test`, not `build`)',
+  );
+});
+
+test('the `test` script\'s `node --test` argument is not a quoted glob (PR #113 CI regression)', () => {
+  // Node's `--test` CLI flag only glob-expands a quoted pattern like
+  // "dist/test/**/*.test.js" on Node 21+; on Node 18/20 (what CI's
+  // actions/setup-node@v4 pins via node-version: '20.x') the shell passes
+  // the quoted string through literally, `--test` treats it as a literal
+  // path, finds no such file, and the whole `npm test` step fails with
+  // "Could not find '.../dist/test/**/*.test.js'" -- see PR #113 / issue
+  // #66, CI run 33346984629. The fix is the directory form (`node --test
+  // dist/test`), which both Node 18/20 and 21+ discover correctly. This
+  // test pins that shape so the quoted glob cannot silently return.
+  const scripts = readManifest().scripts ?? {};
+  const testScript = scripts.test ?? '';
+  const match = testScript.match(/node --test (\S+)/);
+  assert.ok(match, 'the `test` script must invoke `node --test <arg>`');
+  const testArg = match![1];
+  assert.ok(
+    !/[*"]/.test(testArg),
+    `the \`node --test\` argument must not be a quoted glob (Node <21 does not expand it) -- got ${JSON.stringify(testArg)}`,
   );
 });
