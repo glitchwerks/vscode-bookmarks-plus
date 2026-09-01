@@ -52,18 +52,21 @@
     ],
     "menus": {
       "explorer/context": [
-        { "command": "bookmarks.addFile", "when": "!explorerResourceIsFolder", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFile", "when": "!explorerResourceIsFolder && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
         { "command": "bookmarks.addFolder", "when": "explorerResourceIsFolder", "group": "bookmarksPlus" },
-        { "command": "bookmarks.addFileGlobal", "when": "!explorerResourceIsFolder", "group": "bookmarksPlus" },
-        { "command": "bookmarks.addFolderGlobal", "when": "explorerResourceIsFolder", "group": "bookmarksPlus" }
+        { "command": "bookmarks.addFileGlobal", "when": "!explorerResourceIsFolder && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFolderGlobal", "when": "explorerResourceIsFolder", "group": "bookmarksPlus" },
+        { "command": "bookmarks.remove", "when": "!explorerResourceIsFolder && resourcePath in bookmarksPlus.bookmarkedResourceUris", "group": "bookmarksPlus" }
       ],
       "editor/context": [
-        { "command": "bookmarks.addFile", "when": "resourceScheme == file", "group": "bookmarksPlus" },
-        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file", "group": "bookmarksPlus" }
+        { "command": "bookmarks.addFile", "when": "resourceScheme == file && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
+        { "command": "bookmarks.remove", "when": "resourceScheme == file && resourcePath in bookmarksPlus.bookmarkedResourceUris", "group": "bookmarksPlus" }
       ],
       "editor/title/context": [
-        { "command": "bookmarks.addFile", "when": "resourceScheme == file", "group": "bookmarksPlus" },
-        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file", "group": "bookmarksPlus" }
+        { "command": "bookmarks.addFile", "when": "resourceScheme == file && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
+        { "command": "bookmarks.addFileGlobal", "when": "resourceScheme == file && !(resourcePath in bookmarksPlus.bookmarkedResourceUris)", "group": "bookmarksPlus" },
+        { "command": "bookmarks.remove", "when": "resourceScheme == file && resourcePath in bookmarksPlus.bookmarkedResourceUris", "group": "bookmarksPlus" }
       ],
       "view/title": [
         { "command": "bookmarks.newCollection", "when": "view == bookmarksView", "group": "navigation@1" },

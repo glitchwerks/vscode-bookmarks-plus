@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { decorationUriKey } from './bookmarkDecorationProvider';
 import { BookmarkStore, DuplicateBookmarkError } from './bookmarkStore';
 import {
   BookmarkNode,
@@ -116,10 +117,40 @@ export function createPromoteRecentItemHandler(
   };
 }
 
+/**
+ * Removes the bookmark matching `uri` (issue #114: Explorer/editor-title context menu invokes
+ * `bookmarks.remove` with the right-clicked resource's `Uri`, which carries no explicit scope).
+ * Searches the workspace store before the global store and removes from whichever scope holds a
+ * match; a no-op if the resource isn't bookmarked in either. If the same resource happens to be
+ * bookmarked in both scopes at once, only the workspace copy is removed — that tie-break is
+ * intentionally unspecified by the issue, and this is a reasonable, simple default rather than a
+ * deliberately designed behavior.
+ */
+async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri): Promise<void> {
+  const targetKey = decorationUriKey(uri);
+  for (const store of [stores.workspace, stores.global]) {
+    const match = store.getAll().items.find((item) => {
+      try {
+        return decorationUriKey(vscode.Uri.parse(item.uri, true)) === targetKey;
+      } catch {
+        return false;
+      }
+    });
+    if (match) {
+      await store.removeItem(match.id);
+      return;
+    }
+  }
+}
+
 export function createRemoveHandler(
   stores: ScopedStores
-): (node: BookmarkNode) => Promise<void> {
-  return async (node: BookmarkNode): Promise<void> => {
+): (node: BookmarkNode | vscode.Uri) => Promise<void> {
+  return async (node: BookmarkNode | vscode.Uri): Promise<void> => {
+    if (node instanceof vscode.Uri) {
+      await removeByResourceUri(stores, node);
+      return;
+    }
     if (node.kind !== 'item') {
       return;
     }

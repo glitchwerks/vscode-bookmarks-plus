@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { BookmarkStore, OutputSink } from './bookmarkStore';
 import { BookmarkDecorationProvider } from './bookmarkDecorationProvider';
+import { BookmarkContextKeyManager } from './bookmarkContextKeys';
 import {
   MIRROR_RELATIVE_PATH,
   WorkspaceMirrorFile,
@@ -348,6 +349,13 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.registerFileDecorationProvider(decorationProvider),
     onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
   });
+
+  // #114: keeps BOOKMARKED_RESOURCE_CONTEXT_KEY current so the Explorer/editor context menus can
+  // show "Remove Bookmark" instead of "Add Bookmark" for an already-bookmarked resource.
+  const contextKeyManager = new BookmarkContextKeyManager({
+    setContext: (key, value) => vscode.commands.executeCommand('setContext', key, value)
+  });
+  contextKeyManager.wire([store, globalStore]);
 
   const recentItemsTrackerDeps = {
     getTabGroups: () => vscode.window.tabGroups,
