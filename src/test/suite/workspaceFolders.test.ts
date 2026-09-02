@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { isInsideWorkspace } from '../../workspaceFolders';
+import { getWorkspaceRelativePath, isInsideWorkspace } from '../../workspaceFolders';
 
 /**
  * Builds a `vscode.WorkspaceFolder`-shaped fixture. `index` defaults to the position implied by
@@ -159,5 +159,27 @@ suite('workspaceFolders.isInsideWorkspace', () => {
   test('a completely unrelated single-folder workspace is outside', () => {
     const root = vscode.Uri.file('/workspace/project');
     assert.strictEqual(isInsideWorkspace(vscode.Uri.file('/other/place/file.ts'), [folder(root)]), false);
+  });
+});
+
+suite('workspaceFolders.getWorkspaceRelativePath', () => {
+  // --- #118: nested workspace roots (a multi-root workspace where one folder is itself a
+  // descendant of another, e.g. both `/workspace` and `/workspace/repo-a` are open) must resolve
+  // to the longest-prefix (most specific/deepest) matching root, regardless of the order the
+  // folders happen to appear in `vscode.workspace.workspaceFolders`. A bookmark under the nested
+  // child root satisfies the segment-prefix test against BOTH roots, so "first match wins" is not
+  // sufficient — the fix must compare match length across all candidates.
+  test('nested roots, parent listed first: resolves relative to the deepest (child) root', () => {
+    const parent = folder(vscode.Uri.file('/workspace'), 'workspace', 0);
+    const child = folder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 1);
+    const bookmark = vscode.Uri.file('/workspace/repo-a/foo.ts');
+    assert.strictEqual(getWorkspaceRelativePath(bookmark, [parent, child]), 'foo.ts');
+  });
+
+  test('nested roots, child listed first: resolves relative to the deepest (child) root', () => {
+    const child = folder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0);
+    const parent = folder(vscode.Uri.file('/workspace'), 'workspace', 1);
+    const bookmark = vscode.Uri.file('/workspace/repo-a/foo.ts');
+    assert.strictEqual(getWorkspaceRelativePath(bookmark, [child, parent]), 'foo.ts');
   });
 });

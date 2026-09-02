@@ -69,16 +69,27 @@ export function getWorkspaceRelativePath(
   const uriSegments = uri.path.split('/').filter((segment) => segment.length > 0);
   const uriSegmentsLower = uriSegments.map((segment) => segment.toLowerCase());
 
+  // #118: nested workspace roots (e.g. both `/workspace` and `/workspace/repo-a` open) can both
+  // satisfy the segment-prefix test for a bookmark under the child root. Track the best (longest
+  // segment-prefix / most specific) match across all folders instead of returning on the first
+  // hit, so the result is independent of folder array order. Ties (equal-length matches) keep the
+  // first one encountered — defensive only, as distinct real filesystem paths won't tie.
+  let bestMatchLength = -1;
+
   for (const folder of folders) {
     const folderUri = folder.uri;
     if (uri.scheme !== folderUri.scheme || uri.authority !== folderUri.authority) {
       continue;
     }
     const folderSegments = pathSegments(folderUri.path);
-    if (isSegmentPrefix(folderSegments, uriSegmentsLower)) {
-      return uriSegments.slice(folderSegments.length).join('/');
+    if (isSegmentPrefix(folderSegments, uriSegmentsLower) && folderSegments.length > bestMatchLength) {
+      bestMatchLength = folderSegments.length;
     }
   }
 
-  return undefined;
+  if (bestMatchLength === -1) {
+    return undefined;
+  }
+
+  return uriSegments.slice(bestMatchLength).join('/');
 }
