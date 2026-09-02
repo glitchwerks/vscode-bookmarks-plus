@@ -27,6 +27,10 @@ See `docs/superpowers/specs/` for the design spec.
   built-in Explorer tree, so you can spot what's bookmarked without opening the Bookmarks Plus
   panel. Covers both workspace and global bookmarks, and updates live as bookmarks change. On by
   default; turn it off with the `bookmarksPlus.explorerDecoration.enabled` setting.
+- Right-clicking an already-bookmarked file — in the Explorer or the editor tab/title context
+  menu — shows **Remove Bookmark** instead of **Add Bookmark**, and removes the bookmark directly
+  from whichever scope (workspace or global) it's bookmarked in. A non-bookmarked file still shows
+  **Add Bookmark** as before. Folders keep the existing **Add Bookmark** behavior either way.
 - **Add to Workspace:** a global folder bookmark that isn't already inside the current workspace
   gets an inline "Add to Workspace" action, which adds it as a new workspace root. This is VS
   Code's own `updateWorkspaceFolders`, so it may restart the extension host — most likely when

@@ -204,6 +204,72 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   // here.
 });
 
+// #114: `bookmarks.remove` must become reachable from the Explorer / editor-title context menus,
+// which invoke a command with a `vscode.Uri` argument (the right-clicked resource), not a
+// `BookmarkNode` (the tree view's own argument shape). Per the issue's technical notes this is the
+// *same* command id as the tree view's remove — so `createRemoveHandler`'s returned handler must
+// accept either shape. These tests pin the Uri-argument branch of that contract; the pre-existing
+// `BookmarkNode`-argument branch is covered by the suite above and is unchanged.
+//
+// Scope resolution: a resource Uri carries no explicit scope, so the handler must search both
+// stores. These tests only cover the disjoint cases (bookmarked in exactly one scope) — which
+// scope wins when the *same* uri is bookmarked in both is left unspecified by the issue and is
+// deliberately not asserted here.
+suite('commands - remove (resource URI from Explorer/editor context, #114)', () => {
+  test('removes the matching bookmark when invoked with a workspace-bookmarked resource Uri', async () => {
+    const stores = makeScopedStores();
+    const uri = vscode.Uri.file('/workspace/a.txt');
+    await stores.workspace.addItem({ type: 'file', uri: uri.toString() });
+    const handler = createRemoveHandler(stores);
+
+    await handler(uri);
+
+    assert.strictEqual(stores.workspace.getAll().items.length, 0);
+  });
+
+  test('removes only the global bookmark when the resource is bookmarked globally; workspace store untouched', async () => {
+    const workspaceMemento = new FakeMemento();
+    const globalMemento = new FakeMemento();
+    const workspace = new BookmarkStore(workspaceMemento);
+    const global = new BookmarkStore(globalMemento);
+    const uri = vscode.Uri.file('/global/a.txt');
+    await global.addItem({ type: 'file', uri: uri.toString() });
+    const workspaceBefore = snapshotStore(workspace, workspaceMemento);
+    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+
+    await handler(uri);
+
+    assert.strictEqual(global.getAll().items.length, 0, 'the global bookmark for this resource must be removed');
+    assertUntouched(workspace, workspaceMemento, workspaceBefore, 'workspace');
+  });
+
+  test('is a no-op and does not throw when the given resource Uri is not bookmarked in any scope', async () => {
+    const stores = makeScopedStores();
+    const uri = vscode.Uri.file('/workspace/not-bookmarked.txt');
+    const handler = createRemoveHandler(stores);
+
+    await assert.doesNotReject(() => handler(uri));
+
+    assert.strictEqual(stores.workspace.getAll().items.length, 0);
+    assert.strictEqual(stores.global.getAll().items.length, 0);
+  });
+
+  test('removes a folder bookmark matching the given resource Uri, leaving unrelated items untouched', async () => {
+    const stores = makeScopedStores();
+    const targetUri = vscode.Uri.file('/workspace/dir');
+    const otherUri = vscode.Uri.file('/workspace/other.txt');
+    await stores.workspace.addItem({ type: 'folder', uri: targetUri.toString() });
+    const other = await stores.workspace.addItem({ type: 'file', uri: otherUri.toString() });
+    const handler = createRemoveHandler(stores);
+
+    await handler(targetUri);
+
+    const remaining = stores.workspace.getAll().items;
+    assert.strictEqual(remaining.length, 1);
+    assert.strictEqual(remaining[0].id, other.id);
+  });
+});
+
 // T4 (#55 D2) scope-routing note: `createAddFileHandler` / `createAddFolderHandler` take a
 // vscode.Uri, not a BookmarkNode, so there is no `node.scope` to route on — they stay bound to a
 // single store here, and #55's global-add commands (bookmarks.addFileGlobal /
