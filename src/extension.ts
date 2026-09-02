@@ -353,10 +353,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // #114: keeps BOOKMARKED_RESOURCE_CONTEXT_KEY current so the Explorer/editor context menus can
   // show "Remove Bookmark" instead of "Add Bookmark" for an already-bookmarked resource.
+  // #120: also keeps the per-scope workspace/global context keys current, so "Add Bookmark" and
+  // "Add Bookmark (Global)" visibility each depend only on that scope's own bookmark state, not
+  // the merged union `wire()` publishes.
   const contextKeyManager = new BookmarkContextKeyManager({
     setContext: (key, value) => vscode.commands.executeCommand('setContext', key, value)
   });
   contextKeyManager.wire([store, globalStore]);
+  contextKeyManager.wireScoped({ workspace: store, global: globalStore });
 
   const recentItemsTrackerDeps = {
     getTabGroups: () => vscode.window.tabGroups,

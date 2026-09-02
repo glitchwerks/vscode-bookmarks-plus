@@ -11,6 +11,17 @@ import { BookmarkStore } from './bookmarkStore';
 export const BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.bookmarkedResourceUris';
 
 /**
+ * Issue #120: per-scope counterparts to `BOOKMARKED_RESOURCE_CONTEXT_KEY`. That key publishes the
+ * *union* of the workspace and global stores' bookmarked resources, which `bookmarks.addFile` and
+ * `bookmarks.addFileGlobal` both gated on — incorrectly suppressing one scope's "Add Bookmark" menu
+ * item whenever a resource was bookmarked in the *other* scope only. These two keys instead publish
+ * each store's bookmarked resources independently, so each scope's "Add" visibility depends only on
+ * that scope's own bookmark state.
+ */
+export const WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.workspaceBookmarkedResourceUris';
+export const GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.globalBookmarkedResourceUris';
+
+/**
  * Builds the union of bookmarked-resource keys across one or more stores' item lists (workspace
  * ∪ global). Unlike `decorationUriKey` (the #109 star-badge normalization), this key is compared
  * by VS Code itself — via `resourcePath in <key>` — against its own live `resourcePath`
@@ -72,11 +83,21 @@ export interface BookmarkContextKeyDeps {
  */
 export class BookmarkContextKeyManager {
   private keys: string[] = [];
+  private workspaceKeys: string[] = [];
+  private globalKeys: string[] = [];
 
   constructor(private readonly deps: BookmarkContextKeyDeps) {}
 
   getBookmarkedResourceKeys(): string[] {
     return this.keys;
+  }
+
+  getWorkspaceBookmarkedResourceKeys(): string[] {
+    return this.workspaceKeys;
+  }
+
+  getGlobalBookmarkedResourceKeys(): string[] {
+    return this.globalKeys;
   }
 
   wire(stores: BookmarkStore[]): void {
@@ -88,5 +109,27 @@ export class BookmarkContextKeyManager {
     for (const store of stores) {
       store.onBookmarksChanged(publish);
     }
+  }
+
+  /**
+   * Issue #120: wires the workspace and global stores to their own independent context keys
+   * (`WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY` / `GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY`), each
+   * republished only when that scope's store changes — never the merged union `wire()` produces.
+   * This is additive to `wire()`, which callers keep using for the existing merged key (consumed by
+   * `bookmarks.remove`'s `when` clause, where union semantics are still correct).
+   */
+  wireScoped(stores: { workspace: BookmarkStore; global: BookmarkStore }): void {
+    const publishWorkspace = (): void => {
+      this.workspaceKeys = buildBookmarkedResourceKeys([stores.workspace.getAll().items]);
+      void this.deps.setContext(WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY, this.workspaceKeys);
+    };
+    const publishGlobal = (): void => {
+      this.globalKeys = buildBookmarkedResourceKeys([stores.global.getAll().items]);
+      void this.deps.setContext(GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY, this.globalKeys);
+    };
+    publishWorkspace();
+    publishGlobal();
+    stores.workspace.onBookmarksChanged(publishWorkspace);
+    stores.global.onBookmarksChanged(publishGlobal);
   }
 }
