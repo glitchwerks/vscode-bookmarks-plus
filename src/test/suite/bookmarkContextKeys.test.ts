@@ -26,6 +26,15 @@ import { FakeMemento, FakeMirror, FakeOutput } from './fixtures';
 // reports as bookmarked. Reusing that existing, already-tested normalization (fsPath on a `file:`
 // scheme, full `toString()` otherwise, win32 drive-letter/escaping normalization) keeps the two
 // #109/#114 features consistent without re-deriving the same edge cases twice.
+//
+// #119 amendment: that parity requirement is superseded for the win32 case. `decorationUriKey`'s
+// win32 branch fully lower-cases `fsPath` — a normalization that only needs to hold between two
+// values *we* control (the decoration map's own keys). This context array's other comparison side
+// is VS Code's own live `resourcePath` when-clause value, which the `in` operator compares by
+// strict string equality and which VS Code never lower-cases beyond `Uri.fsPath`'s own built-in
+// drive-letter normalization. So `buildBookmarkedResourceKeys` must key `file:` URIs by plain,
+// unmodified `uri.fsPath` — never platform-gated — even though that now diverges from
+// `decorationUriKey` on win32. See the `#119` tests below, which pin the corrected contract.
 
 function item(overrides: Partial<BookmarkItem> = {}): BookmarkItem {
   return {
@@ -93,6 +102,47 @@ suite('buildBookmarkedResourceKeys (#114)', () => {
       [item({ id: 'g', uri: uri.toString() })]
     ]);
     assert.deepStrictEqual(keys, [decorationUriKey(uri)]);
+  });
+
+  // #119 regression: package.json's `when` clauses compare this array's entries against VS Code's
+  // own live `resourcePath` context value with strict string equality (`resourcePath in
+  // bookmarksPlus.bookmarkedResourceUris`) — and `resourcePath` is never lower-cased by VS Code
+  // beyond the drive-letter normalization `Uri.fsPath` itself already does. `decorationUriKey`'s
+  // win32 branch, by contrast, lower-cases the *entire* fsPath — a normalization that makes sense
+  // for the #109 star-badge map (where both sides of the comparison are ours to normalize) but not
+  // here, where the other side of the `in` comparison is VS Code's own unmodified value. Keying
+  // this array via `decorationUriKey` therefore breaks the Windows "Remove Bookmark" menu item for
+  // any bookmark whose path has an uppercase letter past the drive letter. The fix: key `file:`
+  // URIs by plain `uri.fsPath`, unconditionally — never platform-gated, never lower-cased — so this
+  // stub (forcing the win32 branch open on this suite's actual `ubuntu-latest` CI host) must have
+  // no effect on the result once fixed.
+  test('#119: keys a file: URI by its exact fsPath casing, not decorationUriKey\'s win32 full lower-casing', () => {
+    const uri = vscode.Uri.file('/workspace/MyFile.txt');
+    const expectedKey = uri.fsPath;
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true, enumerable: true });
+    let keys: string[];
+    try {
+      keys = buildBookmarkedResourceKeys([[item({ uri: uri.toString() })]]);
+    } finally {
+      Object.defineProperty(process, 'platform', {
+        value: originalPlatform,
+        configurable: true,
+        enumerable: true
+      });
+    }
+
+    assert.deepStrictEqual(
+      keys,
+      [expectedKey],
+      'the key must preserve fsPath casing exactly, even when process.platform is win32'
+    );
+  });
+
+  test('#119: a non-file-scheme uri still falls back to its full toString(), independent of the file-scheme keying change', () => {
+    const uri = vscode.Uri.parse('untitled:Untitled-1', true);
+    const keys = buildBookmarkedResourceKeys([[item({ uri: uri.toString() })]]);
+    assert.deepStrictEqual(keys, [uri.toString()]);
   });
 });
 
