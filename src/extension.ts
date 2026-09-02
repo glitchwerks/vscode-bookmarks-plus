@@ -327,7 +327,8 @@ export function activate(context: vscode.ExtensionContext): void {
     globalStore,
     undefined,
     suggestionsSource,
-    recentlyViewedSource
+    recentlyViewedSource,
+    context.workspaceState
   );
 
   const treeView = vscode.window.createTreeView('bookmarksView', {

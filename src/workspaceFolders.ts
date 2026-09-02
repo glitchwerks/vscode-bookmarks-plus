@@ -48,3 +48,48 @@ export function isInsideWorkspace(
     return isSegmentPrefix(pathSegments(folderUri.path), uriSegments);
   });
 }
+
+/**
+ * #115: the path of `uri` relative to whichever workspace folder contains it, joined with `/`
+ * (POSIX-style, unconditionally — never `path.sep`, so the label is identical on Windows and
+ * POSIX hosts). Returns `undefined` — the "no root to be relative to" case — when `uri` is not
+ * inside any of `folders` (including when `folders` is `undefined` or empty), matching
+ * `isInsideWorkspace`'s own case-insensitive, segment-boundary comparison so the two stay
+ * consistent. Case is preserved in the returned path (unlike `isInsideWorkspace`'s internal
+ * comparison, which lowercases only for matching).
+ */
+export function getWorkspaceRelativePath(
+  uri: vscode.Uri,
+  folders: readonly vscode.WorkspaceFolder[] | undefined
+): string | undefined {
+  if (!folders || folders.length === 0) {
+    return undefined;
+  }
+
+  const uriSegments = uri.path.split('/').filter((segment) => segment.length > 0);
+  const uriSegmentsLower = uriSegments.map((segment) => segment.toLowerCase());
+
+  // #118: nested workspace roots (e.g. both `/workspace` and `/workspace/repo-a` open) can both
+  // satisfy the segment-prefix test for a bookmark under the child root. Track the best (longest
+  // segment-prefix / most specific) match across all folders instead of returning on the first
+  // hit, so the result is independent of folder array order. Ties (equal-length matches) keep the
+  // first one encountered — defensive only, as distinct real filesystem paths won't tie.
+  let bestMatchLength = -1;
+
+  for (const folder of folders) {
+    const folderUri = folder.uri;
+    if (uri.scheme !== folderUri.scheme || uri.authority !== folderUri.authority) {
+      continue;
+    }
+    const folderSegments = pathSegments(folderUri.path);
+    if (isSegmentPrefix(folderSegments, uriSegmentsLower) && folderSegments.length > bestMatchLength) {
+      bestMatchLength = folderSegments.length;
+    }
+  }
+
+  if (bestMatchLength === -1) {
+    return undefined;
+  }
+
+  return uriSegments.slice(bestMatchLength).join('/');
+}

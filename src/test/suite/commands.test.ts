@@ -971,6 +971,55 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
   });
 });
 
+// --- #115: "Toggle Show Full Path" — a view-title-bar toggle mirroring toggleGroupByRepo's shape
+// exactly (new command id `bookmarks.toggleShowFullPath`, wired through `registerViewCommands`,
+// flips a flag on the provider, and triggers a refresh). See bookmarksTreeDataProvider.test.ts's
+// "show full path (#115)" suite for the label/description rendering and persistence contract;
+// this suite only proves the command plumbing, the same split `toggleGroupByRepo` already has
+// between this file (wiring) and the provider's own tests (rendering).
+suite('commands - view (toggleShowFullPath) (#115)', () => {
+  test('toggleShowFullPath flips the full-path display flag, mirroring toggleGroupByRepo', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const store = new BookmarkStore(new FakeMemento());
+      const cache = new FsGitCache(async () => ({ exists: true }));
+      const provider = new BookmarksTreeDataProvider(store, cache);
+      const subscriptions: vscode.Disposable[] = [];
+      registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
+
+      try {
+        assert.strictEqual(provider.getShowFullPath(), false, 'the toggle must default to off');
+        await vscode.commands.executeCommand('bookmarks.toggleShowFullPath');
+        assert.strictEqual(provider.getShowFullPath(), true);
+        await vscode.commands.executeCommand('bookmarks.toggleShowFullPath');
+        assert.strictEqual(provider.getShowFullPath(), false);
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+
+  test('toggleShowFullPath triggers a tree refresh (onDidChangeTreeData), same as toggleGroupByRepo', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const store = new BookmarkStore(new FakeMemento());
+      const cache = new FsGitCache(async () => ({ exists: true }));
+      const provider = new BookmarksTreeDataProvider(store, cache);
+      const subscriptions: vscode.Disposable[] = [];
+      registerViewCommands({ subscriptions } as unknown as vscode.ExtensionContext, provider);
+
+      try {
+        let redraws = 0;
+        provider.onDidChangeTreeData(() => {
+          redraws++;
+        });
+        await vscode.commands.executeCommand('bookmarks.toggleShowFullPath');
+        assert.strictEqual(redraws, 1, 'toggling full-path display must trigger a refresh, same as toggleGroupByRepo');
+      } finally {
+        subscriptions.forEach((d) => d.dispose());
+      }
+    });
+  });
+});
+
 suite('commands - setDescription', () => {
   function itemNode(item: BookmarkItem): BookmarkNode {
     return { kind: 'item', item, scope: 'workspace' };

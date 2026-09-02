@@ -473,6 +473,9 @@ export function registerViewCommands(
         provider.getGroupMode() === 'default' ? 'byRepo' : 'default'
       );
     }),
+    vscode.commands.registerCommand('bookmarks.toggleShowFullPath', () => {
+      provider.setShowFullPath(!provider.getShowFullPath());
+    }),
     vscode.commands.registerCommand('bookmarks.refresh', () => {
       provider.refresh();
     })

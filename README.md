@@ -13,6 +13,12 @@ See `docs/superpowers/specs/` for the design spec.
   is refused.
 - Organize bookmarks into collections; drag and drop to reorder or move between collections.
 - Group the view by git repository, with a dedicated "Unknown" group for anything unresolved.
+- **Toggle Show Full Path:** a view-title-bar button switches each bookmark's label between
+  filename-only (the default) and its path relative to the workspace root, using `/` separators.
+  Combines cleanly with Group by Repo — the relative path doesn't repeat the repo-name prefix the
+  grouping already shows. A bookmark outside every workspace folder (including global bookmarks
+  with no matching workspace root) falls back to filename-only. The toggle state persists across
+  window reloads.
 - Broken bookmarks (moved/deleted targets) show a warning icon instead of erroring.
 - Add an optional description to any bookmark or collection — shown on hover.
 - Workspace bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit
