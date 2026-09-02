@@ -6,6 +6,15 @@ import {
   BookmarkContextKeyDeps,
   BookmarkContextKeyManager
 } from '../../bookmarkContextKeys';
+// Namespace import (not a named import) so the not-yet-implemented #120 exports
+// (WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY / GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY) and the
+// not-yet-implemented BookmarkContextKeyManager scoped surface (wireScoped /
+// getWorkspaceBookmarkedResourceKeys / getGlobalBookmarkedResourceKeys) can be resolved dynamically
+// below without a compile-time failure on the missing exports/members — a compile error is not a
+// valid "red" for this suite (mirrors the existing convention in extension.test.ts's
+// `registerSuggestionsMaxItemsLiveReload` suite). The assertions inside `requireScopedContextKeys()`
+// and `requireScopedSurface()` are the intended failure mode until #120 adds these.
+import * as bookmarkContextKeysModule from '../../bookmarkContextKeys';
 import { decorationUriKey } from '../../bookmarkDecorationProvider';
 import { BookmarkData, BookmarkItem } from '../../types';
 import { BookmarkStore } from '../../bookmarkStore';
@@ -321,6 +330,291 @@ suite('BookmarkContextKeyManager (#114)', () => {
       calls.length,
       callsBefore,
       'an unchanged mirror echo must not produce a redundant context-value publish'
+    );
+  });
+});
+
+// Issue #120 regression: `wire()`/`getBookmarkedResourceKeys()` above (unchanged by this suite —
+// see the #114 suite immediately above) publish the *union* of every wired store's bookmarked
+// resources into a single context key. package.json's `when` clauses gate both
+// `bookmarks.addFile` (workspace-scope add) and `bookmarks.addFileGlobal` (global-scope add) off
+// that one merged key, so a file bookmarked in workspace scope only makes the merged key contain
+// it, which incorrectly suppresses "Add Bookmark (Global)" too (and symmetrically for a
+// global-only bookmark suppressing plain "Add Bookmark").
+//
+// Fix contract pinned here: `BookmarkContextKeyManager` must additionally expose a scoped surface
+// that computes and publishes two independent context-key sets — one from the workspace store
+// only, one from the global store only:
+//   - `WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY` = 'bookmarksPlus.workspaceBookmarkedResourceUris'
+//   - `GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY'   = 'bookmarksPlus.globalBookmarkedResourceUris'
+//   - `wireScoped({ workspace, global })` wires both stores, publishing each scope's key
+//     independently (mirroring `ScopedStores` in commands.ts, not `wire()`'s BookmarkStore[]).
+//   - `getWorkspaceBookmarkedResourceKeys()` / `getGlobalBookmarkedResourceKeys()` expose each
+//     scope's currently-published set.
+// This is additive to the existing `wire()` / `getBookmarkedResourceKeys()` surface, not a
+// replacement — those keep their #114 union behavior and their existing tests are left unchanged
+// above. See `extension.test.ts`'s "menus — per-scope bookmark context keys (issue #120)" suite for
+// the corresponding package.json `when`-clause assertions, which must agree with these exact key
+// name strings.
+suite('BookmarkContextKeyManager — per-scope context keys (#120)', () => {
+  const WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.workspaceBookmarkedResourceUris';
+  const GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.globalBookmarkedResourceUris';
+
+  interface RecordedSetContextCall {
+    key: string;
+    value: string[];
+  }
+
+  function makeDeps(): { deps: BookmarkContextKeyDeps; calls: RecordedSetContextCall[] } {
+    const calls: RecordedSetContextCall[] = [];
+    const deps: BookmarkContextKeyDeps = {
+      setContext: (key: string, value: string[]) => {
+        calls.push({ key, value: [...value] });
+      }
+    };
+    return { deps, calls };
+  }
+
+  /** Structural shape of the not-yet-implemented #120 scoped surface, accessed dynamically (see the
+   * namespace-import comment at the top of this file) so referencing it doesn't fail `tsc` before
+   * #120 lands. */
+  interface ScopedContextKeySurface {
+    wireScoped?: (stores: { workspace: BookmarkStore; global: BookmarkStore }) => void;
+    getWorkspaceBookmarkedResourceKeys?: () => string[];
+    getGlobalBookmarkedResourceKeys?: () => string[];
+  }
+
+  interface ScopedContextKeyModuleExports {
+    WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY?: string;
+    GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY?: string;
+  }
+
+  /** Asserts bookmarkContextKeys.ts exports the two pinned #120 context-key constants with the
+   * exact expected string values, and returns them. This is the intended clean "red" for this
+   * suite until #120 adds the exports. */
+  function requireScopedContextKeyConstants(): { workspaceKey: string; globalKey: string } {
+    const exported = bookmarkContextKeysModule as unknown as ScopedContextKeyModuleExports;
+    assert.strictEqual(
+      exported.WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY,
+      WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY,
+      'expected bookmarkContextKeys.ts to export WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY = ' +
+        `"${WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY}" (issue #120)`
+    );
+    assert.strictEqual(
+      exported.GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY,
+      GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY,
+      'expected bookmarkContextKeys.ts to export GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY = ' +
+        `"${GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY}" (issue #120)`
+    );
+    return {
+      workspaceKey: exported.WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY as string,
+      globalKey: exported.GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY as string
+    };
+  }
+
+  /** Asserts `manager` exposes the #120 scoped surface (wireScoped + both scoped getters) and
+   * returns it narrowed to non-optional members. This is the intended clean "red" for this suite
+   * until #120 adds these members to `BookmarkContextKeyManager`. */
+  function requireScopedSurface(manager: BookmarkContextKeyManager): Required<ScopedContextKeySurface> {
+    const scoped = manager as unknown as ScopedContextKeySurface;
+    assert.strictEqual(
+      typeof scoped.wireScoped,
+      'function',
+      'expected BookmarkContextKeyManager to expose wireScoped({ workspace, global }) (issue #120)'
+    );
+    assert.strictEqual(
+      typeof scoped.getWorkspaceBookmarkedResourceKeys,
+      'function',
+      'expected BookmarkContextKeyManager to expose getWorkspaceBookmarkedResourceKeys() (issue #120)'
+    );
+    assert.strictEqual(
+      typeof scoped.getGlobalBookmarkedResourceKeys,
+      'function',
+      'expected BookmarkContextKeyManager to expose getGlobalBookmarkedResourceKeys() (issue #120)'
+    );
+    return scoped as Required<ScopedContextKeySurface>;
+  }
+
+  test('bookmarkContextKeys.ts exports the two pinned per-scope context-key names', () => {
+    requireScopedContextKeyConstants();
+  });
+
+  test('wiring both scopes publishes each scope\'s own keys — not a merged union', async () => {
+    const { workspaceKey, globalKey } = requireScopedContextKeyConstants();
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const workspaceUri = vscode.Uri.file('/workspace/a.txt');
+    const globalUri = vscode.Uri.file('/home/user/b.txt');
+    await workspaceStore.addItem({ type: 'file', uri: workspaceUri.toString() });
+    await globalStore.addItem({ type: 'file', uri: globalUri.toString() });
+    const { deps, calls } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+
+    assert.deepStrictEqual(
+      scoped.getWorkspaceBookmarkedResourceKeys(),
+      [decorationUriKey(workspaceUri)],
+      'the workspace-scope getter must reflect only the workspace store\'s bookmarks'
+    );
+    assert.deepStrictEqual(
+      scoped.getGlobalBookmarkedResourceKeys(),
+      [decorationUriKey(globalUri)],
+      'the global-scope getter must reflect only the global store\'s bookmarks'
+    );
+
+    const workspaceCall = calls.find((call) => call.key === workspaceKey);
+    assert.ok(workspaceCall, `expected a setContext call publishing "${workspaceKey}"`);
+    assert.deepStrictEqual(
+      workspaceCall!.value,
+      [decorationUriKey(workspaceUri)],
+      `the published value for "${workspaceKey}" must contain only the workspace store's bookmarks`
+    );
+
+    const globalCall = calls.find((call) => call.key === globalKey);
+    assert.ok(globalCall, `expected a setContext call publishing "${globalKey}"`);
+    assert.deepStrictEqual(
+      globalCall!.value,
+      [decorationUriKey(globalUri)],
+      `the published value for "${globalKey}" must contain only the global store's bookmarks`
+    );
+  });
+
+  test('a file bookmarked in the workspace store only is absent from the global-scope key (must remain eligible for global-add)', async () => {
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const uri = vscode.Uri.file('/workspace/only-workspace.txt');
+    await workspaceStore.addItem({ type: 'file', uri: uri.toString() });
+    const { deps } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+
+    assert.deepStrictEqual(
+      scoped.getWorkspaceBookmarkedResourceKeys(),
+      [decorationUriKey(uri)],
+      'the workspace-scope key must contain the workspace-only bookmark'
+    );
+    assert.ok(
+      !scoped.getGlobalBookmarkedResourceKeys().includes(decorationUriKey(uri)),
+      'a workspace-only bookmark must NOT appear in the global-scope key — otherwise ' +
+        '"Add Bookmark (Global)" would be incorrectly suppressed for this resource (issue #120)'
+    );
+  });
+
+  test('a file bookmarked in the global store only is absent from the workspace-scope key (must remain eligible for workspace-add)', async () => {
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const uri = vscode.Uri.file('/home/user/only-global.txt');
+    await globalStore.addItem({ type: 'file', uri: uri.toString() });
+    const { deps } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+
+    assert.deepStrictEqual(
+      scoped.getGlobalBookmarkedResourceKeys(),
+      [decorationUriKey(uri)],
+      'the global-scope key must contain the global-only bookmark'
+    );
+    assert.ok(
+      !scoped.getWorkspaceBookmarkedResourceKeys().includes(decorationUriKey(uri)),
+      'a global-only bookmark must NOT appear in the workspace-scope key — otherwise plain ' +
+        '"Add Bookmark" would be incorrectly suppressed for this resource (issue #120)'
+    );
+  });
+
+  test('a file bookmarked in both scopes appears in both per-scope keys', async () => {
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const uri = vscode.Uri.file('/workspace/in-both.txt');
+    await workspaceStore.addItem({ type: 'file', uri: uri.toString() });
+    await globalStore.addItem({ type: 'file', uri: uri.toString() });
+    const { deps } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+
+    assert.deepStrictEqual(
+      scoped.getWorkspaceBookmarkedResourceKeys(),
+      [decorationUriKey(uri)],
+      'a resource bookmarked in both scopes must still appear in the workspace-scope key'
+    );
+    assert.deepStrictEqual(
+      scoped.getGlobalBookmarkedResourceKeys(),
+      [decorationUriKey(uri)],
+      'a resource bookmarked in both scopes must still appear in the global-scope key'
+    );
+  });
+
+  test('adding a global bookmark republishes only the global-scope key; the workspace-scope key/publish is unaffected', async () => {
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const workspaceUri = vscode.Uri.file('/workspace/a.txt');
+    await workspaceStore.addItem({ type: 'file', uri: workspaceUri.toString() });
+    const { deps, calls } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+    const { workspaceKey } = requireScopedContextKeyConstants();
+    const workspacePublishesBefore = calls.filter((call) => call.key === workspaceKey).length;
+
+    const globalUri = vscode.Uri.file('/home/user/b.txt');
+    await globalStore.addItem({ type: 'file', uri: globalUri.toString() });
+
+    assert.deepStrictEqual(
+      scoped.getWorkspaceBookmarkedResourceKeys(),
+      [decorationUriKey(workspaceUri)],
+      'adding a global bookmark must not change the workspace-scope key\'s contents'
+    );
+    assert.deepStrictEqual(
+      scoped.getGlobalBookmarkedResourceKeys(),
+      [decorationUriKey(globalUri)],
+      'the global-scope key must now reflect the newly added global bookmark'
+    );
+    const workspacePublishesAfter = calls.filter((call) => call.key === workspaceKey).length;
+    assert.strictEqual(
+      workspacePublishesAfter,
+      workspacePublishesBefore,
+      'adding a global bookmark must not trigger a redundant re-publish of the workspace-scope key'
+    );
+  });
+
+  test('removing a workspace bookmark republishes only the workspace-scope key; the global-scope key/publish is unaffected', async () => {
+    const workspaceStore = new BookmarkStore(new FakeMemento());
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const workspaceUri = vscode.Uri.file('/workspace/a.txt');
+    const workspaceItem = await workspaceStore.addItem({ type: 'file', uri: workspaceUri.toString() });
+    const globalUri = vscode.Uri.file('/home/user/b.txt');
+    await globalStore.addItem({ type: 'file', uri: globalUri.toString() });
+    const { deps, calls } = makeDeps();
+    const manager = new BookmarkContextKeyManager(deps);
+    const scoped = requireScopedSurface(manager);
+    scoped.wireScoped({ workspace: workspaceStore, global: globalStore });
+    const { globalKey } = requireScopedContextKeyConstants();
+    const globalPublishesBefore = calls.filter((call) => call.key === globalKey).length;
+
+    await workspaceStore.removeItem(workspaceItem.id);
+
+    assert.deepStrictEqual(
+      scoped.getWorkspaceBookmarkedResourceKeys(),
+      [],
+      'removing the workspace bookmark must clear the workspace-scope key'
+    );
+    assert.deepStrictEqual(
+      scoped.getGlobalBookmarkedResourceKeys(),
+      [decorationUriKey(globalUri)],
+      'removing a workspace bookmark must not change the global-scope key\'s contents'
+    );
+    const globalPublishesAfter = calls.filter((call) => call.key === globalKey).length;
+    assert.strictEqual(
+      globalPublishesAfter,
+      globalPublishesBefore,
+      'removing a workspace bookmark must not trigger a redundant re-publish of the global-scope key'
     );
   });
 });
