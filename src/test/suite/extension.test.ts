@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { BookmarkDecorationProvider } from '../../bookmarkDecorationProvider';
+import { BOOKMARKED_RESOURCE_CONTEXT_KEY } from '../../bookmarkContextKeys';
 import {
   handleWorkspaceFoldersChanged,
   registerBookmarkDecorationProvider,
@@ -1513,4 +1514,134 @@ suite('registerSuggestionsMaxItemsLiveReload (#102)', () => {
       'an unchanged value must still be safely re-applied to the suggestions source'
     );
   });
+});
+
+// Issue #120 regression: `BOOKMARKED_RESOURCE_CONTEXT_KEY` (`bookmarksPlus.bookmarkedResourceUris`)
+// is published as the *union* of the workspace and global stores' bookmarked resources (see
+// `wire()` in `bookmarkContextKeys.ts`), and every `bookmarks.addFile` / `bookmarks.addFileGlobal`
+// `when` clause below gates on that same merged key. That means a file already bookmarked in
+// workspace scope only makes the merged key contain it, which suppresses `bookmarks.addFileGlobal`
+// too — "Add Bookmark (Global)" disappears even though the file was never global-bookmarked (and
+// symmetrically for a global-only bookmark suppressing plain "Add Bookmark"). Before this
+// regression, `bookmarks.addFileGlobal`'s `when` clause was unconditional.
+//
+// Fix contract pinned here: each scope's "Add" visibility must depend only on that resource's
+// bookmark state *in that scope* — two scope-specific context keys, not one merged key:
+//   - `bookmarksPlus.workspaceBookmarkedResourceUris` gates `bookmarks.addFile`
+//   - `bookmarksPlus.globalBookmarkedResourceUris` gates `bookmarks.addFileGlobal`
+// `bookmarks.remove`'s `when` clause is deliberately left free to satisfy this contract either way
+// — it must still show "Remove Bookmark" for a resource bookmarked in *either* scope (unlike add,
+// union is the *correct* semantics there, since `removeByResourceUri` in commands.ts searches both
+// stores), so it may keep referencing the old merged key (if the implementation still maintains and
+// publishes it) or reference an explicit disjunction of both new scope keys — see
+// `referencesEitherMergedOrBothScopedKeys` below.
+suite('menus — per-scope bookmark context keys (issue #120)', () => {
+  // Pinned exactly, not derived from a not-yet-existing export in bookmarkContextKeys.ts — see that
+  // module's test file (`bookmarkContextKeys.test.ts`) for the corresponding
+  // WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY / GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY export
+  // assertions. Both files must agree on these literal strings.
+  const WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.workspaceBookmarkedResourceUris';
+  const GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY = 'bookmarksPlus.globalBookmarkedResourceUris';
+
+  // The three menu contribution points affected: Explorer context menu, editor context menu, and
+  // the editor-title (tab) context menu. `commandPalette` is intentionally excluded — those entries
+  // are `"when": "false"` and are unrelated to this issue.
+  const AFFECTED_MENU_IDS = ['explorer/context', 'editor/context', 'editor/title/context'] as const;
+
+  interface MenuEntry {
+    command: string;
+    when?: string;
+    group?: string;
+  }
+
+  async function getMenus(): Promise<Record<string, MenuEntry[]>> {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
+    assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');
+    await ext!.activate();
+    return ext!.packageJSON.contributes.menus as Record<string, MenuEntry[]>;
+  }
+
+  function findEntry(menus: Record<string, MenuEntry[]>, menuId: string, command: string): MenuEntry {
+    const entry = menus[menuId]?.find((candidate) => candidate.command === command);
+    assert.ok(entry, `expected contributes.menus["${menuId}"] to contain a "${command}" entry`);
+    return entry!;
+  }
+
+  /**
+   * `bookmarks.remove`'s `when` clause is satisfied by either valid fix shape: still referencing
+   * the old merged key (union preserved for removal), or explicitly referencing both new
+   * scope-specific keys (so the menu item shows for either scope's bookmark). Anything else — e.g.
+   * referencing only one scope key — would regress "Remove Bookmark" visibility for the other scope.
+   */
+  function referencesEitherMergedOrBothScopedKeys(when: string): boolean {
+    const referencesMergedKey = when.includes(BOOKMARKED_RESOURCE_CONTEXT_KEY);
+    const referencesBothScopedKeys =
+      when.includes(WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY) &&
+      when.includes(GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY);
+    return referencesMergedKey || referencesBothScopedKeys;
+  }
+
+  for (const menuId of AFFECTED_MENU_IDS) {
+    test(`${menuId}: bookmarks.addFile's when clause references only the workspace-scope key, not the global-scope or old merged key`, async () => {
+      const menus = await getMenus();
+      const entry = findEntry(menus, menuId, 'bookmarks.addFile');
+      const when = entry.when ?? '';
+
+      assert.ok(
+        when.includes(WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `expected bookmarks.addFile's when clause in "${menuId}" to reference ` +
+          `${WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY} — got: ${JSON.stringify(when)}`
+      );
+      assert.ok(
+        !when.includes(GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `bookmarks.addFile's when clause in "${menuId}" must not reference the global-scope key ` +
+          `${GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY} — a workspace-add's visibility must not depend ` +
+          `on global-scope bookmark state — got: ${JSON.stringify(when)}`
+      );
+      assert.ok(
+        !when.includes(BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `bookmarks.addFile's when clause in "${menuId}" must not reference the old merged key ` +
+          `${BOOKMARKED_RESOURCE_CONTEXT_KEY} (issue #120) — got: ${JSON.stringify(when)}`
+      );
+    });
+
+    test(`${menuId}: bookmarks.addFileGlobal's when clause references only the global-scope key, not the workspace-scope or old merged key`, async () => {
+      const menus = await getMenus();
+      const entry = findEntry(menus, menuId, 'bookmarks.addFileGlobal');
+      const when = entry.when ?? '';
+
+      assert.ok(
+        when.includes(GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `expected bookmarks.addFileGlobal's when clause in "${menuId}" to reference ` +
+          `${GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY} — got: ${JSON.stringify(when)}`
+      );
+      assert.ok(
+        !when.includes(WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `bookmarks.addFileGlobal's when clause in "${menuId}" must not reference the workspace-scope ` +
+          `key ${WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY} — a global-add's visibility must not ` +
+          `depend on workspace-scope bookmark state (this is the exact #120 regression) — got: ` +
+          `${JSON.stringify(when)}`
+      );
+      assert.ok(
+        !when.includes(BOOKMARKED_RESOURCE_CONTEXT_KEY),
+        `bookmarks.addFileGlobal's when clause in "${menuId}" must not reference the old merged key ` +
+          `${BOOKMARKED_RESOURCE_CONTEXT_KEY} (issue #120) — got: ${JSON.stringify(when)}`
+      );
+    });
+
+    test(`${menuId}: bookmarks.remove's when clause still reflects bookmark state in either scope (union preserved for removal)`, async () => {
+      const menus = await getMenus();
+      const entry = findEntry(menus, menuId, 'bookmarks.remove');
+      const when = entry.when ?? '';
+
+      assert.ok(
+        referencesEitherMergedOrBothScopedKeys(when),
+        `bookmarks.remove's when clause in "${menuId}" must still show "Remove Bookmark" for a ` +
+          `resource bookmarked in either scope — expected it to reference the merged key ` +
+          `(${BOOKMARKED_RESOURCE_CONTEXT_KEY}) or both scope keys ` +
+          `(${WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY} and ${GLOBAL_BOOKMARKED_RESOURCE_CONTEXT_KEY}) — ` +
+          `got: ${JSON.stringify(when)}`
+      );
+    });
+  }
 });
