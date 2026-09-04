@@ -160,16 +160,17 @@ The extension does not *infer* its workspace, it *is* the workspace: the value c
 
 Not a substitute, though — a **complement**. See 4B.4.
 
-### 4B.2 The API facts, and one that changes the design
+### 4B.2 The API facts, version floor, and one fact that changes the design
 
-From VS Code's documentation of the API (https://code.visualstudio.com/updates/v1_46 § extension terminal environment contributions and https://code.visualstudio.com/docs/terminal/advanced, retrieved 2026-08-09):
+Verified API chronology (re-fetched from official release notes on 2026-09-03):
 
-- Extensions contribute variables to integrated terminal environments via `replace` / `append` / `prepend`; the built-in Git extension does this for `GIT_ASKPASS`.
-- Collections can be **scoped to a workspace folder**, applying in addition to the global collection.
-- Collections are **removed when disposed or when the extension is uninstalled**.
-- **`unverified:`** "These collections are persisted across window reloads such that terminals created immediately after the window is loaded do not block on the extension host launching but instead use the last known version." Provenance: retrieved via search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, **not a direct page fetch** — re-fetch and confirm the exact wording before relying on it.
+- **VS Code 1.46:** `ExtensionContext.environmentVariableCollection` and `onStartupFinished` became stable. Environment-variable collections can `replace` / `append` / `prepend`, are persisted across reloads by default so an early terminal can receive the last known collection before the extension host starts, and are removed when disposed or when the extension is uninstalled. The built-in Git extension uses the same API. Source: https://code.visualstudio.com/updates/v1_46 (fetched 2026-09-03).
+- **VS Code 1.80:** `EnvironmentVariableCollection.description` became stable. Source: https://code.visualstudio.com/updates/v1_80 (fetched 2026-09-03).
+- **VS Code 1.82:** `GlobalEnvironmentVariableCollection.getScoped()` added workspace-folder-scoped collections, applied in addition to the global collection; the same release added `EnvironmentVariableMutatorOptions`, including `applyAtProcessCreation` and `applyAtShellIntegration`. Source: https://code.visualstudio.com/updates/v1_82 (fetched 2026-09-03).
 
-That last bullet, if accurate, is a **C2 leak vector**, and it is the most important finding in this section:
+The project declares `"engines": { "vscode": "^1.85.0" }` (`package.json:L12`), so every API used by the follow-up implementation is inside the supported floor. The implementation uses the **global** collection passed as `context.environmentVariableCollection` (`src/extension.ts:L293`, `src/extension.ts:L436`) and calls `replace()` without an options argument after setting `persistent = false` and `description` (`src/workspaceEnv.ts:L61-L75`). It does **not** call `getScoped()`, so workspace-folder scoping is part of the API chronology, not a runtime dependency of this design.
+
+The verified default persistence behavior is a **C2 leak vector**, and it is the most important finding in this section:
 
 > A cached "last known version" of the variable can be applied to terminals **before the extension host activates**. A `claude` session launched in that window would serve the cached workspace's bookmarks — silently, and with no enumeration surface involved. Exactly the failure C2 forbids, arriving through a caching optimization.
 
@@ -177,7 +178,7 @@ That last bullet, if accurate, is a **C2 leak vector**, and it is the most impor
 
 **Mitigation (D6): set `persistent = false`.** No cache, no stale value. The cost is that a terminal opened in the gap before activation simply lacks the variable — and lacking it is *safe*, because resolution falls through to `CLAUDE_PROJECT_DIR`, which is correct for that session. **A stale-but-present value is strictly worse than an absent one:** absent degrades to a correct source, stale silently serves the wrong workspace.
 
-Note the useful property: this mitigation is correct **whether or not the caching quote turns out to be exactly right.** It costs one tier of latency in a narrow window and removes an entire class of failure, so it does not need the uncertain claim to be true in order to be justified.
+Note the useful property: this mitigation is correct **regardless of whether the cache is global or workspace-scoped.** It costs one tier of latency in a narrow window and removes an entire class of failure, so resolving the remaining cache-scope uncertainty cannot invalidate D6.
 
 ### 4B.3 Two more implementation constraints, both non-obvious
 
@@ -501,7 +502,6 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 ## 11. Open questions and unverified claims
 
 - **`unverified:` whether `CLAUDE_PROJECT_DIR` equals the VS Code workspace folder for a session started inside VS Code.** The single load-bearing empirical unknown. Phase 0 measurement 1 settles it; nothing else in the design is asserted on top of it.
-- **`unverified:` VS Code's persistence of environment variable collections** ("terminals created immediately after the window is loaded… use the last known version"). Provenance: search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, not a direct fetch. Re-fetch before relying on the exact wording. D6's mitigation is correct either way (§ 4B.2).
 - **`unverified:` whether that persistence cache is global or per-workspace-folder.** Determines whether R6 is a real leak or a benign first-run gap. Phase 0 measurement 6.
 - **`unverified:` whether Claude Code's VS Code extension panel spawns through the terminal subsystem**, i.e. whether § 4B's injection reaches it. Phase 0 measurement 4.
 - **`unverified:` that a Desktop app Code tab session inherits § 2(b)'s `CLAUDE_PROJECT_DIR` behavior.** Inferred from the Code tab being a Claude Code session, not quoted from any source. Phase 0 measurement 3 settles it. Only the Q1 scope answer depends on it, not the design.
