@@ -160,30 +160,31 @@ The extension does not *infer* its workspace, it *is* the workspace: the value c
 
 Not a substitute, though — a **complement**. See 4B.4.
 
-### 4B.2 The API facts, and one that changes the design
+### 4B.2 The API facts, version floor, and one fact that changes the design
 
-From VS Code's documentation of the API (https://code.visualstudio.com/updates/v1_46 § extension terminal environment contributions and https://code.visualstudio.com/docs/terminal/advanced, retrieved 2026-08-09):
+Verified API chronology (re-fetched from official release notes on 2026-09-03):
 
-- Extensions contribute variables to integrated terminal environments via `replace` / `append` / `prepend`; the built-in Git extension does this for `GIT_ASKPASS`.
-- Collections can be **scoped to a workspace folder**, applying in addition to the global collection.
-- Collections are **removed when disposed or when the extension is uninstalled**.
-- **`unverified:`** "These collections are persisted across window reloads such that terminals created immediately after the window is loaded do not block on the extension host launching but instead use the last known version." Provenance: retrieved via search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, **not a direct page fetch** — re-fetch and confirm the exact wording before relying on it.
+- **VS Code 1.46:** `ExtensionContext.environmentVariableCollection` and `onStartupFinished` became stable. Environment-variable collections can `replace` / `append` / `prepend`, are persisted across reloads by default so an early terminal can receive the last known collection before the extension host starts, and are removed when disposed or when the extension is uninstalled. The built-in Git extension uses the same API. Source: https://code.visualstudio.com/updates/v1_46 (fetched 2026-09-03).
+- **VS Code 1.80:** `EnvironmentVariableCollection.description` became stable. Source: https://code.visualstudio.com/updates/v1_80 (fetched 2026-09-03).
+- **VS Code 1.82:** `GlobalEnvironmentVariableCollection.getScoped()` added workspace-folder-scoped collections, applied in addition to the global collection; the same release added `EnvironmentVariableMutatorOptions`, including `applyAtProcessCreation` and `applyAtShellIntegration`. Source: https://code.visualstudio.com/updates/v1_82 (fetched 2026-09-03).
 
-That last bullet, if accurate, is a **C2 leak vector**, and it is the most important finding in this section:
+The project declares `"engines": { "vscode": "^1.85.0" }` (`package.json:L12`), so every API used by the follow-up implementation is inside the supported floor. The implementation uses the **global** collection passed as `context.environmentVariableCollection` (`src/extension.ts:L293`, `src/extension.ts:L436`) and calls `replace()` without an options argument after setting `persistent = false` and `description` (`src/workspaceEnv.ts:L61-L75`). It does **not** call `getScoped()`, so workspace-folder scoping is part of the API chronology, not a runtime dependency of this design.
+
+The verified default persistence behavior is a **C2 stale-value vector**, and it is the most important finding in this section:
 
 > A cached "last known version" of the variable can be applied to terminals **before the extension host activates**. A `claude` session launched in that window would serve the cached workspace's bookmarks — silently, and with no enumeration surface involved. Exactly the failure C2 forbids, arriving through a caching optimization.
 
-**How bad this is depends on the cache's scope, which the source does not state.** If the cache is keyed per workspace folder, the blast radius is only "the first-ever window on a new workspace has no cached value" — benign. If it is global, then opening window A on repo A and then window B on repo B could hand repo A's path to a terminal in window B — the full leak. Phase 0 measurement 6 settles which. D6 is the right call under either answer, so this uncertainty does not block.
+The cache is **workspace-specific**, not machine-global: VS Code describes `context.environmentVariableCollection` as the extension's global collection "for this workspace," and `persistent` as caching that collection "for the workspace." Here, *global* means that the collection applies across terminal scopes inside that workspace; workspace-folder-specific collections are the separate `getScoped()` facility added in 1.82. Opening unrelated workspace B therefore cannot reuse workspace A's collection. The residual risk is narrower: an early terminal opened while reloading the same workspace can receive that workspace's last known value before the extension host refreshes it. Source: https://code.visualstudio.com/api/references/vscode-api#GlobalEnvironmentVariableCollection (fetched 2026-09-03).
 
 **Mitigation (D6): set `persistent = false`.** No cache, no stale value. The cost is that a terminal opened in the gap before activation simply lacks the variable — and lacking it is *safe*, because resolution falls through to `CLAUDE_PROJECT_DIR`, which is correct for that session. **A stale-but-present value is strictly worse than an absent one:** absent degrades to a correct source, stale silently serves the wrong workspace.
 
-Note the useful property: this mitigation is correct **whether or not the caching quote turns out to be exactly right.** It costs one tier of latency in a narrow window and removes an entire class of failure, so it does not need the uncertain claim to be true in order to be justified.
+This costs one tier of latency in a narrow window and removes the documented same-workspace stale-value path. No cross-workspace cache-scope uncertainty remains.
 
 ### 4B.3 Two more implementation constraints, both non-obvious
 
 **Use `replace()`, never `append()`/`prepend()`.** A terminal in window A that runs `code /other/repo` launches a window whose extension host inherits `BOOKMARKS_PLUS_WORKSPACE=/repo/A` from its parent process environment. `replace()` overwrites it with the correct value; `append()` would compound two workspace paths into one variable.
 
-**The extension's activation timing is currently wrong for this.** `package.json:L15` declares `"activationEvents": []`, so activation is driven entirely by the contributed view — the extension does not run until the Bookmarks view is first revealed in that window. A terminal opened before that gets nothing. With `persistent = false` (D6) there is no cache to paper over it. **Add `onStartupFinished`** to the follow-up issue's scope: it activates the extension in every window shortly after load, without blocking startup. Cost: the extension activates in windows where the user never opens the Bookmarks view.
+**At design time, the extension's activation timing was wrong for this.** Before the extension-side follow-up, activation was driven by the contributed view, so the extension did not run until the Bookmarks view was first revealed in that window. A terminal opened before that got nothing. With `persistent = false` (D6), there was no cache to paper over it. Issue #58, implemented by PR #88, added `onStartupFinished`; the current manifest records it at `package.json:L15`. It activates the extension in every window shortly after load, without blocking startup. Cost: the extension activates in windows where the user never opens the Bookmarks view.
 
 ### 4B.4 Coverage — does it reach more session types? (coordinator Q3)
 
@@ -211,7 +212,7 @@ It does expand the *file* scope: activation logic and `package.json` in the exte
 **Recommendation: split.**
 
 - **#57 (this spec):** `mcp-server` reads `BOOKMARKS_PLUS_WORKSPACE` at its documented precedence. Inert until the extension sets it. Still a sub-10-line change, still 57/57 tests preserved.
-- **Follow-up issue (to be filed by the router — this agent cannot create issues):** the extension half. Set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; add `onStartupFinished`; implement the sentinel contract in § 4B.7 by declaring its **own** literal for both reason slugs (never importing from `mcp-server/`); add `mcp-server/test/sentinelDrift.test.ts` per § 4B.7a to enforce agreement across the boundary; extension-side tests.
+- **#58 (subsequently completed by PR #88):** the extension half set `BOOKMARKS_PLUS_WORKSPACE` via `context.environmentVariableCollection.replace()` with `persistent = false` (D6) and a `description`; added `onStartupFinished`; implemented the sentinel contract in § 4B.7 with its **own** literal for both reason slugs (never importing from `mcp-server/`); and added `mcp-server/test/sentinelDrift.test.ts` plus extension-side tests.
 
 ### 4B.7 Multi-root: the extension must set a sentinel, not stay silent
 
@@ -416,7 +417,7 @@ Supporting detail for Q1, retained because the README's limitation wording depen
 
 **R3 — Docs describe the retired model.** `README.md:L50-L127` documents one-registration-per-workspace as current behavior, including per-workspace `args` entries (`:L83`, `:L100`) and the argv-wins-over-env rule (`:L71`). The precedence rule stays true under D1; the per-workspace framing does not.
 
-**R6 — A cached extension-injected variable could serve the wrong workspace.** § 4B.2, the one genuinely new risk Rev 3 introduces. Removed by D6 (`persistent = false`), which is why D5 and D6 are adopted as a pair.
+**R6 — A cached extension-injected variable could be stale during a reload of the same workspace.** § 4B.2, the one genuinely new risk Rev 3 introduces. VS Code's cache is workspace-specific, so it does not transfer a value between unrelated workspaces; D6 (`persistent = false`) removes the remaining same-workspace stale-value path, which is why D5 and D6 are adopted as a pair. Source: https://code.visualstudio.com/api/references/vscode-api#GlobalEnvironmentVariableCollection (fetched 2026-09-03).
 
 **R4 — Multi-root VS Code workspaces have no mirror at all, and the resolution chain must not paper over that.** Verified rather than assumed: `resolveMirrorLocation` returns `kind: 'disabled'` for `folders.length > 1` (`src/bookmarkMirror.ts:L29-L34`), so no `.vscode/bookmarks.json` exists in such a window. Reads degrade harmlessly to an empty list, but `add_bookmark` would happily *create* a mirror the extension will never read. § 4B.7's sentinel contract turns that into a named refusal. Widening multi-root support belongs to a mirror-design issue, not this one.
 
@@ -441,8 +442,6 @@ Build, register the server with no `args` path, then take **five** measurements 
 4. Claude Code's **VS Code extension panel**, if the user runs sessions that way — does the panel spawn through the terminal subsystem? This determines whether § 4B's injection reaches that surface (§ 4B.4, row 4). Probing it now is nearly free; discovering it after the extension work ships is not.
 5. Claude Code launched from a VS Code terminal **`cd`'d into a subdirectory** of the workspace — this is R1's main failure mode and § 4B.1's strongest argument. If `CLAUDE_PROJECT_DIR` reports the subdirectory here, that is the concrete evidence for D5.
 
-6. **Cache-scope check, once the extension half exists** (§ 4B.2): open window A on repo A, let the extension activate, then open window B on repo B and read the probe file for a terminal created *before* B's Bookmarks view is revealed. If it records repo A's path, the persistence cache is global and R6 is the full leak; if it records nothing, the cache is per-workspace and R6 is benign. Either way `persistent = false` stays.
-
 **This probe is not a design gate, but it *is* a correctness gate on tier 3 — do not let the first framing obscure the second.** No decision in this spec changes based on the outcome. But tier 3 is the only automatic source #57 ships (tier 2 arrives with #58), so if it does not resolve correctly in VS Code sessions, **#57 delivers zero ergonomic improvement until #58 lands** — the user would still have to put a path in every registration entry, which is the state C1 rejected.
 
 **Stop condition:** if measurements 1 **and** 5 both disappoint — `CLAUDE_PROJECT_DIR` absent, or pointing somewhere other than the workspace root, in ordinary VS Code sessions — **halt and return to the router.** Do not ship a tier that does not work and rely on #58 to rescue it. That outcome would mean #57's value depends entirely on #58, which changes the issue's sequencing and is a decision for the user, not the implementer.
@@ -456,7 +455,7 @@ Build, register the server with no `args` path, then take **five** measurements 
 
 Test-first per the repo standard: the four new `config.test.ts` cases before the `config.ts` edit.
 
-**Follow-up issue — the extension half (§ 4B.5).** For the router to file; this agent cannot create issues. Scope: `context.environmentVariableCollection.replace('BOOKMARKS_PLUS_WORKSPACE', <workspace root>)` with `persistent = false` (D6) and a user-visible `description`; add `onStartupFinished` to `package.json:L15`'s empty `activationEvents` (§ 4B.3); per the § 4B.7 sentinel contract, set the variable to `disabled:multi-root` when a multi-root window is open and `disabled:no-folder` when no workspace folder is open, rather than declining to set it at all (R4); extension-side tests. Blocked on nothing in #57 — the two halves meet only at the variable name.
+**Follow-up issue — the extension half (§ 4B.5), subsequently completed as #58 by PR #88.** Its scope was: `context.environmentVariableCollection.replace('BOOKMARKS_PLUS_WORKSPACE', <workspace root>)` with `persistent = false` (D6) and a user-visible `description`; add `onStartupFinished` (§ 4B.3); per the § 4B.7 sentinel contract, set the variable to `disabled:multi-root` when a multi-root window is open and `disabled:no-folder` when no workspace folder is open, rather than declining to set it at all (R4); extension-side tests. It was blocked on nothing in #57 — the two halves meet only at the variable name.
 
 **Not in this issue:** roots (D2), the extension half (above), any multi-workspace capability, any tool-schema change.
 
@@ -501,8 +500,6 @@ Because `resolveConfig`'s signature, return type, and `Config`'s shape are uncha
 ## 11. Open questions and unverified claims
 
 - **`unverified:` whether `CLAUDE_PROJECT_DIR` equals the VS Code workspace folder for a session started inside VS Code.** The single load-bearing empirical unknown. Phase 0 measurement 1 settles it; nothing else in the design is asserted on top of it.
-- **`unverified:` VS Code's persistence of environment variable collections** ("terminals created immediately after the window is loaded… use the last known version"). Provenance: search-result summarization of https://code.visualstudio.com/updates/v1_46 on 2026-08-09, not a direct fetch. Re-fetch before relying on the exact wording. D6's mitigation is correct either way (§ 4B.2).
-- **`unverified:` whether that persistence cache is global or per-workspace-folder.** Determines whether R6 is a real leak or a benign first-run gap. Phase 0 measurement 6.
 - **`unverified:` whether Claude Code's VS Code extension panel spawns through the terminal subsystem**, i.e. whether § 4B's injection reaches it. Phase 0 measurement 4.
 - **`unverified:` that a Desktop app Code tab session inherits § 2(b)'s `CLAUDE_PROJECT_DIR` behavior.** Inferred from the Code tab being a Claude Code session, not quoted from any source. Phase 0 measurement 3 settles it. Only the Q1 scope answer depends on it, not the design.
 - **`unverified:` `anthropics/claude-code#75266`** (desktop-app-spawned MCP servers getting `cwd` = `$HOME`) was never fetched directly (`docs/research/2026-08-09-mcp-dynamic-workspace-resolution.md:L73`). It does not matter here: this design reads an explicit env var and never trusts inherited `cwd`.
