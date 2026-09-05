@@ -239,7 +239,7 @@ way to pin a workspace under Claude Code.
 
 ## Requirements
 
-Requires VS Code 1.85.0 or later. The repo-name badge uses the built-in `vscode.git` extension when it's enabled; the extension works without it, just without badges.
+Requires VS Code 1.101.0 or later. The repo-name badge uses the built-in `vscode.git` extension when it's enabled; the extension works without it, just without badges.
 
 ## Installation
 

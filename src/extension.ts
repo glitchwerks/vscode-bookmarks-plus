@@ -26,6 +26,7 @@ import {
   GitApiFactory,
   GitExtensionExports
 } from './gitInfo';
+import { registerBookmarksMcpProvider } from './mcpServerProvider';
 import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
 import {
   loadRecentlyViewed,
@@ -41,6 +42,15 @@ const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
 const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
 
 let activeStores: BookmarkStore[] = [];
+
+export interface McpActivationDependencies {
+  getWorkspaceFolders: () => readonly { uri: vscode.Uri }[] | undefined;
+  registerProvider: (
+    id: string,
+    provider: vscode.McpServerDefinitionProvider
+  ) => vscode.Disposable;
+  onDidChangeWorkspaceFolders: (listener: () => void) => vscode.Disposable;
+}
 
 export async function disposeStores(stores: (BookmarkStore | undefined)[]): Promise<void> {
   for (const store of stores) {
@@ -279,7 +289,16 @@ export function registerSuggestionsMaxItemsLiveReload(
   subscriptions.push(configChangeSubscription);
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(
+  context: vscode.ExtensionContext,
+  mcpDeps: McpActivationDependencies = {
+    getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
+    registerProvider: (id, provider) =>
+      vscode.lm.registerMcpServerDefinitionProvider(id, provider),
+    onDidChangeWorkspaceFolders: (listener) =>
+      vscode.workspace.onDidChangeWorkspaceFolders(listener)
+  }
+): void {
   const output = vscode.window.createOutputChannel('Bookmarks Plus');
   const location = resolveMirrorLocation(vscode.workspace.workspaceFolders);
 
@@ -343,6 +362,13 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => store.dispose() },
     { dispose: () => globalStore.dispose() }
   );
+
+  registerBookmarksMcpProvider(context.subscriptions, {
+    ...mcpDeps,
+    extensionUri: context.extensionUri,
+    extensionVersion: String(context.extension.packageJSON.version),
+    output
+  });
 
   registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
     getConfiguration: () => vscode.workspace.getConfiguration(),
