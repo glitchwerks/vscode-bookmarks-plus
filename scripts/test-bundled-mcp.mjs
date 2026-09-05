@@ -18,6 +18,7 @@ import yauzl from 'yauzl';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const builtBundle = join(repoRoot, 'dist', 'bookmarks-plus-mcp.mjs');
+const bundleSourceMap = `${builtBundle}.map`;
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
 const mcpPackage = JSON.parse(
   readFileSync(join(repoRoot, 'mcp-server', 'package.json'), 'utf8'),
@@ -152,6 +153,28 @@ test('production build emits both extension and MCP bundles', () => {
     existsSync(builtBundle),
     true,
     'expected the production build to emit dist/bookmarks-plus-mcp.mjs',
+  );
+});
+
+test('MCP bundle resolves its shared runtime dependencies from the verified root install', () => {
+  execFileSync(process.execPath, ['esbuild.js'], {
+    cwd: repoRoot,
+    stdio: 'pipe',
+  });
+  const sourceMap = JSON.parse(readFileSync(bundleSourceMap, 'utf8'));
+  const normalizedSources = sourceMap.sources.map((source) => source.replaceAll('\\', '/'));
+
+  for (const dependency of ['@modelcontextprotocol/sdk', 'zod']) {
+    const rootDependencyPrefix = `../node_modules/${dependency}/`;
+    assert.ok(
+      normalizedSources.some((source) => source.startsWith(rootDependencyPrefix)),
+      `expected bundle inputs from ${rootDependencyPrefix}`,
+    );
+  }
+  assert.equal(
+    normalizedSources.some((source) => source.startsWith('../mcp-server/node_modules/')),
+    false,
+    'expected no bundle inputs from the independently installed standalone package dependencies',
   );
 });
 

@@ -36,6 +36,30 @@ function assertMcpBuildDependencies(rootPackage, rootLockfile, mcpLockfile) {
   }
 }
 
+function rootMcpDependenciesPlugin() {
+  return {
+    name: 'root-mcp-dependencies',
+    setup(build) {
+      build.onResolve(
+        { filter: /^(?:@modelcontextprotocol\/sdk|zod)(?:\/.*)?$/ },
+        async (args) => {
+          if (args.pluginData?.resolvingFromRoot) {
+            return undefined;
+          }
+
+          return build.resolve(args.path, {
+            importer: args.importer,
+            kind: args.kind,
+            namespace: args.namespace,
+            pluginData: { ...args.pluginData, resolvingFromRoot: true },
+            resolveDir: __dirname,
+          });
+        },
+      );
+    },
+  };
+}
+
 async function main() {
   const rootPackage = readJson('package.json');
   const rootLockfile = readJson('package-lock.json');
@@ -64,6 +88,7 @@ async function main() {
       entryPoints: ['mcp-server/src/index.ts'],
       format: 'esm',
       outfile: 'dist/bookmarks-plus-mcp.mjs',
+      plugins: [rootMcpDependenciesPlugin()],
       define: {
         __BOOKMARKS_PLUS_MCP_VERSION__: JSON.stringify(mcpPackage.version),
       },
