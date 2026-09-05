@@ -133,7 +133,7 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile",
     "test": "node ./out/test/runTest.js",
-    "test:mcp-bundle": "node --test scripts/test-bundled-mcp.mjs",
+    "test:mcp-bundle": "node --test scripts/mcp-json-rpc.test.mjs scripts/test-bundled-mcp.mjs",
     "lint": "eslint src --ext ts",
     "vsce:package": "vsce package --no-dependencies",
     "publish:stable": "node scripts/guard-channel.js stable && vsce publish",

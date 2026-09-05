@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 import vsce from '@vscode/vsce';
 import yauzl from 'yauzl';
 
+import { createJsonRpcClient } from './mcp-json-rpc.cjs';
+
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const builtBundle = join(repoRoot, 'dist', 'bookmarks-plus-mcp.mjs');
 const bundleSourceMap = `${builtBundle}.map`;
@@ -37,80 +39,6 @@ async function removeDirWithRetry(directory) {
   } catch {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await rm(directory, { recursive: true, force: true });
-  }
-}
-
-function collectJsonRpcResponse(child, id) {
-  return new Promise((resolve) => {
-    let buffer = '';
-    let settled = false;
-
-    const finish = (value) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      child.stdout.off('data', onData);
-      child.off('exit', onExit);
-      resolve(value);
-    };
-
-    const onData = (chunk) => {
-      buffer += chunk.toString('utf8');
-      let newlineIndex;
-      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        if (!line.trim()) {
-          continue;
-        }
-        try {
-          const message = JSON.parse(line);
-          if (message.id === id) {
-            finish(message);
-            return;
-          }
-        } catch {
-          // Ignore non-JSON stdout noise while waiting for the requested response.
-        }
-      }
-    };
-
-    const onExit = () => finish(undefined);
-    child.stdout.on('data', onData);
-    child.on('exit', onExit);
-  });
-}
-
-async function waitFor(promise, timeoutMs, label) {
-  let timeout;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeout = setTimeout(
-      () => reject(new Error(`timed out after ${timeoutMs}ms waiting for ${label}`)),
-      timeoutMs,
-    );
-  });
-
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function stopChild(child) {
-  if (child.exitCode !== null) {
-    return;
-  }
-
-  child.stdin.end();
-  await Promise.race([
-    new Promise((resolve) => child.once('exit', resolve)),
-    new Promise((resolve) => setTimeout(resolve, 1_000)),
-  ]);
-
-  if (child.exitCode === null) {
-    child.kill('SIGKILL');
   }
 }
 
@@ -196,60 +124,35 @@ test('isolated MCP bundle initializes with its own version and lists both tools'
     cwd: bundleDir,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  let stderr = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString('utf8');
-  });
+  const client = createJsonRpcClient(child);
 
   try {
-    const initializeResponsePromise = collectJsonRpcResponse(child, 1);
-    child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-          clientInfo: { name: 'bundle-test-client', version: '0.0.0' },
-        },
-      })}\n`,
-    );
-
-    const initializeResponse = await waitFor(
-      initializeResponsePromise,
-      10_000,
+    const initializeResponse = await client.request(
+      'initialize',
+      {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'bundle-test-client', version: '0.0.0' },
+      },
       'the bundled MCP initialize response',
     );
-    assert.ok(initializeResponse, `expected initialize response; stderr: ${stderr}`);
     assert.equal(initializeResponse.result.serverInfo.name, 'bookmarks-plus-mcp');
     assert.equal(initializeResponse.result.serverInfo.version, mcpPackage.version);
 
-    child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-        params: {},
-      })}\n`,
-    );
+    client.notify('notifications/initialized');
 
-    const toolsResponsePromise = collectJsonRpcResponse(child, 2);
-    child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`,
-    );
-
-    const toolsResponse = await waitFor(
-      toolsResponsePromise,
-      10_000,
+    const toolsResponse = await client.request(
+      'tools/list',
+      {},
       'the bundled MCP tools/list response',
     );
-    assert.ok(toolsResponse, `expected tools/list response; stderr: ${stderr}`);
     assert.deepEqual(
       toolsResponse.result.tools.map(({ name }) => name).sort(),
       ['add_bookmark', 'list_bookmarks'],
     );
+    client.assertNoStdoutNoise();
   } finally {
-    await stopChild(child);
+    await client.stop();
   }
 });
 
