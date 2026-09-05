@@ -177,7 +177,8 @@ pre-release lane using the odd/even minor rule above.
    npm run test:packaged-mcp
    ```
    The packaged MCP test creates a real VSIX, loads that exact artifact in a pinned VS Code 1.101
-   Extension Host, and exercises both MCP tools on Windows or Linux.
+   Extension Host, and exercises both MCP tools on Windows or Linux
+   (`package.json:L127-L139`; `scripts/test-packaged-native-mcp.mjs:L102-L149`).
 6. **Perform the packaged-VSIX UI smoke check:**
    1. Run `npm run vsce:package` and install the generated VSIX using
       **Extensions: Install from VSIX...** in VS Code 1.101 or later.
@@ -186,7 +187,8 @@ pre-release lane using the odd/even minor rule above.
    3. Open Chat in Agent mode, select the tools button, and confirm that
       `list_bookmarks` and `add_bookmark` appear under **Bookmarks Plus**.
    4. Repeat with no folder and with a multi-root workspace. Confirm that the server is not
-      advertised and that the **Bookmarks Plus** output channel explains the disabled state.
+      advertised and that the **Bookmarks Plus** output channel explains the disabled state
+      (`src/mcpServerProvider.ts:L18-L52`).
 
    The server-management names above follow the
    [VS Code MCP documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
