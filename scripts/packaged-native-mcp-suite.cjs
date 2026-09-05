@@ -97,6 +97,7 @@ async function capturePackagedProvider(extension, initialFolders) {
   const context = createFakeContext(extension);
   let folders = initialFolders;
   let provider;
+  let activationError;
 
   try {
     extensionModule.activate(context, {
@@ -112,9 +113,18 @@ async function capturePackagedProvider(extension, initialFolders) {
     if (provider === undefined) {
       throw error;
     }
+    activationError = error;
   }
 
   assert.ok(provider, 'expected the packaged extension to register its MCP provider');
+  if (activationError !== undefined) {
+    const message = activationError instanceof Error ? activationError.message : String(activationError);
+    assert.match(
+      message,
+      /command ['"]bookmarks\.[^'"]+['"] already exists|already registered/i,
+      `unexpected failure after packaged MCP provider registration: ${message}`,
+    );
+  }
 
   return {
     async definitionsFor(nextFolders) {

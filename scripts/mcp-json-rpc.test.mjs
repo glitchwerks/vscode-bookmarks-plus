@@ -53,3 +53,46 @@ test('reports non-protocol stdout together with buffered stderr', async () => {
     await client.stop();
   }
 });
+
+test('includes fully drained stderr when the server exits without responding', async () => {
+  const marker = 'final stderr marker';
+  const child = spawnFixture(`
+    const fs = require('node:fs');
+    const readline = require('node:readline');
+    readline.createInterface({ input: process.stdin }).once('line', () => {
+      fs.writeSync(2, 'x'.repeat(128 * 1024) + '${marker}\\n');
+      process.exit(7);
+    });
+  `);
+  const client = createJsonRpcClient(child, { timeoutMs: 2_000 });
+
+  try {
+    await assert.rejects(
+      client.request('fixture/exit', {}),
+      (error) => {
+        assert.match(error.message, /code 7/);
+        assert.match(error.message, new RegExp(marker));
+        return true;
+      },
+    );
+  } finally {
+    await client.stop();
+  }
+});
+
+test('rejects a request instead of emitting an unhandled EPIPE when stdin closes early', async () => {
+  const child = spawnFixture('setInterval(() => {}, 1_000);');
+  const client = createJsonRpcClient(child, { timeoutMs: 2_000 });
+
+  try {
+    const response = client.request('fixture/write-after-close', {});
+    const pipeError = Object.assign(new Error('fixture EPIPE'), { code: 'EPIPE' });
+    child.stdin.destroy(pipeError);
+    await assert.rejects(
+      response,
+      /MCP server stdin error: fixture EPIPE/,
+    );
+  } finally {
+    await client.stop();
+  }
+});
