@@ -130,12 +130,14 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile",
     "test": "node ./out/test/runTest.js",
+    "test:mcp-bundle": "node --test scripts/test-bundled-mcp.mjs",
     "lint": "eslint src --ext ts",
     "vsce:package": "vsce package --no-dependencies",
     "publish:stable": "node scripts/guard-channel.js stable && vsce publish",
     "publish:prerelease": "node scripts/guard-channel.js prerelease && vsce publish --pre-release"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@vscode/vsce": "^2.24.0",
     "@types/vscode": "^1.85.0",
     "@types/node": "^20.11.0",
@@ -147,6 +149,7 @@
     "@vscode/test-electron": "^2.3.9",
     "eslint": "^8.57.0",
     "@typescript-eslint/eslint-plugin": "^7.1.0",
-    "@typescript-eslint/parser": "^7.1.0"
+    "@typescript-eslint/parser": "^7.1.0",
+    "zod": "4.4.3"
   }
 }
