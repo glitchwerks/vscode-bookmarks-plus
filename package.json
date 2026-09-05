@@ -150,6 +150,7 @@
     "eslint": "^8.57.0",
     "@typescript-eslint/eslint-plugin": "^7.1.0",
     "@typescript-eslint/parser": "^7.1.0",
+    "yauzl": "2.10.0",
     "zod": "4.4.3"
   }
 }

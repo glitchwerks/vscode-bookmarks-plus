@@ -13,9 +13,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vsce from '@vscode/vsce';
+import yauzl from 'yauzl';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const builtBundle = join(repoRoot, 'dist', 'bookmarks-plus-mcp.mjs');
+const rootPackage = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
 const mcpPackage = JSON.parse(
   readFileSync(join(repoRoot, 'mcp-server', 'package.json'), 'utf8'),
 );
@@ -108,6 +111,26 @@ async function stopChild(child) {
   if (child.exitCode === null) {
     child.kill('SIGKILL');
   }
+}
+
+function readZipEntries(archivePath) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(archivePath, { lazyEntries: true }, (openError, archive) => {
+      if (openError) {
+        reject(openError);
+        return;
+      }
+
+      const entries = [];
+      archive.on('error', reject);
+      archive.on('entry', (entry) => {
+        entries.push(entry.fileName.replaceAll('\\', '/'));
+        archive.readEntry();
+      });
+      archive.on('end', () => resolve(entries));
+      archive.readEntry();
+    });
+  });
 }
 
 before(() => {
@@ -205,4 +228,26 @@ test('isolated MCP bundle initializes with its own version and lists both tools'
   } finally {
     await stopChild(child);
   }
+});
+
+test('VSIX contains the bundled MCP runtime without raw server files or dependencies', async () => {
+  assert.equal(
+    rootPackage.devDependencies.yauzl,
+    '2.10.0',
+    'expected yauzl to be a direct test dependency rather than an accidental transitive import',
+  );
+
+  const packageDir = makeTempDir('bookmarks-plus-vsix-');
+  const vsixPath = join(packageDir, 'bookmarks-plus.vsix');
+  await vsce.createVSIX({
+    cwd: repoRoot,
+    packagePath: vsixPath,
+    dependencies: false,
+  });
+
+  const entries = await readZipEntries(vsixPath);
+  assert.ok(entries.includes('extension/dist/extension.js'));
+  assert.ok(entries.includes('extension/dist/bookmarks-plus-mcp.mjs'));
+  assert.equal(entries.some((entry) => entry.startsWith('extension/mcp-server/')), false);
+  assert.equal(entries.some((entry) => entry.includes('/node_modules/')), false);
 });
