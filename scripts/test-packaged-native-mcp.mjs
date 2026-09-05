@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -110,11 +109,7 @@ async function main() {
 
   try {
     mkdirSync(packageDir, { recursive: true });
-    mkdirSync(join(workspaceDir, '.vscode'), { recursive: true });
-    writeFileSync(
-      join(workspaceDir, '.vscode', 'bookmarks.json'),
-      `${JSON.stringify({ version: 2, items: [], collections: [] }, null, 2)}\n`,
-    );
+    mkdirSync(workspaceDir, { recursive: true });
 
     execFileSync(process.execPath, ['esbuild.js', '--production'], {
       cwd: repoRoot,

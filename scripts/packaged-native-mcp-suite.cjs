@@ -10,6 +10,7 @@ const { createJsonRpcClient } = require('./mcp-json-rpc.cjs');
 
 const EXTENSION_ID = 'cbeaulieu-gt.vscode-bookmarks-plus';
 const MIRROR_RELATIVE_PATH = path.join('.vscode', 'bookmarks.json');
+const MIRROR_ADOPTION_WINDOW_MS = 1_000;
 
 class MemoryMemento {
   constructor() {
@@ -231,10 +232,14 @@ async function run() {
       readMirror(mirrorPath).items.some((item) => item.id === added.id),
     );
 
-    await waitUntil('the packaged extension to adopt and remove the MCP-written bookmark', async () => {
-      await vscode.commands.executeCommand('bookmarks.remove', targetUri);
-      return !readMirror(mirrorPath).items.some((item) => item.id === added.id);
-    });
+    // The store is closure-private, so there is no supported readiness signal for watcher
+    // adoption. Allow filesystem delivery plus the 150 ms debounce to settle, then mutate once;
+    // a missed adoption must fail instead of being masked by repeated remove commands.
+    await new Promise((resolve) => setTimeout(resolve, MIRROR_ADOPTION_WINDOW_MS));
+    await vscode.commands.executeCommand('bookmarks.remove', targetUri);
+    await waitUntil('the packaged extension removal to reach the mirror', () =>
+      !readMirror(mirrorPath).items.some((item) => item.id === added.id),
+    );
 
     const finalList = toolPayload(await client.request('tools/call', {
       name: 'list_bookmarks',

@@ -1,11 +1,14 @@
 'use strict';
 
+const { StringDecoder } = require('node:string_decoder');
+
 function createJsonRpcClient(child, options = {}) {
   const timeoutMs = options.timeoutMs ?? 10_000;
   const pending = new Map();
   const stdoutNoise = [];
   let stderr = '';
   let stdoutBuffer = '';
+  const stdoutDecoder = new StringDecoder('utf8');
   let nextId = 1;
   let stopped = false;
   let closed = false;
@@ -61,17 +64,39 @@ function createJsonRpcClient(child, options = {}) {
     }
     clearTimeout(entry.timeout);
     pending.delete(message.id);
-    entry.resolve(message);
+    if (Object.prototype.hasOwnProperty.call(message, 'error')) {
+      const serverError = message.error;
+      const code = serverError?.code;
+      const serverMessage = serverError?.message;
+      let description = `${entry.label} failed with JSON-RPC error`;
+      if (code !== undefined) {
+        description += ` ${code}`;
+      }
+      if (typeof serverMessage === 'string') {
+        description += `: ${serverMessage}`;
+      }
+      const error = diagnostic(description);
+      error.code = code;
+      error.data = serverError?.data;
+      error.serverError = serverError;
+      entry.reject(error);
+    } else {
+      entry.resolve(message);
+    }
   };
 
-  const onStdout = (chunk) => {
-    stdoutBuffer += chunk.toString('utf8');
+  const consumeStdout = (text) => {
+    stdoutBuffer += text;
     let newlineIndex;
     while ((newlineIndex = stdoutBuffer.indexOf('\n')) !== -1) {
       const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, '');
       stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
       handleLine(line);
     }
+  };
+
+  const onStdout = (chunk) => {
+    consumeStdout(stdoutDecoder.write(chunk));
   };
 
   const onStderr = (chunk) => {
@@ -84,6 +109,7 @@ function createJsonRpcClient(child, options = {}) {
 
   const onClose = (code, signal) => {
     closed = true;
+    consumeStdout(stdoutDecoder.end());
     if (stdoutBuffer.trim().length > 0) {
       stdoutNoise.push(stdoutBuffer.trim());
       stdoutBuffer = '';
@@ -138,7 +164,7 @@ function createJsonRpcClient(child, options = {}) {
           pending.delete(id);
           reject(diagnostic(`timed out after ${timeoutMs}ms waiting for ${label}`));
         }, timeoutMs);
-        pending.set(id, { resolve, reject, timeout });
+        pending.set(id, { resolve, reject, timeout, label });
 
         try {
           write({ jsonrpc: '2.0', id, method, params });
