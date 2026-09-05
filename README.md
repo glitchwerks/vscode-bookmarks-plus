@@ -250,6 +250,7 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
 - `npm install` — install dependencies
 - `npm run compile` — bundle `src/extension.ts` to `dist/extension.js` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
+- `npm run test:packaged-mcp` — package a real VSIX and exercise its bundled MCP server in a VS Code Extension Host
 - Press F5 in VS Code (or use the "Run Extension" launch config) to open an Extension Development Host with the extension loaded
 - `mcp-server/` has its own `package.json`, build, and test suite — not run by the commands
   above. See "Using bookmarks from Claude (MCP server)" for its build steps.
