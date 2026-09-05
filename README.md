@@ -91,15 +91,17 @@ server — can read and change them.
 ## Using bookmarks in VS Code chat (native MCP)
 
 With VS Code 1.101.0 or later, installing Bookmarks Plus also makes its bundled MCP server
-available to VS Code automatically. You do not need an `mcp.json` file, a separate npm package,
-or a server command: the extension registers a server named **Bookmarks Plus** for the current
-window.
+available to VS Code automatically. You also need VS Code Chat with Agent mode enabled and an
+account and organization policy that permit AI agents and MCP tools. You do not need an
+`mcp.json` file, a separate npm package, or a server command: the extension registers a server
+named **Bookmarks Plus** for the current window.
 
 To find and use it:
 
 1. Open exactly one workspace folder in VS Code.
-2. Run **MCP: List Servers** from the Command Palette and select **Bookmarks Plus**. The server
-   also appears with installed MCP servers in the Extensions view.
+2. Run **MCP: List Servers** from the Command Palette and select **Bookmarks Plus**. In VS Code
+   1.102 or later, the server also appears under **MCP SERVERS - INSTALLED** in the Extensions
+   view.
 3. Open Chat in Agent mode, select the tools button, and search for **Bookmarks Plus**. Its
    `list_bookmarks` and `add_bookmark` tools are available to the agent.
 
