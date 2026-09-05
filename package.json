@@ -9,12 +9,15 @@
     "url": "https://github.com/glitchwerks/vscode-bookmarks-plus.git"
   },
   "license": "MIT",
-  "engines": { "vscode": "^1.85.0" },
+  "engines": { "vscode": "^1.101.0" },
   "categories": ["Other"],
   "icon": "images/icon.png",
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      { "id": "bookmarks-plus.mcp", "label": "Bookmarks Plus" }
+    ],
     "viewsContainers": {
       "activitybar": [
         { "id": "bookmarksActivityBar", "title": "Bookmarks Plus", "icon": "$(bookmark)" }
@@ -139,7 +142,7 @@
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "@vscode/vsce": "^2.24.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "1.101.0",
     "@types/node": "^20.11.0",
     "@types/mocha": "^10.0.6",
     "typescript": "^5.4.0",
