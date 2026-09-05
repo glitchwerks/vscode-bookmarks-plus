@@ -31,6 +31,9 @@ jobs:
       - name: Run tests
         run: xvfb-run -a npm test
 
+      - name: Test bundled MCP server and VSIX contents
+        run: npm run test:mcp-bundle
+
   # Issue #66 / T4 (plan docs/superpowers/plans/2026-08-30-publish-mcp-server-to-npm.md,
   # §6 T4, D9 = Option B): separate job (not a matrix on `test` above) because
   # the extension's own steps use xvfb-run, which is Linux-only and cannot run
