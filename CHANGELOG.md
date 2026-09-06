@@ -21,6 +21,12 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 - The minimum supported VS Code version is now 1.101.0, which provides the MCP server definition
   provider API used by the native integration.
 
+### Fixed
+
+- Workspace-folder changes now rebind `.vscode/bookmarks.json` to the current single folder,
+  dispose the former folder's watcher, and disable both reads and writes in no-folder or
+  multi-root windows (#135). Rapid successive folder changes are processed in order.
+
 ## [1.3.0] — 2026-08-29
 
 ### Added
