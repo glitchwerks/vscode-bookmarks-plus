@@ -127,6 +127,18 @@ suite('Publish workflow native MCP release gates (#136)', () => {
   test('defaults to read-only contents and grants write access only to publishing', () => {
     assert.strictEqual(workflow.permissions?.contents, 'read');
     assert.strictEqual(getJob('publish').permissions?.contents, 'write');
+
+    for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+      if (jobName === 'publish') {
+        continue;
+      }
+
+      assert.notStrictEqual(
+        job.permissions?.contents,
+        'write',
+        `${jobName} must not override contents permission to write`
+      );
+    }
   });
 
   test('pins the privileged GitHub release action to an immutable commit', () => {
