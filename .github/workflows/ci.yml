@@ -1,6 +1,5 @@
 name: CI
 
-# The workflow runs tests for pull requests targeting main and pushes to main.
 on:
   pull_request:
     branches:
@@ -30,6 +29,9 @@ jobs:
 
       - name: Run tests
         run: xvfb-run -a npm test
+
+      - name: Test bundled MCP server and VSIX contents
+        run: npm run test:mcp-bundle
 
   # Issue #66 / PR #113, T4 / D9 Option B: separate job (not a matrix on
   # `test` above) because
@@ -93,3 +95,38 @@ jobs:
       - name: Packaging smoke test (npx entrypoint)
         working-directory: mcp-server
         run: npm run test:packaging
+
+  # Issue #127: the packaged extension and its bundled MCP process must behave
+  # identically on the Linux and Windows hosts users actually run.
+  packaged-native-mcp:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test packaged native MCP integration (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:packaged-mcp
+
+      - name: Test packaged native MCP integration (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:packaged-mcp

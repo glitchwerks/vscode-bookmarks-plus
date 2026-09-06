@@ -98,6 +98,8 @@ export interface FakeExtensionContext {
   workspaceState: FakeMemento;
   globalState: FakeMemento;
   environmentVariableCollection: FakeEnvironmentVariableCollection;
+  extensionUri: vscode.Uri;
+  extension: { packageJSON: { version: string } };
 }
 
 export function createFakeExtensionContext(): FakeExtensionContext {
@@ -105,7 +107,9 @@ export function createFakeExtensionContext(): FakeExtensionContext {
     subscriptions: [],
     workspaceState: new FakeMemento(),
     globalState: new FakeMemento(),
-    environmentVariableCollection: new FakeEnvironmentVariableCollection()
+    environmentVariableCollection: new FakeEnvironmentVariableCollection(),
+    extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
+    extension: { packageJSON: { version: '1.3.0' } }
   };
 }
 

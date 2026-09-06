@@ -5,6 +5,8 @@ import { BookmarkDecorationProvider } from './bookmarkDecorationProvider';
 import { BookmarkContextKeyManager } from './bookmarkContextKeys';
 import {
   MIRROR_RELATIVE_PATH,
+  MirrorLocation,
+  MirrorPort,
   WorkspaceMirrorFile,
   resolveMirrorLocation
 } from './bookmarkMirror';
@@ -26,6 +28,7 @@ import {
   GitApiFactory,
   GitExtensionExports
 } from './gitInfo';
+import { registerBookmarksMcpProvider } from './mcpServerProvider';
 import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
 import {
   loadRecentlyViewed,
@@ -39,8 +42,18 @@ const WATCHER_DEBOUNCE_MS = 150;
 const EXPLORER_DECORATION_ENABLED_KEY = 'bookmarksPlus.explorerDecoration.enabled';
 const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
 const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
+const MCP_TEST_DEFINITIONS_COMMAND = 'bookmarks.test.getMcpServerDefinitions';
 
 let activeStores: BookmarkStore[] = [];
+
+export interface McpActivationDependencies {
+  getWorkspaceFolders: () => readonly { uri: vscode.Uri }[] | undefined;
+  registerProvider: (
+    id: string,
+    provider: vscode.McpServerDefinitionProvider
+  ) => vscode.Disposable;
+  onDidChangeWorkspaceFolders: (listener: () => void) => vscode.Disposable;
+}
 
 export async function disposeStores(stores: (BookmarkStore | undefined)[]): Promise<void> {
   for (const store of stores) {
@@ -58,24 +71,146 @@ function logMirrorDisabled(output: OutputSink, reason: string): void {
   );
 }
 
-export function handleWorkspaceFoldersChanged(
+type EnabledMirrorLocation = Extract<MirrorLocation, { kind: 'enabled' }>;
+
+export interface WorkspaceMirrorChangeDependencies {
+  createMirror: (location: EnabledMirrorLocation) => MirrorPort;
+  createResources: (
+    location: EnabledMirrorLocation,
+    onMirrorEvent: () => void
+  ) => vscode.Disposable;
+}
+
+function createMirrorResources(
+  location: EnabledMirrorLocation,
+  onMirrorEvent: () => void
+): vscode.Disposable {
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(location.folder, MIRROR_RELATIVE_PATH)
+  );
+  const reloadDelayer = new Delayer(WATCHER_DEBOUNCE_MS);
+  const triggerReload = (): void => {
+    reloadDelayer.trigger(onMirrorEvent);
+  };
+
+  return vscode.Disposable.from(
+    watcher,
+    reloadDelayer,
+    watcher.onDidChange(triggerReload),
+    watcher.onDidCreate(triggerReload),
+    watcher.onDidDelete(triggerReload)
+  );
+}
+
+const defaultWorkspaceMirrorChangeDependencies: WorkspaceMirrorChangeDependencies = {
+  createMirror: (location) => new WorkspaceMirrorFile(location),
+  createResources: createMirrorResources
+};
+
+export async function handleWorkspaceFoldersChanged(
   store: BookmarkStore,
   output: OutputSink,
   folders: readonly { uri: vscode.Uri }[] | undefined,
   mirrorResources?: vscode.Disposable,
-  refresh?: () => void
-): boolean {
+  refresh?: () => void,
+  deps: WorkspaceMirrorChangeDependencies = defaultWorkspaceMirrorChangeDependencies
+): Promise<vscode.Disposable | undefined> {
   const location = resolveMirrorLocation(folders);
-  if (location.kind === 'enabled') {
+  await store.rebindMirror(undefined);
+  mirrorResources?.dispose();
+
+  if (location.kind === 'disabled') {
+    logMirrorDisabled(output, location.reason);
     refresh?.();
-    return false;
+    return undefined;
   }
 
-  logMirrorDisabled(output, location.reason);
-  store.detachMirror();
-  mirrorResources?.dispose();
-  refresh?.();
-  return true;
+  let resources: vscode.Disposable | undefined;
+  try {
+    await store.rebindMirror(deps.createMirror(location));
+    resources = deps.createResources(location, () => {
+      void store.reloadFromMirror();
+    });
+    await store.syncWithMirror();
+    refresh?.();
+    return resources;
+  } catch (error: unknown) {
+    resources?.dispose();
+    try {
+      await store.rebindMirror(undefined);
+    } catch {
+      // Preserve the original setup or reconciliation error.
+    }
+    throw error;
+  }
+}
+
+export class WorkspaceMirrorChangeCoordinator implements vscode.Disposable {
+  private pending: Promise<void> = Promise.resolve();
+  private disposed = false;
+  private provisionalResources?: vscode.Disposable;
+
+  constructor(
+    private readonly store: BookmarkStore,
+    private readonly output: OutputSink,
+    private mirrorResources?: vscode.Disposable,
+    private readonly refresh?: () => void,
+    private readonly deps: WorkspaceMirrorChangeDependencies = defaultWorkspaceMirrorChangeDependencies
+  ) {}
+
+  rebind(folders: readonly { uri: vscode.Uri }[] | undefined): Promise<void> {
+    const snapshot = folders ? [...folders] : undefined;
+    const operation = this.pending.then(async () => {
+      if (this.disposed) {
+        return;
+      }
+
+      let resources: vscode.Disposable | undefined;
+      try {
+        resources = await handleWorkspaceFoldersChanged(
+          this.store,
+          this.output,
+          snapshot,
+          this.mirrorResources,
+          this.refresh,
+          {
+            ...this.deps,
+            createResources: (location, onMirrorEvent) => {
+              const provisional = this.deps.createResources(location, onMirrorEvent);
+              this.provisionalResources = provisional;
+              if (this.disposed) {
+                provisional.dispose();
+                this.store.detachMirror();
+              }
+              return provisional;
+            }
+          }
+        );
+      } finally {
+        this.provisionalResources = undefined;
+      }
+      if (this.disposed) {
+        resources?.dispose();
+        this.store.detachMirror();
+        return;
+      }
+      this.mirrorResources = resources;
+    });
+
+    // Keep later transitions runnable after a failed one while returning the original rejection
+    // to the caller so activation can log it.
+    this.pending = operation.catch(() => undefined);
+    return operation;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.provisionalResources?.dispose();
+    this.provisionalResources = undefined;
+    this.mirrorResources?.dispose();
+    this.mirrorResources = undefined;
+    this.store.detachMirror();
+  }
 }
 
 function createCacheResolver(getGitApi: GitApiFactory): ResolveFn {
@@ -279,7 +414,16 @@ export function registerSuggestionsMaxItemsLiveReload(
   subscriptions.push(configChangeSubscription);
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(
+  context: vscode.ExtensionContext,
+  mcpDeps: McpActivationDependencies = {
+    getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
+    registerProvider: (id, provider) =>
+      vscode.lm.registerMcpServerDefinitionProvider(id, provider),
+    onDidChangeWorkspaceFolders: (listener) =>
+      vscode.workspace.onDidChangeWorkspaceFolders(listener)
+  }
+): void {
   const output = vscode.window.createOutputChannel('Bookmarks Plus');
   const location = resolveMirrorLocation(vscode.workspace.workspaceFolders);
 
@@ -293,7 +437,7 @@ export function activate(context: vscode.ExtensionContext): void {
   applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
 
   const store = new BookmarkStore(context.workspaceState, output, {
-    mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : undefined
+    mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : null
   });
   const globalStore = new BookmarkStore(context.globalState, output);
   const stores: ScopedStores = { workspace: store, global: globalStore };
@@ -343,6 +487,27 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => store.dispose() },
     { dispose: () => globalStore.dispose() }
   );
+
+  const mcpProvider = registerBookmarksMcpProvider(context.subscriptions, {
+    ...mcpDeps,
+    extensionUri: context.extensionUri,
+    extensionVersion: String(context.extension.packageJSON.version),
+    output
+  });
+  // VS Code has no public API for tests to enumerate registered MCP definitions. Expose the
+  // definition only inside the packaged test host, after the real registration path succeeds.
+  if (process.env.BOOKMARKS_PACKAGED_MCP_TEST === '1' && mcpProvider) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(MCP_TEST_DEFINITIONS_COMMAND, async () => {
+        const cancellation = new vscode.CancellationTokenSource();
+        try {
+          return await mcpProvider.provideMcpServerDefinitions(cancellation.token);
+        } finally {
+          cancellation.dispose();
+        }
+      })
+    );
+  }
 
   registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
     getConfiguration: () => vscode.workspace.getConfiguration(),
@@ -394,21 +559,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   let mirrorResources: vscode.Disposable | undefined;
   if (location.kind === 'enabled') {
-    // One path, never the workspace at large. The .tmp staging file used for atomic
-    // writes deliberately does not match this pattern.
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(location.folder, MIRROR_RELATIVE_PATH)
-    );
-    // A single logical save fires several raw filesystem events, so coalesce before reloading.
-    const reloadDelayer = new Delayer(WATCHER_DEBOUNCE_MS);
-    const onMirrorEvent = (): void => {
-      reloadDelayer.trigger(() => store.reloadFromMirror());
-    };
-    watcher.onDidChange(onMirrorEvent, undefined, context.subscriptions);
-    watcher.onDidCreate(onMirrorEvent, undefined, context.subscriptions);
-    watcher.onDidDelete(onMirrorEvent, undefined, context.subscriptions);
-    context.subscriptions.push(watcher, reloadDelayer);
-    mirrorResources = vscode.Disposable.from(watcher, reloadDelayer);
+    mirrorResources = createMirrorResources(location, () => {
+      void store.reloadFromMirror();
+    });
 
     void store.syncWithMirror().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -416,23 +569,22 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   }
 
+  const mirrorCoordinator = new WorkspaceMirrorChangeCoordinator(
+    store,
+    output,
+    mirrorResources,
+    () => provider?.refresh()
+  );
   context.subscriptions.push(
+    mirrorCoordinator,
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      const disabled = handleWorkspaceFoldersChanged(
-        store,
-        output,
-        vscode.workspace.workspaceFolders,
-        mirrorResources,
-        () => provider?.refresh()
-      );
-      if (disabled) {
-        mirrorResources = undefined;
-      }
+      void mirrorCoordinator.rebind(vscode.workspace.workspaceFolders).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        output.appendLine(`Bookmarks Plus: mirror rebind failed — ${message}`);
+      });
 
-      // Runs unconditionally, as a sibling to handleWorkspaceFoldersChanged rather than nested
-      // inside it (plan D-A). handleWorkspaceFoldersChanged early-returns on an enabled→enabled
-      // transition, but a single-root → single-root folder swap is exactly that transition and
-      // still needs the env var resynced to the new folder's path.
+      // The terminal environment tracks the VS Code workspace immediately; mirror transitions
+      // are serialized separately because they may need to flush an in-flight file write first.
       applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
     })
   );

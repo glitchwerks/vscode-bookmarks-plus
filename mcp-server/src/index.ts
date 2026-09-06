@@ -11,12 +11,18 @@ import { readMirror, writeMirrorAtomic } from './mirrorFile.js';
 import { createAddHandler } from './tools/add.js';
 import { createListHandler } from './tools/list.js';
 
+declare const __BOOKMARKS_PLUS_MCP_VERSION__: string | undefined;
+
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const UNKNOWN_VERSION = '0.0.0-unknown';
 
 function readPackageVersion(): string {
+  if (typeof __BOOKMARKS_PLUS_MCP_VERSION__ === 'string') {
+    return __BOOKMARKS_PLUS_MCP_VERSION__;
+  }
+
   let directory = path.dirname(fileURLToPath(import.meta.url));
 
   for (let depth = 0; depth < 5; depth += 1) {

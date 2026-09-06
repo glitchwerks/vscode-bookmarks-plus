@@ -6,10 +6,26 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ### Added
 
+- VS Code-native MCP integration (#124): installing Bookmarks Plus now registers the bundled
+  **Bookmarks Plus** MCP server automatically in VS Code. In a single-folder workspace, Agent
+  mode can use `list_bookmarks` and `add_bookmark` without an `mcp.json` entry or separate server
+  installation. The initial integration exposes workspace bookmarks only; global and multi-root
+  support remain tracked by #129 and #62.
 - Toggle Show Full Path (#115): a view-title-bar button switches bookmark labels between
   filename-only (the default) and the path relative to the workspace root, using `/` separators.
   Combines cleanly with Group by Repo (no duplicated repo-name prefix); a bookmark outside every
   workspace folder falls back to filename-only. The toggle state persists across window reloads.
+
+### Changed
+
+- The minimum supported VS Code version is now 1.101.0, which provides the MCP server definition
+  provider API used by the native integration.
+
+### Fixed
+
+- Workspace-folder changes now rebind `.vscode/bookmarks.json` to the current single folder,
+  dispose the former folder's watcher, and disable both reads and writes in no-folder or
+  multi-root windows (#135). Rapid successive folder changes are processed in order.
 
 ## [1.3.0] — 2026-08-29
 

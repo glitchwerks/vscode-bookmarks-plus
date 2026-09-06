@@ -10,29 +10,113 @@ on:
         description: 'Tag to publish (e.g. v1.3.0)'
         required: true
 
+permissions:
+  contents: read
+
 jobs:
+  resolve-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Checkout selected release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable release commit
+        id: release
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9] ]]; then
+            echo "::error::Tag '$TAG_NAME' does not match the extension-release pattern ^v[0-9] -- refusing to run the VSIX publish workflow"
+            exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+  mcp-bundle:
+    needs: [resolve-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Test bundled MCP server and VSIX contents
+        run: npm run test:mcp-bundle
+
+  packaged-native-mcp:
+    needs: [resolve-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Test packaged native MCP integration (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:packaged-mcp
+
+      - name: Test packaged native MCP integration (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:packaged-mcp
+
   publish:
+    needs: [resolve-release, mcp-bundle, packaged-native-mcp]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Guard against non-extension tags
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
-            echo "::error::Tag '$TAG' does not match the extension-release pattern ^v[0-9] -- refusing to run the VSIX publish workflow"
-            exit 1
-          fi
-
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: 'npm'
@@ -48,7 +132,7 @@ jobs:
 
       - name: Derive channel
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
           VERSION=${TAG#v}
           MINOR=$(echo "$VERSION" | cut -d. -f2)
@@ -72,7 +156,7 @@ jobs:
 
       - name: Create GitHub Release
         if: success()
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ env.TAG_NAME }}
           name: ${{ env.TAG_NAME }}

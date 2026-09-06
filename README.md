@@ -88,6 +88,37 @@ server — can read and change them.
   it to share a bookmark set with your team, or add `.vscode/bookmarks.json` to `.gitignore` to
   keep it private — bookmarks were private-per-user before this file existed.
 
+## Using bookmarks in VS Code chat (native MCP)
+
+With VS Code 1.101.0 or later, installing Bookmarks Plus also makes its bundled MCP server
+available to VS Code automatically. You also need VS Code Chat with Agent mode enabled and an
+account and organization policy that permit AI agents and MCP tools. You do not need an
+`mcp.json` file, a separate npm package, or a server command: the extension registers a server
+named **Bookmarks Plus** for the current window.
+
+To find and use it:
+
+1. Open exactly one workspace folder in VS Code.
+2. Run **MCP: List Servers** from the Command Palette and select **Bookmarks Plus**. In VS Code
+   1.102 or later, the server also appears under **MCP SERVERS - INSTALLED** in the Extensions
+   view.
+3. Open Chat in Agent mode, select the tools button, and search for **Bookmarks Plus**. Its
+   `list_bookmarks` and `add_bookmark` tools are available to the agent.
+
+The native server uses the same `.vscode/bookmarks.json` mirror described above. Its initial
+scope is intentionally limited:
+
+- It is available only when exactly one workspace folder is open. A no-folder window has no
+  workspace mirror to expose; multi-root support is tracked in
+  [#62](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/62).
+- It exposes workspace bookmarks only. Global-bookmark support requires the live bridge tracked
+  in [#129](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/129).
+- It has the same last-write-wins behavior as the mirror and provides the same two tools as the
+  standalone server described below.
+
+See VS Code's [MCP server documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
+for the editor's server-management and trust controls.
+
 ## Using bookmarks from Claude (MCP server)
 
 `mcp-server/` is a standalone Node/TypeScript package that exposes a workspace's
@@ -239,7 +270,7 @@ way to pin a workspace under Claude Code.
 
 ## Requirements
 
-Requires VS Code 1.85.0 or later. The repo-name badge uses the built-in `vscode.git` extension when it's enabled; the extension works without it, just without badges.
+Requires VS Code 1.101.0 or later. The repo-name badge uses the built-in `vscode.git` extension when it's enabled; the extension works without it, just without badges.
 
 ## Installation
 
@@ -250,6 +281,11 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
 - `npm install` — install dependencies
 - `npm run compile` — bundle `src/extension.ts` to `dist/extension.js` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
+- `npm run test:mcp-bundle` — verify the bundled MCP server and packaged VSIX contents
+- `npm run test:packaged-mcp` — package a real VSIX and exercise its bundled MCP server in a VS Code Extension Host
+- Marketplace publishes and GitHub Releases are gated on the MCP bundle check plus packaged-VSIX
+  validation on Linux and Windows, all pinned to one immutable tag commit; see
+  [`docs/release-strategy.md`](docs/release-strategy.md).
 - Press F5 in VS Code (or use the "Run Extension" launch config) to open an Extension Development Host with the extension loaded
 - `mcp-server/` has its own `package.json`, build, and test suite — not run by the commands
   above. See "Using bookmarks from Claude (MCP server)" for its build steps.
