@@ -156,7 +156,7 @@ test('isolated MCP bundle initializes with its own version and lists both tools'
   }
 });
 
-test('VSIX contains the bundled MCP runtime without raw server files or dependencies', async () => {
+test('VSIX contains the bundled MCP runtime without raw server files, dependencies, or scratch artifacts', async () => {
   assert.equal(
     rootPackage.devDependencies.yauzl,
     '2.10.0',
@@ -165,15 +165,25 @@ test('VSIX contains the bundled MCP runtime without raw server files or dependen
 
   const packageDir = makeTempDir('bookmarks-plus-vsix-');
   const vsixPath = join(packageDir, 'bookmarks-plus.vsix');
-  await vsce.createVSIX({
-    cwd: repoRoot,
-    packagePath: vsixPath,
-    dependencies: false,
-  });
+  const scratchDir = join(repoRoot, '.tmp');
+  const scratchFile = join(scratchDir, 'packaging-regression-sentinel.txt');
+  mkdirSync(scratchDir, { recursive: true });
+  writeFileSync(scratchFile, 'must not ship\n');
 
-  const entries = await readZipEntries(vsixPath);
-  assert.ok(entries.includes('extension/dist/extension.js'));
-  assert.ok(entries.includes('extension/dist/bookmarks-plus-mcp.mjs'));
-  assert.equal(entries.some((entry) => entry.startsWith('extension/mcp-server/')), false);
-  assert.equal(entries.some((entry) => entry.includes('/node_modules/')), false);
+  try {
+    await vsce.createVSIX({
+      cwd: repoRoot,
+      packagePath: vsixPath,
+      dependencies: false,
+    });
+
+    const entries = await readZipEntries(vsixPath);
+    assert.ok(entries.includes('extension/dist/extension.js'));
+    assert.ok(entries.includes('extension/dist/bookmarks-plus-mcp.mjs'));
+    assert.equal(entries.some((entry) => entry.startsWith('extension/mcp-server/')), false);
+    assert.equal(entries.some((entry) => entry.includes('/node_modules/')), false);
+    assert.equal(entries.some((entry) => entry.startsWith('extension/.tmp/')), false);
+  } finally {
+    await rm(scratchFile, { force: true });
+  }
 });

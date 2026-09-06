@@ -4,6 +4,7 @@
 .worktrees/**
 .github/**
 .superpowers/**
+.tmp/**
 mcp-server/**
 src/**
 out/**
