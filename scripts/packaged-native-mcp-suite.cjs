@@ -24,7 +24,7 @@ function readMirror(mirrorPath) {
 
 function toolPayload(response) {
   assert.equal(response.error, undefined, `unexpected JSON-RPC error: ${JSON.stringify(response.error)}`);
-  assert.equal(response.result?.isError, undefined, `unexpected MCP tool error: ${JSON.stringify(response.result)}`);
+  assert.notEqual(response.result?.isError, true, `unexpected MCP tool error: ${JSON.stringify(response.result)}`);
 
   if (response.result?.structuredContent !== undefined) {
     return response.result.structuredContent;
@@ -54,6 +54,21 @@ async function waitUntil(label, predicate, timeoutMs = 10_000) {
 }
 
 async function run() {
+  const explicitSuccessPayload = { items: [{ id: 'explicit-success' }] };
+  assert.deepEqual(
+    toolPayload({
+      jsonrpc: '2.0',
+      id: 1,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify(explicitSuccessPayload) }],
+        structuredContent: explicitSuccessPayload,
+        isError: false,
+      },
+    }),
+    explicitSuccessPayload,
+    'an explicit isError: false result must remain a successful structured payload',
+  );
+
   const expectedExtensionPath = process.env.BOOKMARKS_PACKAGED_EXTENSION_PATH;
   const expectedWorkspacePath = process.env.BOOKMARKS_PACKAGED_WORKSPACE_PATH;
   const expectedMcpVersion = process.env.BOOKMARKS_PACKAGED_MCP_VERSION;

@@ -85,12 +85,20 @@ test('production build emits both extension and MCP bundles', () => {
 });
 
 test('MCP bundle resolves its shared runtime dependencies from the verified root install', () => {
-  execFileSync(process.execPath, ['esbuild.js'], {
-    cwd: repoRoot,
-    stdio: 'pipe',
-  });
-  const sourceMap = JSON.parse(readFileSync(bundleSourceMap, 'utf8'));
-  const normalizedSources = sourceMap.sources.map((source) => source.replaceAll('\\', '/'));
+  let normalizedSources;
+  try {
+    execFileSync(process.execPath, ['esbuild.js'], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+    });
+    const sourceMap = JSON.parse(readFileSync(bundleSourceMap, 'utf8'));
+    normalizedSources = sourceMap.sources.map((source) => source.replaceAll('\\', '/'));
+  } finally {
+    execFileSync(process.execPath, ['esbuild.js', '--production'], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+    });
+  }
 
   for (const dependency of ['@modelcontextprotocol/sdk', 'zod']) {
     const rootDependencyPrefix = `../node_modules/${dependency}/`;
@@ -103,6 +111,11 @@ test('MCP bundle resolves its shared runtime dependencies from the verified root
     normalizedSources.some((source) => source.startsWith('../mcp-server/node_modules/')),
     false,
     'expected no bundle inputs from the independently installed standalone package dependencies',
+  );
+  assert.equal(
+    /\/\/# sourceMappingURL=/.test(readFileSync(builtBundle, 'utf8')),
+    false,
+    'expected source-map inspection to leave the production MCP bundle restored',
   );
 });
 

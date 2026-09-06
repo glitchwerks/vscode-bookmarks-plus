@@ -65,6 +65,8 @@ function getStep(job: WorkflowJob, name: string): WorkflowStep {
 suite('Publish workflow native MCP release gates (#136)', () => {
   const checkoutAction =
     'actions/checkout@11d5960a326750d5838078e36cf38b85af677262';
+  const setupNodeAction =
+    'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020';
   const releaseAction =
     'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65';
   const immutableReleaseCommit = '${{ needs.resolve-release.outputs.commit }}';
@@ -108,9 +110,12 @@ suite('Publish workflow native MCP release gates (#136)', () => {
   test('publishes the same immutable commit that the gates validate', () => {
     const publish = getJob('publish');
     const checkout = getStep(publish, 'Checkout');
+    const setupNode = getStep(publish, 'Setup Node');
 
+    assert.strictEqual(checkout.uses, checkoutAction);
     assert.strictEqual(checkout.with?.ref, immutableReleaseCommit);
     assert.strictEqual(checkout.with?.['persist-credentials'], false);
+    assert.strictEqual(setupNode.uses, setupNodeAction);
   });
 
   test('pins the privileged GitHub release action to an immutable commit', () => {
