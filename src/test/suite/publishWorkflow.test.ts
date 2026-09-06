@@ -20,6 +20,9 @@ interface WorkflowJob {
   needs?: string | string[];
   if?: string;
   'continue-on-error'?: boolean;
+  permissions?: {
+    contents?: string;
+  };
   outputs?: Record<string, string>;
   strategy?: {
     matrix?: {
@@ -30,6 +33,9 @@ interface WorkflowJob {
 }
 
 interface PublishWorkflow {
+  permissions?: {
+    contents?: string;
+  };
   on?: {
     push?: {
       tags?: string[];
@@ -116,6 +122,11 @@ suite('Publish workflow native MCP release gates (#136)', () => {
     assert.strictEqual(checkout.with?.ref, immutableReleaseCommit);
     assert.strictEqual(checkout.with?.['persist-credentials'], false);
     assert.strictEqual(setupNode.uses, setupNodeAction);
+  });
+
+  test('defaults to read-only contents and grants write access only to publishing', () => {
+    assert.strictEqual(workflow.permissions?.contents, 'read');
+    assert.strictEqual(getJob('publish').permissions?.contents, 'write');
   });
 
   test('pins the privileged GitHub release action to an immutable commit', () => {

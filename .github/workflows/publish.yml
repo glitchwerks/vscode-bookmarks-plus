@@ -10,6 +10,9 @@ on:
         description: 'Tag to publish (e.g. v1.3.0)'
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   resolve-release:
     runs-on: ubuntu-latest
