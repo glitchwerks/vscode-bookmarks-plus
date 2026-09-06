@@ -631,6 +631,78 @@ suite('BookmarkStore - mirror writes', () => {
 
     assert.strictEqual(mirror.writeCount, 0);
   });
+
+  test('flush preserves write order when an older mirror write is still running', async () => {
+    let releaseFirstWrite: (() => void) | undefined;
+    const firstWriteBlocked = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let firstWriteStarted: (() => void) | undefined;
+    const didStartFirstWrite = new Promise<void>((resolve) => {
+      firstWriteStarted = resolve;
+    });
+    const writes: string[] = [];
+    const mirror = new FakeMirror();
+    mirror.write = async (content: string) => {
+      writes.push(content);
+      if (writes.length === 1) {
+        firstWriteStarted!();
+        await firstWriteBlocked;
+      }
+      mirror.content = content;
+      mirror.writeCount++;
+    };
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput(), {
+      mirror,
+      writeDelayMs: 1
+    });
+
+    await store.addItem({ type: 'file', uri: 'file:///first.txt' });
+    await didStartFirstWrite;
+    await store.addItem({ type: 'file', uri: 'file:///second.txt' });
+    const flush = store.flushMirrorWrites();
+    await sleep(10);
+
+    assert.strictEqual(writes.length, 1, 'the newer physical write must wait for the older write');
+    releaseFirstWrite!();
+    await flush;
+    assert.deepStrictEqual(
+      JSON.parse(mirror.content!).items.map((item: { uri: string }) => item.uri),
+      ['file:///first.txt', 'file:///second.txt']
+    );
+  });
+
+  test('rebindMirror flushes the old mirror before sending later writes to the replacement', async () => {
+    const oldMirror = new FakeMirror();
+    const newMirror = new FakeMirror();
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput(), {
+      mirror: oldMirror,
+      writeDelayMs: 5
+    });
+    const rebindMirror = (store as BookmarkStore & {
+      rebindMirror?: (mirror: FakeMirror) => Promise<void>;
+    }).rebindMirror;
+
+    await store.addItem({ type: 'file', uri: 'file:///before-rebind.txt' });
+    assert.strictEqual(oldMirror.writeCount, 0, 'the original write must still be pending');
+    assert.strictEqual(typeof rebindMirror, 'function', 'BookmarkStore must support replacing its mirror');
+    await rebindMirror!.call(store, newMirror);
+
+    assert.strictEqual(oldMirror.writeCount, 1, 'the pending write must finish against the old mirror');
+    assert.deepStrictEqual(
+      JSON.parse(oldMirror.content!).items.map((item: { uri: string }) => item.uri),
+      ['file:///before-rebind.txt']
+    );
+
+    await store.addItem({ type: 'file', uri: 'file:///after-rebind.txt' });
+    await store.flushMirrorWrites();
+
+    assert.strictEqual(oldMirror.writeCount, 1, 'the old mirror must receive no writes after rebinding');
+    assert.deepStrictEqual(
+      JSON.parse(newMirror.content!).items.map((item: { uri: string }) => item.uri),
+      ['file:///before-rebind.txt', 'file:///after-rebind.txt']
+    );
+  });
 });
 
 suite('BookmarkStore - syncWithMirror (activation reconcile)', () => {
@@ -815,6 +887,45 @@ suite('BookmarkStore - reloadFromMirror (external change)', () => {
   function fileContent(items: unknown[], collections: unknown[] = []): string {
     return `${JSON.stringify({ version: 2, items, collections }, null, 2)}\n`;
   }
+
+  test('does not adopt an older file snapshot while a newer local write is queued', async () => {
+    let releaseFirstWrite: (() => void) | undefined;
+    const firstWriteBlocked = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let firstWriteStarted: (() => void) | undefined;
+    const didStartFirstWrite = new Promise<void>((resolve) => {
+      firstWriteStarted = resolve;
+    });
+    const mirror = new FakeMirror();
+    mirror.write = async (content: string) => {
+      if (mirror.writeCount === 0) {
+        firstWriteStarted!();
+        await firstWriteBlocked;
+      }
+      mirror.content = content;
+      mirror.writeCount++;
+    };
+    const store = new BookmarkStore(new FakeMemento(), new FakeOutput(), {
+      mirror,
+      writeDelayMs: 1
+    });
+
+    await store.addItem({ type: 'file', uri: 'file:///first.txt' });
+    await didStartFirstWrite;
+    const reload = store.reloadFromMirror();
+    await Promise.resolve();
+    await store.addItem({ type: 'file', uri: 'file:///second.txt' });
+    await sleep(10);
+    releaseFirstWrite!();
+    await reload;
+    await store.flushMirrorWrites();
+
+    assert.deepStrictEqual(
+      store.getAll().items.map((item) => item.uri),
+      ['file:///first.txt', 'file:///second.txt']
+    );
+  });
 
   test('ignores an event whose file content is our own last write', async () => {
     const mirror = new FakeMirror();
