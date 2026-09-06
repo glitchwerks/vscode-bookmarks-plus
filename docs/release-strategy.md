@@ -93,6 +93,8 @@ the codebase with `npm run lint` (eslint) before publishing.
 
 [VS Code docs — Pre-release extensions](https://code.visualstudio.com/api/working-with-extensions/publishing-extension#prerelease-extensions)
 
+[VS Code docs — Add and manage MCP servers](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
+
 ---
 
 ## GitHub Actions secret setup
@@ -148,10 +150,8 @@ immediately rather than silently skipping the publish.
 ## Cutting a release
 
 Follow these steps every time you publish a new version to the Marketplace.
-This extension has not yet published a first version, so the walkthrough
-below is written for that inaugural release — `1.0.0`, an even minor, which
-publishes to the **stable** channel. The same checklist applies unchanged to
-every release after this one; just substitute the target version number.
+Substitute the target version number for `X.Y.Z` and select the stable or
+pre-release lane using the odd/even minor rule above.
 
 1. **Merge all PRs** targeting the release into `main`.
 2. **Pull latest `main`:**
@@ -159,10 +159,8 @@ every release after this one; just substitute the target version number.
    git pull --ff-only origin main
    ```
 3. **Bump `version` in `package.json`:**
-   - For the first release, set it to `1.0.0` — an even minor, so it
-     publishes to the **stable** channel.
-   - For later releases: even minor (e.g. `1.2.0`) → stable; odd minor
-     (e.g. `1.1.0`) → pre-release.
+   - Even minor (e.g. `1.4.0`) → stable; odd minor
+     (e.g. `1.5.0`) → pre-release.
    - If you are staying in the same minor lane, increment the patch instead
      (e.g. `1.0.0` → `1.0.1`).
 4. **Update `CHANGELOG.md`:** move the `[Unreleased]` entries into a new
@@ -170,24 +168,48 @@ every release after this one; just substitute the target version number.
    ```markdown
    ## [X.Y.Z] — YYYY-MM-DD
    ```
-   For the first release this becomes `## [1.0.0] — YYYY-MM-DD`.
-5. **Commit:**
+5. **Run the automated release checks:**
+   ```bash
+   npm ci
+   npm run lint
+   npm test
+   npm run test:mcp-bundle
+   npm run test:packaged-mcp
+   ```
+   The packaged MCP test creates a real VSIX, loads that exact artifact in a pinned VS Code 1.101
+   Extension Host, and exercises both MCP tools on Windows or Linux
+   (`package.json:L127-L139`; `scripts/test-packaged-native-mcp.mjs:L102-L149`).
+6. **Perform the packaged-VSIX UI smoke check:**
+   1. Run `npm run vsce:package` and install the generated VSIX using
+      **Extensions: Install from VSIX...** in VS Code 1.101 or later.
+   2. Open a single-folder workspace and run **MCP: List Servers**. Confirm that
+      **Bookmarks Plus** is listed and starts without an error.
+   3. Open Chat in Agent mode, select the tools button, and confirm that
+      `list_bookmarks` and `add_bookmark` appear under **Bookmarks Plus**.
+   4. Repeat with no folder and with a multi-root workspace. Confirm that the server is not
+      advertised and that the **Bookmarks Plus** output channel explains the disabled state
+      (`src/mcpServerProvider.ts:L18-L52`).
+
+   The server-management names above follow the
+   [VS Code MCP documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
+   (fetched 2026-09-05).
+7. **Commit:**
    ```bash
    git commit -am "chore: bump to X.Y.Z"
    ```
-6. **Push the commit:**
+8. **Push the commit:**
    ```bash
    git push origin main
    ```
-7. **Create the tag:**
+9. **Create the tag:**
    ```bash
    git tag vX.Y.Z
    ```
-8. **Push the tag:**
+10. **Push the tag:**
    ```bash
    git push origin vX.Y.Z
    ```
-9. **Watch the workflow:** go to the **Actions** tab in the GitHub repo and
+11. **Watch the workflow:** go to the **Actions** tab in the GitHub repo and
    open the **Publish** workflow run that triggered on the tag push. On success
    the workflow will:
    - Publish the extension to the VS Code Marketplace (stable or pre-release
