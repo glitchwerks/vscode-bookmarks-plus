@@ -436,7 +436,7 @@ export function activate(
   applyWorkspaceEnv(context.environmentVariableCollection, vscode.workspace.workspaceFolders);
 
   const store = new BookmarkStore(context.workspaceState, output, {
-    mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : undefined
+    mirror: location.kind === 'enabled' ? new WorkspaceMirrorFile(location) : null
   });
   const globalStore = new BookmarkStore(context.globalState, output);
   const stores: ScopedStores = { workspace: store, global: globalStore };
@@ -544,21 +544,9 @@ export function activate(
 
   let mirrorResources: vscode.Disposable | undefined;
   if (location.kind === 'enabled') {
-    // One path, never the workspace at large. The .tmp staging file used for atomic
-    // writes deliberately does not match this pattern.
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(location.folder, MIRROR_RELATIVE_PATH)
-    );
-    // A single logical save fires several raw filesystem events, so coalesce before reloading.
-    const reloadDelayer = new Delayer(WATCHER_DEBOUNCE_MS);
-    const onMirrorEvent = (): void => {
-      reloadDelayer.trigger(() => store.reloadFromMirror());
-    };
-    watcher.onDidChange(onMirrorEvent, undefined, context.subscriptions);
-    watcher.onDidCreate(onMirrorEvent, undefined, context.subscriptions);
-    watcher.onDidDelete(onMirrorEvent, undefined, context.subscriptions);
-    context.subscriptions.push(watcher, reloadDelayer);
-    mirrorResources = vscode.Disposable.from(watcher, reloadDelayer);
+    mirrorResources = createMirrorResources(location, () => {
+      void store.reloadFromMirror();
+    });
 
     void store.syncWithMirror().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);

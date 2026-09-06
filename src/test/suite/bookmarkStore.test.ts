@@ -679,14 +679,10 @@ suite('BookmarkStore - mirror writes', () => {
       mirror: oldMirror,
       writeDelayMs: 5
     });
-    const rebindMirror = (store as BookmarkStore & {
-      rebindMirror?: (mirror: FakeMirror) => Promise<void>;
-    }).rebindMirror;
 
     await store.addItem({ type: 'file', uri: 'file:///before-rebind.txt' });
     assert.strictEqual(oldMirror.writeCount, 0, 'the original write must still be pending');
-    assert.strictEqual(typeof rebindMirror, 'function', 'BookmarkStore must support replacing its mirror');
-    await rebindMirror!.call(store, newMirror);
+    await store.rebindMirror(newMirror);
 
     assert.strictEqual(oldMirror.writeCount, 1, 'the pending write must finish against the old mirror');
     assert.deepStrictEqual(
@@ -709,6 +705,37 @@ suite('BookmarkStore - syncWithMirror (activation reconcile)', () => {
   function fileContent(items: unknown[], version = 2, collections: unknown[] = []): string {
     return `${JSON.stringify({ version, items, collections }, null, 2)}\n`;
   }
+
+  test('an initially disabled workspace mirror preserves local changes when a stale mirror is attached', async () => {
+    const staleContent = fileContent([
+      {
+        id: 'stale',
+        type: 'file',
+        uri: 'file:///stale.txt',
+        collectionId: null,
+        order: 0
+      }
+    ]);
+    const mirror = new FakeMirror(staleContent);
+    const memento = new FakeMemento();
+    const store = new BookmarkStore(memento, new FakeOutput(), {
+      mirror: null,
+      writeDelayMs: 5
+    });
+
+    await store.addItem({ type: 'file', uri: 'file:///local.txt' });
+    await store.rebindMirror(mirror);
+    await store.syncWithMirror();
+
+    assert.deepStrictEqual(
+      store.getAll().items.map((item) => item.uri),
+      ['file:///local.txt']
+    );
+    assert.deepStrictEqual(
+      JSON.parse(mirror.content!).items.map((item: { uri: string }) => item.uri),
+      ['file:///local.txt']
+    );
+  });
 
   test('seeds a missing mirror file from workspaceState', async () => {
     const mirror = new FakeMirror(undefined);

@@ -8,7 +8,8 @@ import {
   registerBookmarkDecorationProvider,
   registerRecentItemsTracker,
   registerRecentlyViewedTracker,
-  WorkspaceMirrorChangeCoordinator
+  WorkspaceMirrorChangeCoordinator,
+  WorkspaceMirrorChangeDependencies
 } from '../../extension';
 // Namespace import (not a named import) so `registerSuggestionsMaxItemsLiveReload` (#102, not yet
 // implemented) can be resolved dynamically below without a compile-time failure on the missing
@@ -598,37 +599,24 @@ suite('Extension - workspace-folder mirror changes', () => {
     await store.flushMirrorWrites();
     const writesToABeforeRebind = mirrorA.writeCount;
 
-    const handleChange = handleWorkspaceFoldersChanged as unknown as (
-      store: BookmarkStore,
-      output: FakeOutput,
-      folders: readonly { uri: vscode.Uri }[] | undefined,
-      mirrorResources: vscode.Disposable | undefined,
-      refresh: (() => void) | undefined,
-      deps: {
-        createMirror: (location: { folder: vscode.Uri }) => FakeMirror;
-        createResources: (
-          location: { folder: vscode.Uri },
-          onMirrorEvent: () => void
-        ) => vscode.Disposable;
+    const deps: WorkspaceMirrorChangeDependencies = {
+      createMirror: (location) => {
+        createdFor = location.folder;
+        return mirrorB;
+      },
+      createResources: (_location, listener) => {
+        onMirrorEvent = listener;
+        return newResources;
       }
-    ) => Promise<vscode.Disposable | undefined>;
+    };
 
-    const result = await handleChange(
+    const result = await handleWorkspaceFoldersChanged(
       store,
       output,
       [{ uri: vscode.Uri.file('/workspace/b') }],
       oldResources,
       refresh,
-      {
-        createMirror: (location) => {
-          createdFor = location.folder;
-          return mirrorB;
-        },
-        createResources: (_location, listener) => {
-          onMirrorEvent = listener;
-          return newResources;
-        }
-      }
+      deps
     );
 
     assert.strictEqual(oldResourcesDisposed, true, 'workspace A watcher must be disposed');

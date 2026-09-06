@@ -25,8 +25,8 @@ export interface OutputSink {
 }
 
 export interface BookmarkStoreOptions {
-  /** When omitted, the store behaves exactly as it did before the mirror existed. */
-  mirror?: MirrorPort;
+  /** Omit for a non-mirrored store; use null for a workspace whose mirror is disabled. */
+  mirror?: MirrorPort | null;
   /** Debounce window for mirror writes. Defaults to 250 ms; tests use a short value. */
   writeDelayMs?: number;
 }
@@ -74,8 +74,7 @@ export class BookmarkStore {
     this.mirrorBinding = options.mirror
       ? { generation: this.nextMirrorGeneration++, port: options.mirror }
       : undefined;
-    this.mirrorTemporarilyDetached =
-      Object.prototype.hasOwnProperty.call(options, 'mirror') && options.mirror === undefined;
+    this.mirrorTemporarilyDetached = options.mirror === null;
     this.mirrorDelayer = new Delayer(options.writeDelayMs ?? DEFAULT_MIRROR_WRITE_DELAY_MS);
     this.data = this.load();
   }
