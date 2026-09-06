@@ -150,6 +150,7 @@
     "esbuild": "^0.20.0",
     "mocha": "^10.3.0",
     "glob": "^10.3.10",
+    "js-yaml": "4.3.0",
     "@vscode/test-electron": "^2.3.9",
     "eslint": "^8.57.0",
     "@typescript-eslint/eslint-plugin": "^7.1.0",

@@ -212,6 +212,10 @@ pre-release lane using the odd/even minor rule above.
 11. **Watch the workflow:** go to the **Actions** tab in the GitHub repo and
    open the **Publish** workflow run that triggered on the tag push. On success
    the workflow will:
+   - Test the bundled MCP server and VSIX contents on Linux.
+   - Test the packaged VSIX integration on both Linux and Windows.
+   - Block Marketplace publication and GitHub Release creation unless every MCP
+     release gate succeeds for the same immutable commit resolved from the tag.
    - Publish the extension to the VS Code Marketplace (stable or pre-release
      channel, determined automatically from the minor parity).
    - Create a GitHub Release for the tag using the matching CHANGELOG entry as
@@ -227,5 +231,7 @@ publish without pushing a new tag:
 2. Enter the existing tag in the **Tag to publish** input (e.g. `v1.0.0`).
 3. Click **Run workflow**.
 
-The workflow checks out that tag, runs the full lint/test/compile pipeline, and
-publishes exactly as the automatic run would have.
+The workflow resolves the input as a qualified tag (never as a same-named
+branch), records its immutable commit once, and checks out that commit for the
+full lint/test/compile pipeline and the same bundled-MCP and packaged-VSIX gates
+as the automatic path before publishing exactly that tag.
