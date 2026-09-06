@@ -129,6 +129,9 @@ async function main() {
     const packagedManifest = JSON.parse(readFileSync(join(extensionPath, 'package.json'), 'utf8'));
     const mcpManifest = JSON.parse(readFileSync(join(repoRoot, 'mcp-server', 'package.json'), 'utf8'));
     assert.equal(packagedManifest.name, 'vscode-bookmarks-plus');
+    assert.deepEqual(packagedManifest.contributes?.mcpServerDefinitionProviders, [
+      { id: 'bookmarks-plus.mcp', label: 'Bookmarks Plus' },
+    ]);
 
     await runTests({
       version: '1.101.0',
@@ -138,6 +141,7 @@ async function main() {
         BOOKMARKS_PACKAGED_EXTENSION_PATH: extensionPath,
         BOOKMARKS_PACKAGED_WORKSPACE_PATH: workspaceDir,
         BOOKMARKS_PACKAGED_MCP_VERSION: mcpManifest.version,
+        BOOKMARKS_PACKAGED_MCP_TEST: '1',
       },
       launchArgs: [
         workspaceDir,

@@ -1,15 +1,12 @@
 name: CI
 
-# The native-MCP feature branch is included while #124 is assembled through sub-branch PRs.
 on:
   pull_request:
     branches:
       - main
-      - feature-124-vscode-native-mcp
   push:
     branches:
       - main
-      - feature-124-vscode-native-mcp
 
 jobs:
   test:
@@ -102,10 +99,7 @@ jobs:
   # Issue #127: the packaged extension and its bundled MCP process must behave
   # identically on the Linux and Windows hosts users actually run.
   packaged-native-mcp:
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/main' ||
-      github.ref == 'refs/heads/feature-124-vscode-native-mcp'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:

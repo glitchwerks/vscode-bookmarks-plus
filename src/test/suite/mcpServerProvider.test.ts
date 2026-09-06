@@ -79,7 +79,7 @@ suite('MCP server definitions (#126)', () => {
     let providerDisposeCount = 0;
     let listenerDisposeCount = 0;
 
-    registerBookmarksMcpProvider(subscriptions, {
+    const registered = registerBookmarksMcpProvider(subscriptions, {
       getWorkspaceFolders: () => folders,
       extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
       extensionVersion: '1.3.0',
@@ -97,6 +97,7 @@ suite('MCP server definitions (#126)', () => {
 
     assert.strictEqual(registeredId, 'bookmarks-plus.mcp');
     assert.ok(registeredProvider);
+    assert.strictEqual(registered, registeredProvider);
     const initialDefinitions = await registeredProvider.provideMcpServerDefinitions(
       {} as vscode.CancellationToken
     );
@@ -151,8 +152,9 @@ suite('MCP server definitions (#126)', () => {
     const output = new FakeOutput();
     let providerDisposeCount = 0;
 
-    assert.doesNotThrow(() =>
-      registerBookmarksMcpProvider(subscriptions, {
+    let registered: vscode.McpServerDefinitionProvider | undefined;
+    assert.doesNotThrow(() => {
+      registered = registerBookmarksMcpProvider(subscriptions, {
         getWorkspaceFolders: () => [{ uri: vscode.Uri.file('/workspaces/project') }],
         extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
         extensionVersion: '1.3.0',
@@ -161,9 +163,10 @@ suite('MCP server definitions (#126)', () => {
         onDidChangeWorkspaceFolders: () => {
           throw new Error('simulated workspace-listener failure');
         }
-      })
-    );
+      });
+    });
 
+    assert.strictEqual(registered, undefined);
     assert.strictEqual(providerDisposeCount, 1);
     assert.deepStrictEqual(subscriptions, []);
     assert.strictEqual(output.lines.length, 1);
@@ -181,6 +184,8 @@ suite('MCP server definitions (#126)', () => {
     };
     let registeredId: string | undefined;
     let registeredProvider: vscode.McpServerDefinitionProvider | undefined;
+    const previousPackagedTest = process.env.BOOKMARKS_PACKAGED_MCP_TEST;
+    process.env.BOOKMARKS_PACKAGED_MCP_TEST = '1';
 
     try {
       try {
@@ -211,8 +216,17 @@ suite('MCP server definitions (#126)', () => {
         (definitions?.[0] as vscode.McpStdioServerDefinition).version,
         '9.8.7'
       );
+      const observedDefinitions = await vscode.commands.executeCommand<
+        vscode.McpStdioServerDefinition[]
+      >('bookmarks.test.getMcpServerDefinitions');
+      assert.deepStrictEqual(observedDefinitions, definitions);
     } finally {
       context.subscriptions.forEach((subscription) => subscription.dispose());
+      if (previousPackagedTest === undefined) {
+        delete process.env.BOOKMARKS_PACKAGED_MCP_TEST;
+      } else {
+        process.env.BOOKMARKS_PACKAGED_MCP_TEST = previousPackagedTest;
+      }
     }
   });
 });

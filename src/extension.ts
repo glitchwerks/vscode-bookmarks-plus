@@ -42,6 +42,7 @@ const WATCHER_DEBOUNCE_MS = 150;
 const EXPLORER_DECORATION_ENABLED_KEY = 'bookmarksPlus.explorerDecoration.enabled';
 const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
 const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
+const MCP_TEST_DEFINITIONS_COMMAND = 'bookmarks.test.getMcpServerDefinitions';
 
 let activeStores: BookmarkStore[] = [];
 
@@ -487,12 +488,26 @@ export function activate(
     { dispose: () => globalStore.dispose() }
   );
 
-  registerBookmarksMcpProvider(context.subscriptions, {
+  const mcpProvider = registerBookmarksMcpProvider(context.subscriptions, {
     ...mcpDeps,
     extensionUri: context.extensionUri,
     extensionVersion: String(context.extension.packageJSON.version),
     output
   });
+  // VS Code has no public API for tests to enumerate registered MCP definitions. Expose the
+  // definition only inside the packaged test host, after the real registration path succeeds.
+  if (process.env.BOOKMARKS_PACKAGED_MCP_TEST === '1' && mcpProvider) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(MCP_TEST_DEFINITIONS_COMMAND, async () => {
+        const cancellation = new vscode.CancellationTokenSource();
+        try {
+          return await mcpProvider.provideMcpServerDefinitions(cancellation.token);
+        } finally {
+          cancellation.dispose();
+        }
+      })
+    );
+  }
 
   registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
     getConfiguration: () => vscode.workspace.getConfiguration(),

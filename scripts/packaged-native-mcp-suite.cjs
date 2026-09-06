@@ -9,33 +9,9 @@ const vscode = require('vscode');
 const { createJsonRpcClient } = require('./mcp-json-rpc.cjs');
 
 const EXTENSION_ID = 'cbeaulieu-gt.vscode-bookmarks-plus';
+const MCP_TEST_DEFINITIONS_COMMAND = 'bookmarks.test.getMcpServerDefinitions';
 const MIRROR_RELATIVE_PATH = path.join('.vscode', 'bookmarks.json');
 const MIRROR_ADOPTION_WINDOW_MS = 1_000;
-
-class MemoryMemento {
-  constructor() {
-    this.values = new Map();
-  }
-
-  get(key, defaultValue) {
-    return this.values.has(key) ? this.values.get(key) : defaultValue;
-  }
-
-  update(key, value) {
-    if (value === undefined) {
-      this.values.delete(key);
-    } else {
-      this.values.set(key, value);
-    }
-    return Promise.resolve();
-  }
-
-  keys() {
-    return [...this.values.keys()];
-  }
-
-  setKeysForSync() {}
-}
 
 function canonicalPath(value) {
   const resolved = realpathSync(value);
@@ -77,73 +53,6 @@ async function waitUntil(label, predicate, timeoutMs = 10_000) {
   throw new Error(`timed out waiting for ${label}${detail}`);
 }
 
-function createFakeContext(extension) {
-  return {
-    subscriptions: [],
-    workspaceState: new MemoryMemento(),
-    globalState: new MemoryMemento(),
-    environmentVariableCollection: {
-      persistent: true,
-      description: undefined,
-      replace() {},
-    },
-    extensionUri: extension.extensionUri,
-    extension: { packageJSON: extension.packageJSON },
-  };
-}
-
-async function capturePackagedProvider(extension, initialFolders) {
-  const extensionModulePath = path.resolve(extension.extensionPath, extension.packageJSON.main);
-  const extensionModule = require(extensionModulePath);
-  const context = createFakeContext(extension);
-  let folders = initialFolders;
-  let provider;
-  let activationError;
-
-  try {
-    extensionModule.activate(context, {
-      getWorkspaceFolders: () => folders,
-      registerProvider: (id, candidate) => {
-        assert.equal(id, 'bookmarks-plus.mcp');
-        provider = candidate;
-        return { dispose() {} };
-      },
-      onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
-    });
-  } catch (error) {
-    if (provider === undefined) {
-      throw error;
-    }
-    activationError = error;
-  }
-
-  assert.ok(provider, 'expected the packaged extension to register its MCP provider');
-  if (activationError !== undefined) {
-    const message = activationError instanceof Error ? activationError.message : String(activationError);
-    assert.match(
-      message,
-      /command ['"]bookmarks\.[^'"]+['"] already exists|already registered/i,
-      `unexpected failure after packaged MCP provider registration: ${message}`,
-    );
-  }
-
-  return {
-    async definitionsFor(nextFolders) {
-      folders = nextFolders;
-      return await provider.provideMcpServerDefinitions();
-    },
-    dispose() {
-      for (const disposable of [...context.subscriptions].reverse()) {
-        try {
-          disposable.dispose();
-        } catch {
-          // Best-effort isolation cleanup must not hide the contract assertions.
-        }
-      }
-    },
-  };
-}
-
 async function run() {
   const expectedExtensionPath = process.env.BOOKMARKS_PACKAGED_EXTENSION_PATH;
   const expectedWorkspacePath = process.env.BOOKMARKS_PACKAGED_WORKSPACE_PATH;
@@ -170,24 +79,35 @@ async function run() {
   const mirrorPath = path.join(workspacePath, MIRROR_RELATIVE_PATH);
   const targetPath = path.join(workspacePath, 'packaged-mcp-target.txt');
   const targetUri = vscode.Uri.file(targetPath);
-  const bundlePath = vscode.Uri.joinPath(
-    extension.extensionUri,
-    'dist',
-    'bookmarks-plus-mcp.mjs',
-  ).fsPath;
+  const definitions = await vscode.commands.executeCommand(MCP_TEST_DEFINITIONS_COMMAND);
+  assert.ok(Array.isArray(definitions), 'normal activation must expose registered MCP definitions');
+  assert.equal(definitions.length, 1, 'a single-root workspace must register one MCP server');
+  const definition = definitions[0];
+  assert.ok(
+    definition instanceof vscode.McpStdioServerDefinition,
+    'the registered MCP server must use stdio',
+  );
+  assert.equal(definition.label, 'Bookmarks Plus');
+  assert.equal(definition.version, extension.packageJSON.version);
+
+  const [bundlePath, definedWorkspacePath] = definition.args;
   assert.equal(existsSync(bundlePath), true, 'the extracted VSIX must contain the MCP bundle');
+  assert.equal(canonicalPath(definedWorkspacePath), canonicalPath(workspacePath));
   writeFileSync(targetPath, 'packaged MCP integration target\n');
 
   await waitUntil('the packaged extension mirror initialization', () => existsSync(mirrorPath));
 
-  const launch = {
-    command: process.execPath,
-    args: [bundlePath, workspacePath],
-    env: { ELECTRON_RUN_AS_NODE: '1' },
-  };
-  const child = spawn(launch.command, launch.args, {
-    cwd: extension.extensionPath,
-    env: { ...process.env, ...launch.env },
+  const childEnv = { ...process.env };
+  for (const [key, value] of Object.entries(definition.env)) {
+    if (value === null) {
+      delete childEnv[key];
+    } else {
+      childEnv[key] = String(value);
+    }
+  }
+  const child = spawn(definition.command, definition.args, {
+    cwd: definition.cwd?.fsPath ?? extension.extensionPath,
+    env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const client = createJsonRpcClient(child, { timeoutMs: 15_000 });
@@ -255,27 +175,6 @@ async function run() {
     throw error;
   } finally {
     await client.stop();
-  }
-
-  const provider = await capturePackagedProvider(extension, folders);
-  try {
-    const singleRootDefinitions = await provider.definitionsFor(folders);
-    assert.equal(singleRootDefinitions.length, 1);
-    assert.equal(singleRootDefinitions[0].command, launch.command);
-    assert.deepEqual(singleRootDefinitions[0].args, launch.args);
-    assert.deepEqual(singleRootDefinitions[0].env, launch.env);
-    assert.equal(singleRootDefinitions[0].version, extension.packageJSON.version);
-
-    assert.deepEqual(await provider.definitionsFor(undefined), []);
-    assert.deepEqual(
-      await provider.definitionsFor([
-        { uri: folders[0].uri },
-        { uri: vscode.Uri.file(path.join(workspacePath, 'second-root')) },
-      ]),
-      [],
-    );
-  } finally {
-    provider.dispose();
   }
 }
 

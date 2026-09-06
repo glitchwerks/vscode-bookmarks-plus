@@ -3,6 +3,10 @@ import type { OutputSink } from './bookmarkStore';
 
 export const MCP_SERVER_PROVIDER_ID = 'bookmarks-plus.mcp';
 
+export type BookmarksMcpProvider = vscode.McpServerDefinitionProvider<
+  vscode.McpStdioServerDefinition
+>;
+
 interface McpProviderDependencies {
   getWorkspaceFolders: () => readonly { uri: vscode.Uri }[] | undefined;
   extensionUri: vscode.Uri;
@@ -55,10 +59,10 @@ export function buildMcpServerDefinitions(
 export function registerBookmarksMcpProvider(
   subscriptions: vscode.Disposable[],
   deps: McpProviderDependencies
-): void {
+): BookmarksMcpProvider | undefined {
   const changeEmitter = new vscode.EventEmitter<void>();
   const resources: vscode.Disposable[] = [changeEmitter];
-  const provider: vscode.McpServerDefinitionProvider<vscode.McpStdioServerDefinition> = {
+  const provider: BookmarksMcpProvider = {
     onDidChangeMcpServerDefinitions: changeEmitter.event,
     provideMcpServerDefinitions: () =>
       buildMcpServerDefinitions(
@@ -73,6 +77,7 @@ export function registerBookmarksMcpProvider(
     resources.push(deps.registerProvider(MCP_SERVER_PROVIDER_ID, provider));
     resources.push(deps.onDidChangeWorkspaceFolders(() => changeEmitter.fire()));
     subscriptions.push(...resources);
+    return provider;
   } catch (error: unknown) {
     for (const resource of resources.reverse()) {
       try {
@@ -85,5 +90,6 @@ export function registerBookmarksMcpProvider(
     deps.output.appendLine(
       `Bookmarks Plus: native MCP provider registration failed — ${message}`
     );
+    return undefined;
   }
 }
