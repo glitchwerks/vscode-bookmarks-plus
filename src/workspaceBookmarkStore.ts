@@ -28,6 +28,7 @@ import {
   validateWorkspacePartitionSnapshot
 } from './workspacePartitionTypes';
 import { loadOrMigrateWorkspaceSnapshot } from './workspacePartitionMigration';
+import { hashContent, serializeBookmarkData } from './bookmarkMirror';
 
 export type {
   PartitionLifecycleChange,
@@ -114,6 +115,7 @@ interface MutationResult<T> {
   readonly value: T;
   readonly changed: boolean;
   readonly afterCommit?: () => void;
+  readonly silent?: boolean;
 }
 
 interface PendingRecovery {
@@ -242,6 +244,77 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       return undefined;
     }
     return this.ownerData(this.snapshot, owner) ? cloneData(this.ownerData(this.snapshot, owner)!) : undefined;
+  }
+
+  /** Returns a defensive snapshot of one partition's mirror content and precedence metadata. */
+  getMirrorState(partitionId: string): { data: BookmarkData; hash?: string; dirty: boolean } | undefined {
+    const partition = this.snapshot?.partitions.find((entry) => entry.id === partitionId);
+    return partition ? {
+      data: cloneData(partition.data), hash: partition.mirror.lastSuccessfulHash, dirty: partition.mirror.dirty
+    } : undefined;
+  }
+
+  /** Atomically adopts a validated mirror only while committed local content is clean. */
+  adoptMirrorData(partitionId: string, data: BookmarkData, hash: string, rewriteRequired: boolean): Promise<void> {
+    const incoming = cloneData(data);
+    return this.enqueue((draft) => {
+      const partition = this.requireAttachedCreateOwner(draft, { kind: 'partition', partitionId });
+      if (partition.mirror.dirty) { return unchanged(); }
+      for (const item of incoming.items) {
+        if (partition.data.items.some((existing) => existing.id === item.id && existing.uri === item.uri)) { continue; }
+        const owner = this.resolveAttachedOwnerIn(draft, vscode.Uri.parse(item.uri));
+        if (owner?.kind !== 'partition' || owner.partitionId !== partitionId) {
+          throw new PartitionBoundaryError('External bookmark URI is outside the selected workspace partition.');
+        }
+      }
+      partition.data = cloneData(incoming);
+      // Another partition may have adopted the same external IDs while this mutation was queued.
+      // Repair against the draft inside the atomic transaction, never against an earlier read view.
+      const used = new Set([
+        ...draft.partitions.map((entry) => entry.id),
+        ...draft.partitions.filter((entry) => entry.id !== partitionId)
+          .flatMap((entry) => [...entry.data.collections, ...entry.data.items].map((record) => record.id)),
+        ...[...draft.unassigned.collections, ...draft.unassigned.items].map((entry) => entry.id)
+      ]);
+      const collectionIds = new Map<string, string>();
+      let repaired = false;
+      for (const collection of partition.data.collections) {
+        const originalId = collection.id;
+        if (used.has(originalId)) { collection.id = this.allocateId(draft); repaired = true; }
+        used.add(collection.id);
+        collectionIds.set(originalId, collection.id);
+      }
+      for (const item of partition.data.items) {
+        if (used.has(item.id)) { item.id = this.allocateId(draft); repaired = true; }
+        used.add(item.id);
+        if (item.collectionId !== null) { item.collectionId = collectionIds.get(item.collectionId) ?? item.collectionId; }
+      }
+      partition.replacementEligible = false;
+      partition.mirror = { lastSuccessfulHash: hash, dirty: rewriteRequired || repaired };
+      return changed();
+    });
+  }
+
+  /** Records a successful physical write without clearing a newer local content mutation. */
+  recordMirrorWrite(partitionId: string, hash: string): Promise<void> {
+    return this.enqueue((draft) => {
+      const partition = draft.partitions.find((entry) => entry.id === partitionId);
+      if (!partition) { return unchanged(); }
+      const dirty = hashContent(serializeBookmarkData(partition.data)) !== hash;
+      if (partition.mirror.lastSuccessfulHash === hash && partition.mirror.dirty === dirty) { return unchanged(); }
+      partition.mirror = { lastSuccessfulHash: hash, dirty };
+      return { ...changed(), silent: true };
+    });
+  }
+
+  /** Persists failed-write precedence without emitting a content event. */
+  recordMirrorDirty(partitionId: string): Promise<void> {
+    return this.enqueue((draft) => {
+      const partition = draft.partitions.find((entry) => entry.id === partitionId);
+      if (!partition || partition.mirror.dirty) { return unchanged(); }
+      partition.mirror.dirty = true;
+      return { ...changed(), silent: true };
+    });
   }
 
   /** Finds exact stored URI matches without exposing the mutable snapshot records. */
@@ -757,7 +830,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       this.snapshot = draft;
       this.revision++;
       outcome.afterCommit?.();
-      this._onBookmarksChanged.fire();
+      if (!outcome.silent) { this._onBookmarksChanged.fire(); }
       return outcome.value;
     });
     this.operationTail = run.then(() => undefined, () => undefined);
@@ -810,7 +883,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       return;
     }
     const partition = snapshot.partitions.find((candidate) => candidate.id === owner.partitionId);
-    if (partition?.attachment) {
+    if (partition) {
       markContentMutation(partition);
     }
   }

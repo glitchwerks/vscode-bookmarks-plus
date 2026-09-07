@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { Prompter } from '../../commands';
 import { MirrorPort } from '../../bookmarkMirror';
+import type { PartitionMirrorResources } from '../../workspaceMirrorCoordinator';
 
 export class FakeMemento implements vscode.Memento {
   private store = new Map<string, unknown>();
@@ -149,6 +150,24 @@ export class FakeMirror implements MirrorPort {
     }
     this.content = content;
     this.writeCount++;
+  }
+}
+
+/** Mirror port plus independently fireable watcher events and disposal evidence. */
+export class FakePartitionMirrorResources implements PartitionMirrorResources {
+  readonly change = new vscode.EventEmitter<void>();
+  readonly create = new vscode.EventEmitter<void>();
+  readonly delete = new vscode.EventEmitter<void>();
+  readonly onDidChange = this.change.event;
+  readonly onDidCreate = this.create.event;
+  readonly onDidDelete = this.delete.event;
+  disposed = false;
+  constructor(readonly port: FakeMirror = new FakeMirror()) {}
+  dispose(): void {
+    this.disposed = true;
+    this.change.dispose();
+    this.create.dispose();
+    this.delete.dispose();
   }
 }
 
