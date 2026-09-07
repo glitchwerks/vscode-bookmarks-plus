@@ -4,11 +4,15 @@ import { DuplicateBookmarkError } from '../../bookmarkStore';
 import { BookmarkItem } from '../../types';
 import {
   PartitionBoundaryError,
+  PartitionLifecycleChange,
+  RecoveryConflictError,
+  StaleRecoveryPreviewError,
   WorkspaceBookmarkStore,
   WorkspaceDataUnavailableError
 } from '../../workspaceBookmarkStore';
 import { RootCandidate } from '../../rootUri';
 import {
+  RecoveryFileSystem,
   WORKSPACE_PARTITION_STORAGE_KEY,
   WorkspacePartitionSnapshot
 } from '../../workspacePartitionTypes';
@@ -71,6 +75,44 @@ function snapshotWithAttachedRoot(): WorkspacePartitionSnapshot {
     canonicalRootUri: ROOT_A.toString()
   };
   return snapshot;
+}
+
+function recoverySnapshot(options: { destination?: 'none' | 'eligible' | 'established' } = {}): WorkspacePartitionSnapshot {
+  const destination = options.destination ?? 'none';
+  const partitions: WorkspacePartitionSnapshot['partitions'] = [{
+    id: '00000000-0000-4000-8000-000000000001', attachment: null,
+    lastKnownRootUri: 'file:///old/repo', canonicalLastKnownRootUri: 'file:///old/repo',
+    replacementEligible: false,
+    data: {
+      version: 2, collections: [], items: [
+        { id: '00000000-0000-4000-8000-000000000011', type: 'file', uri: 'file:///old/repo/src/a.ts', collectionId: null, order: 0 },
+        { id: '00000000-0000-4000-8000-000000000012', type: 'file', uri: 'file:///old/repo/src/missing.ts', collectionId: null, order: 1 },
+        { id: '00000000-0000-4000-8000-000000000013', type: 'file', uri: 'file:///elsewhere/kept.ts', collectionId: null, order: 2 }
+      ]
+    }, mirror: { dirty: false }
+  }];
+  if (destination !== 'none') {
+    partitions.push({
+      id: '00000000-0000-4000-8000-000000000002',
+      attachment: { rootUri: 'file:///new/repo', canonicalRootUri: 'file:///new/repo' },
+      lastKnownRootUri: 'file:///new/repo', canonicalLastKnownRootUri: 'file:///new/repo',
+      replacementEligible: destination === 'eligible',
+      data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+  }
+  return { version: 1, partitions, unassigned: { version: 2, items: [], collections: [] } };
+}
+
+function recoveryFilesystem(resolving: readonly string[]): RecoveryFileSystem {
+  const targets = new Set(resolving);
+  return {
+    stat: async (uri) => {
+      if (targets.has(uri.toString())) {
+        return { type: vscode.FileType.File, ctime: 0, mtime: 0, size: 1 };
+      }
+      throw new Error('not found');
+    }
+  };
 }
 
 class DeferredFirstWorkspaceUpdateMemento extends FakeMemento {
@@ -396,5 +438,272 @@ suite('WorkspaceBookmarkStore content operations', () => {
     );
     await assert.rejects(store.addCollection({ kind: 'unassigned' }, 'Nope'), WorkspaceDataUnavailableError);
     assert.strictEqual(state.updateCallCount, updatesBefore);
+  });
+});
+
+suite('WorkspaceBookmarkStore root lifecycle', () => {
+  test('adding a nested root preserves existing ownership while assigning future URIs to the nested partition', async () => {
+    const state = new FakeMemento();
+    const parent = vscode.Uri.parse('file:///work');
+    const store = await WorkspaceBookmarkStore.create({
+      state,
+      roots: [{ id: 'parent', label: 'Work', uri: parent }],
+      output: new FakeOutput(),
+      createId: ids()
+    });
+    const parentId = store.getView().attached[0].partitionId;
+    const item = await store.addItem(
+      { kind: 'partition', partitionId: parentId },
+      { type: 'file', uri: 'file:///work/child/existing.ts' }
+    );
+
+    const result = await store.reconcileRoots([
+      { id: 'parent', label: 'Work', uri: parent },
+      { id: 'child', label: 'Child', uri: vscode.Uri.parse('file:///work/child') }
+    ]);
+
+    assert.strictEqual(store.getOwnerData({ kind: 'partition', partitionId: parentId })?.items[0].id, item.id);
+    const childOwner = store.resolveAttachedOwner(vscode.Uri.parse('file:///work/child/new.ts'));
+    assert.strictEqual(childOwner?.kind, 'partition');
+    assert.notStrictEqual(childOwner?.kind === 'partition' ? childOwner.partitionId : undefined, parentId);
+    assert.strictEqual(result.attachedPartitionIds.length, 1);
+  });
+
+  test('reconciliation detaches a missing root and reattaches its exact canonical return', async () => {
+    const state = new FakeMemento();
+    const root = vscode.Uri.parse('file:///work');
+    const store = await WorkspaceBookmarkStore.create({
+      state,
+      roots: [{ id: 'work', label: 'Work', uri: root }],
+      output: new FakeOutput(),
+      createId: ids()
+    });
+    const partitionId = store.getView().attached[0].partitionId;
+
+    const removal = await store.reconcileRoots([]);
+    const returned = await store.reconcileRoots([
+      { id: 'returned', label: 'Returned work', uri: vscode.Uri.parse('FILE:///work/') }
+    ]);
+
+    assert.deepStrictEqual(removal.detachedPartitionIds, [partitionId]);
+    assert.deepStrictEqual(returned.attachedPartitionIds, [partitionId]);
+    assert.strictEqual(store.getView().attached[0].partitionId, partitionId);
+  });
+
+  test('reordering and relabeling roots updates the lifecycle view without persistence but emits one lifecycle event', async () => {
+    const { store, state } = await readyStore();
+    const changes: PartitionLifecycleChange[] = [];
+    store.onDidChangePartitions((change) => changes.push(change));
+    let contentEvents = 0;
+    store.onBookmarksChanged(() => contentEvents++);
+    const writes = state.updateCallCount;
+
+    await store.reconcileRoots([
+      { id: 'root-b', label: 'Renamed B', uri: ROOT_B },
+      { id: 'root-a', label: 'Renamed A', uri: ROOT_A }
+    ]);
+
+    assert.deepStrictEqual(store.getView().attached.map((partition) => partition.label), ['Renamed B', 'Renamed A']);
+    assert.strictEqual(state.updateCallCount, writes);
+    assert.strictEqual(contentEvents, 0);
+    assert.strictEqual(changes.length, 1);
+    assert.deepStrictEqual(changes[0].attachedPartitionIds, []);
+    assert.deepStrictEqual(changes[0].detachedPartitionIds, []);
+  });
+
+  test('canonical collisions keep roots unavailable without replacing or reassigning partitions', async () => {
+    const state = new FakeMemento({
+      [WORKSPACE_PARTITION_STORAGE_KEY]: {
+        version: 1,
+        partitions: [
+          {
+            id: '00000000-0000-4000-8000-000000000001', attachment: null,
+            lastKnownRootUri: 'file:///work', canonicalLastKnownRootUri: 'file:///work',
+            replacementEligible: false, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+          },
+          {
+            id: '00000000-0000-4000-8000-000000000002', attachment: null,
+            lastKnownRootUri: 'FILE:///work/', canonicalLastKnownRootUri: 'file:///work',
+            replacementEligible: false, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+          }
+        ],
+        unassigned: { version: 2, items: [], collections: [] }
+      }
+    });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [], output: new FakeOutput(), createId: ids() });
+    const writes = state.updateCallCount;
+
+    const result = await store.reconcileRoots([
+      { id: 'one', label: 'One', uri: vscode.Uri.parse('file:///work') },
+      { id: 'two', label: 'Two', uri: vscode.Uri.parse('FILE:///work/') }
+    ]);
+
+    assert.deepStrictEqual(result.unavailableCanonicalRoots, ['file:///work']);
+    assert.strictEqual(store.getView().attached.length, 0);
+    assert.strictEqual(store.getView().detached.length, 2);
+    assert.strictEqual(state.updateCallCount, writes);
+  });
+
+  test('multiple detached partitions matching one returning identity leave that root unavailable', async () => {
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: recoverySnapshot() });
+    const snapshot = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    snapshot.partitions.push({
+      id: '00000000-0000-4000-8000-000000000099', attachment: null,
+      lastKnownRootUri: 'FILE:///old/repo/', canonicalLastKnownRootUri: 'file:///old/repo',
+      replacementEligible: false, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+    const root = { id: 'returning', label: 'Old repo', uri: vscode.Uri.parse('file:///old/repo') };
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [], output: new FakeOutput(), createId: ids() });
+
+    const result = await store.reconcileRoots([root]);
+
+    assert.deepStrictEqual(result.unavailableCanonicalRoots, ['file:///old/repo']);
+    assert.strictEqual(store.getView().attached.length, 0);
+    assert.strictEqual(store.getView().detached.length, 2);
+  });
+});
+
+suite('WorkspaceBookmarkStore recovery', () => {
+  const destination: RootCandidate = {
+    id: 'new-root', label: 'New repo', uri: vscode.Uri.parse('file:///new/repo')
+  };
+
+  async function recoveryStore(destinationState: 'none' | 'eligible' | 'established' = 'none') {
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: recoverySnapshot({ destination: destinationState }) });
+    const store = await WorkspaceBookmarkStore.create({
+      state, roots: [destination], output: new FakeOutput(), createId: ids()
+    });
+    return { state, store, detachedId: '00000000-0000-4000-8000-000000000001' };
+  }
+
+  test('salvage previews resolving, missing, and incompatible items then rewrites only resolving URIs', async () => {
+    const { state, store, detachedId } = await recoveryStore();
+    const writes = state.updateCallCount;
+    const preview = await store.previewRecovery(
+      detachedId,
+      destination,
+      'salvage',
+      recoveryFilesystem(['file:///new/repo/src/a.ts'])
+    );
+
+    assert.deepStrictEqual(
+      { resolving: preview.resolving, missing: preview.missing, incompatible: preview.incompatible },
+      { resolving: 1, missing: 1, incompatible: 1 }
+    );
+    await store.commitRecovery(preview.token);
+
+    assert.strictEqual(state.updateCallCount, writes + 1);
+    assert.deepStrictEqual(
+      store.getView().attached[0].data.items.map((item) => item.uri),
+      ['file:///new/repo/src/a.ts', 'file:///old/repo/src/missing.ts', 'file:///elsewhere/kept.ts']
+    );
+  });
+
+  test('reattach-only preserves every item URI and consumes its recovery token once', async () => {
+    const { store, detachedId } = await recoveryStore();
+    const preview = await store.previewRecovery(detachedId, destination, 'reattach-only', recoveryFilesystem([]));
+
+    await store.commitRecovery(preview.token);
+
+    assert.deepStrictEqual(
+      store.getView().attached[0].data.items.map((item) => item.uri),
+      ['file:///old/repo/src/a.ts', 'file:///old/repo/src/missing.ts', 'file:///elsewhere/kept.ts']
+    );
+    await assert.rejects(store.commitRecovery(preview.token), RecoveryConflictError);
+  });
+
+  test('recovery replaces only an empty replacement-eligible destination partition', async () => {
+    const { store, detachedId } = await recoveryStore('eligible');
+    const preview = await store.previewRecovery(detachedId, destination, 'reattach-only', recoveryFilesystem([]));
+
+    await store.commitRecovery(preview.token);
+
+    assert.deepStrictEqual(store.getView().attached.map((partition) => partition.partitionId), [detachedId]);
+  });
+
+  test('recovery rejects established and invalid destinations without mutation', async () => {
+    const { state, store, detachedId } = await recoveryStore('established');
+    const before = JSON.stringify(store.getView());
+    const writes = state.updateCallCount;
+
+    await assert.rejects(store.previewRecovery(detachedId, destination, 'salvage', recoveryFilesystem([])), RecoveryConflictError);
+    await assert.rejects(
+      store.previewRecovery(
+        detachedId,
+        { id: 'not-current', label: 'Elsewhere', uri: vscode.Uri.parse('file:///elsewhere') },
+        'reattach-only',
+        recoveryFilesystem([])
+      ),
+      RecoveryConflictError
+    );
+
+    assert.strictEqual(JSON.stringify(store.getView()), before);
+    assert.strictEqual(state.updateCallCount, writes);
+  });
+
+  test('recovery rejects an invalid canonical destination and a stale preview without mutation', async () => {
+    const { state, store, detachedId } = await recoveryStore();
+    await assert.rejects(
+      store.previewRecovery(
+        detachedId,
+        { id: destination.id, label: destination.label, uri: vscode.Uri.parse('file:///new/repo?query=bad') },
+        'reattach-only',
+        recoveryFilesystem([])
+      ),
+      RecoveryConflictError
+    );
+    await assert.rejects(
+      store.previewRecovery(
+        detachedId,
+        { id: destination.id, label: destination.label, uri: vscode.Uri.parse('file:///new/repo#fragment') },
+        'reattach-only',
+        recoveryFilesystem([])
+      ),
+      RecoveryConflictError
+    );
+    const preview = await store.previewRecovery(detachedId, destination, 'reattach-only', recoveryFilesystem([]));
+    await store.reconcileRoots([destination, { id: 'other', label: 'Other', uri: vscode.Uri.parse('file:///other') }]);
+    const beforeCommit = JSON.stringify(store.getView());
+    const writes = state.updateCallCount;
+
+    await assert.rejects(store.commitRecovery(preview.token), StaleRecoveryPreviewError);
+
+    assert.strictEqual(JSON.stringify(store.getView()), beforeCommit);
+    assert.strictEqual(state.updateCallCount, writes);
+  });
+
+  test('a content mutation in another attached partition makes a recovery preview stale', async () => {
+    const otherRoot: RootCandidate = { id: 'other-root', label: 'Other', uri: vscode.Uri.parse('file:///other') };
+    const snapshot = recoverySnapshot();
+    snapshot.partitions.push({
+      id: '00000000-0000-4000-8000-000000000003',
+      attachment: { rootUri: otherRoot.uri.toString(), canonicalRootUri: otherRoot.uri.toString() },
+      lastKnownRootUri: otherRoot.uri.toString(), canonicalLastKnownRootUri: otherRoot.uri.toString(),
+      replacementEligible: true, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [destination, otherRoot], output: new FakeOutput(), createId: ids() });
+    const preview = await store.previewRecovery(
+      '00000000-0000-4000-8000-000000000001', destination, 'reattach-only', recoveryFilesystem([])
+    );
+
+    await store.addItem(
+      { kind: 'partition', partitionId: '00000000-0000-4000-8000-000000000003' },
+      { type: 'file', uri: 'file:///other/changed.ts' }
+    );
+
+    await assert.rejects(store.commitRecovery(preview.token), StaleRecoveryPreviewError);
+  });
+
+  test('failed recovery persistence rolls back and leaves the current preview retryable', async () => {
+    const { state, store, detachedId } = await recoveryStore();
+    const preview = await store.previewRecovery(detachedId, destination, 'reattach-only', recoveryFilesystem([]));
+    state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
+
+    await assert.rejects(store.commitRecovery(preview.token));
+    assert.strictEqual(store.getView().detached[0].partitionId, detachedId);
+
+    await store.commitRecovery(preview.token);
+    assert.strictEqual(store.getView().attached[0].partitionId, detachedId);
   });
 });

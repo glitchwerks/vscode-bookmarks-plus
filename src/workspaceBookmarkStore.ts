@@ -6,7 +6,7 @@ import {
   DuplicateBookmarkError,
   OutputSink
 } from './bookmarkStore';
-import { RootCandidate, findDeepestRoot } from './rootUri';
+import { RootCandidate, canonicalizeRootUri, findDeepestRoot, rebaseUri } from './rootUri';
 import {
   BookmarkCollection,
   BookmarkData,
@@ -19,10 +19,23 @@ import {
   WorkspaceOwnerRef,
   WorkspacePartition,
   WorkspacePartitionSnapshot,
+  PartitionLifecycleChange,
+  RecoveryFileSystem,
+  RecoveryMode,
+  RecoveryPreview,
+  RootReconcileResult,
   cloneWorkspacePartitionSnapshot,
   validateWorkspacePartitionSnapshot
 } from './workspacePartitionTypes';
 import { loadOrMigrateWorkspaceSnapshot } from './workspacePartitionMigration';
+
+export type {
+  PartitionLifecycleChange,
+  RecoveryFileSystem,
+  RecoveryMode,
+  RecoveryPreview,
+  RootReconcileResult
+} from './workspacePartitionTypes';
 
 /** Rejects a mutation that would escape an attached partition's root boundary. */
 export class PartitionBoundaryError extends Error {
@@ -45,6 +58,22 @@ export class WorkspaceDataUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'WorkspaceDataUnavailableError';
+  }
+}
+
+/** Rejects recovery when its destination or selected detached partition is no longer eligible. */
+export class RecoveryConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecoveryConflictError';
+  }
+}
+
+/** Rejects a recovery preview after any persisted workspace snapshot revision. */
+export class StaleRecoveryPreviewError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleRecoveryPreviewError';
   }
 }
 
@@ -84,6 +113,15 @@ export interface WorkspaceStoreView {
 interface MutationResult<T> {
   readonly value: T;
   readonly changed: boolean;
+  readonly afterCommit?: () => void;
+}
+
+interface PendingRecovery {
+  readonly revision: number;
+  readonly partitionId: string;
+  readonly destination: RootCandidate;
+  readonly replacementPartitionId?: string;
+  readonly rewrites: ReadonlyMap<string, string>;
 }
 
 const noopOutput: OutputSink = { appendLine: () => {} };
@@ -100,10 +138,15 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
   private disposed = false;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
   readonly onBookmarksChanged: vscode.Event<void> = this._onBookmarksChanged.event;
+  private readonly _onDidChangePartitions = new vscode.EventEmitter<PartitionLifecycleChange>();
+  readonly onDidChangePartitions: vscode.Event<PartitionLifecycleChange> = this._onDidChangePartitions.event;
+  private readonly pendingRecoveries = new Map<string, PendingRecovery>();
+  private unavailableCanonicalRoots: readonly string[] = [];
+  private revision = 0;
 
   private constructor(
     private readonly state: vscode.Memento,
-    private readonly roots: readonly RootCandidate[],
+    private roots: readonly RootCandidate[],
     private readonly output: OutputSink,
     private readonly createId: () => string
   ) {}
@@ -163,7 +206,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     for (const partition of this.snapshot.partitions) {
       if (partition.attachment) {
         const root = this.roots.find(
-          (candidate) => candidate.uri.toString() === partition.attachment!.rootUri
+          (candidate) => canonicalizeRootUri(candidate.uri) === partition.attachment!.canonicalRootUri
         );
         attached.push({
           partitionId: partition.id,
@@ -183,12 +226,13 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         });
       }
     }
+    attached.sort((left, right) => this.rootOrder(left.canonicalRootUri) - this.rootOrder(right.canonicalRootUri));
     return {
       kind: 'ready',
       attached,
       detached,
       unassigned: cloneData(this.snapshot.unassigned),
-      unavailableRoots: []
+      unavailableRoots: this.unavailableCanonicalRoots
     };
   }
 
@@ -406,10 +450,238 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
+  /** Reconciles the supplied workspace roots without moving existing content between partitions. */
+  reconcileRoots(roots: readonly RootCandidate[]): Promise<RootReconcileResult> {
+    const run = this.operationTail.then(async () => {
+      this.assertReady();
+      const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);
+      const reconciliation = this.reconcileDraft(draft, roots);
+      if (reconciliation.changed) {
+        const validation = validateWorkspacePartitionSnapshot(draft);
+        if (!validation.ok) {
+          throw new WorkspaceSnapshotInvariantError(validation.reason ?? 'Workspace snapshot is invalid.');
+        }
+        await this.state.update(WORKSPACE_PARTITION_STORAGE_KEY, draft);
+        this.snapshot = draft;
+        this.revision++;
+        this._onBookmarksChanged.fire();
+      }
+      this.roots = roots.slice();
+      this.unavailableCanonicalRoots = reconciliation.result.unavailableCanonicalRoots;
+      this._onDidChangePartitions.fire({ ...reconciliation.result, currentRoots: this.roots.slice() });
+      return reconciliation.result;
+    });
+    this.operationTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Previews a detached-partition recovery against the current snapshot without mutating it. */
+  async previewRecovery(
+    partitionId: string,
+    destination: RootCandidate,
+    mode: RecoveryMode,
+    fs: RecoveryFileSystem
+  ): Promise<RecoveryPreview> {
+    await this.operationTail;
+    this.assertReady();
+    const recovery = this.prepareRecovery(this.snapshot!, partitionId, destination);
+    const rewrites = new Map<string, string>();
+    let resolving = 0;
+    let missing = 0;
+    let incompatible = 0;
+    if (mode === 'salvage') {
+      const oldRoot = vscode.Uri.parse(recovery.partition.lastKnownRootUri);
+      for (const item of recovery.partition.data.items) {
+        const rebased = rebaseUri(vscode.Uri.parse(item.uri), oldRoot, recovery.destination.uri);
+        if (rebased.kind !== 'rebased' || !rebased.uri) {
+          incompatible++;
+          continue;
+        }
+        try {
+          await fs.stat(rebased.uri);
+          resolving++;
+          rewrites.set(item.id, rebased.uri.toString());
+        } catch {
+          missing++;
+        }
+      }
+    }
+    const token = randomUUID();
+    this.pendingRecoveries.set(token, {
+      revision: this.revision,
+      partitionId,
+      destination: recovery.destination,
+      replacementPartitionId: recovery.replacementPartitionId,
+      rewrites
+    });
+    return {
+      token,
+      detachedPartitionId: partitionId,
+      destinationRootUri: recovery.destination.uri.toString(),
+      mode,
+      resolving,
+      missing,
+      incompatible
+    };
+  }
+
+  /** Commits an unchanged recovery preview as one attachment and optional URI-rewrite mutation. */
+  commitRecovery(token: string): Promise<void> {
+    return this.enqueue((draft) => {
+      const pending = this.pendingRecoveries.get(token);
+      if (!pending) {
+        throw new RecoveryConflictError('Recovery preview token is unknown.');
+      }
+      if (pending.revision !== this.revision) {
+        this.pendingRecoveries.delete(token);
+        throw new StaleRecoveryPreviewError('Recovery preview is stale.');
+      }
+      const recovery = this.prepareRecovery(draft, pending.partitionId, pending.destination);
+      if (recovery.replacementPartitionId !== pending.replacementPartitionId) {
+        throw new RecoveryConflictError('Recovery destination eligibility changed.');
+      }
+      if (pending.replacementPartitionId) {
+        draft.partitions = draft.partitions.filter((partition) => partition.id !== pending.replacementPartitionId);
+      }
+      const partition = draft.partitions.find((candidate) => candidate.id === pending.partitionId);
+      if (!partition) {
+        throw new RecoveryConflictError('Detached partition is no longer available.');
+      }
+      const canonicalRootUri = canonicalizeRootUri(recovery.destination.uri);
+      partition.attachment = { rootUri: recovery.destination.uri.toString(), canonicalRootUri };
+      partition.lastKnownRootUri = recovery.destination.uri.toString();
+      partition.canonicalLastKnownRootUri = canonicalRootUri;
+      for (const item of partition.data.items) {
+        const rewrittenUri = pending.rewrites.get(item.id);
+        if (rewrittenUri) {
+          item.uri = rewrittenUri;
+        }
+      }
+      return { value: undefined, changed: true, afterCommit: () => this.pendingRecoveries.delete(token) };
+    });
+  }
+
   /** Disposes the change event emitter; workspace state itself remains untouched. */
   dispose(): void {
     this.disposed = true;
     this._onBookmarksChanged.dispose();
+    this._onDidChangePartitions.dispose();
+    this.pendingRecoveries.clear();
+  }
+
+  private reconcileDraft(
+    draft: WorkspacePartitionSnapshot,
+    roots: readonly RootCandidate[]
+  ): { readonly result: RootReconcileResult; readonly changed: boolean } {
+    const rootsByCanonical = new Map<string, RootCandidate[]>();
+    for (const root of roots) {
+      const canonical = canonicalizeRootUri(root.uri);
+      const group = rootsByCanonical.get(canonical);
+      if (group) {
+        group.push(root);
+      } else {
+        rootsByCanonical.set(canonical, [root]);
+      }
+    }
+    const unavailableCanonicalRoots = [...rootsByCanonical]
+      .filter(([, candidates]) => candidates.length > 1)
+      .map(([canonical]) => canonical);
+    const currentCanonicalRoots = new Set(rootsByCanonical.keys());
+    const detachedPartitionIds: string[] = [];
+    const attachedPartitionIds: string[] = [];
+    let changed = false;
+
+    for (const partition of draft.partitions) {
+      if (!partition.attachment || currentCanonicalRoots.has(partition.attachment.canonicalRootUri)) {
+        continue;
+      }
+      partition.lastKnownRootUri = partition.attachment.rootUri;
+      partition.canonicalLastKnownRootUri = partition.attachment.canonicalRootUri;
+      partition.attachment = null;
+      detachedPartitionIds.push(partition.id);
+      changed = true;
+    }
+
+    for (const [canonical, candidates] of rootsByCanonical) {
+      if (candidates.length !== 1) {
+        continue;
+      }
+      if (draft.partitions.some((partition) => partition.attachment?.canonicalRootUri === canonical)) {
+        continue;
+      }
+      const matches = draft.partitions.filter(
+        (partition) => !partition.attachment && partition.canonicalLastKnownRootUri === canonical
+      );
+      if (matches.length === 1) {
+        const partition = matches[0];
+        const root = candidates[0];
+        partition.attachment = { rootUri: root.uri.toString(), canonicalRootUri: canonical };
+        partition.lastKnownRootUri = root.uri.toString();
+        partition.canonicalLastKnownRootUri = canonical;
+        attachedPartitionIds.push(partition.id);
+        changed = true;
+      } else if (matches.length === 0) {
+        const root = candidates[0];
+        const partition: WorkspacePartition = {
+          id: this.allocateId(draft),
+          attachment: { rootUri: root.uri.toString(), canonicalRootUri: canonical },
+          lastKnownRootUri: root.uri.toString(),
+          canonicalLastKnownRootUri: canonical,
+          replacementEligible: true,
+          data: emptyBookmarkData(),
+          mirror: { dirty: false }
+        };
+        draft.partitions.push(partition);
+        attachedPartitionIds.push(partition.id);
+        changed = true;
+      } else {
+        unavailableCanonicalRoots.push(canonical);
+      }
+    }
+    return {
+      changed,
+      result: { attachedPartitionIds, detachedPartitionIds, unavailableCanonicalRoots }
+    };
+  }
+
+  private prepareRecovery(
+    snapshot: WorkspacePartitionSnapshot,
+    partitionId: string,
+    requestedDestination: RootCandidate
+  ): { readonly partition: WorkspacePartition; readonly destination: RootCandidate; readonly replacementPartitionId?: string } {
+    const partition = snapshot.partitions.find((candidate) => candidate.id === partitionId);
+    if (!partition || partition.attachment) {
+      throw new RecoveryConflictError('Recovery requires a detached partition.');
+    }
+    let destinationCanonical: string;
+    try {
+      destinationCanonical = canonicalizeRootUri(requestedDestination.uri);
+    } catch {
+      throw new RecoveryConflictError('Recovery destination is not a current workspace root.');
+    }
+    const matchingRoots = this.roots.filter((root) => root.id === requestedDestination.id
+      && canonicalizeRootUri(root.uri) === destinationCanonical);
+    if (matchingRoots.length !== 1 || this.roots.filter(
+      (root) => canonicalizeRootUri(root.uri) === destinationCanonical
+    ).length !== 1) {
+      throw new RecoveryConflictError('Recovery destination is unavailable.');
+    }
+    const destination = matchingRoots[0];
+    const existing = snapshot.partitions.find(
+      (candidate) => candidate.attachment?.canonicalRootUri === destinationCanonical
+    );
+    if (!existing) {
+      return { partition, destination };
+    }
+    if (!existing.replacementEligible || existing.data.items.length !== 0 || existing.data.collections.length !== 0) {
+      throw new RecoveryConflictError('Recovery destination is an established partition.');
+    }
+    return { partition, destination, replacementPartitionId: existing.id };
+  }
+
+  private rootOrder(canonicalRootUri: string): number {
+    const index = this.roots.findIndex((root) => canonicalizeRootUri(root.uri) === canonicalRootUri);
+    return index < 0 ? Number.MAX_SAFE_INTEGER : index;
   }
 
   private enqueue<T>(operation: (draft: WorkspacePartitionSnapshot) => MutationResult<T>): Promise<T> {
@@ -426,6 +698,8 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       }
       await this.state.update(WORKSPACE_PARTITION_STORAGE_KEY, draft);
       this.snapshot = draft;
+      this.revision++;
+      outcome.afterCommit?.();
       this._onBookmarksChanged.fire();
       return outcome.value;
     });

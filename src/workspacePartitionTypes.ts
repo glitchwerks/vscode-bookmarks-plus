@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { canonicalizeRootUri } from './rootUri';
+import { RootCandidate } from './rootUri';
 import {
   BookmarkData,
   emptyBookmarkData,
@@ -38,6 +39,37 @@ export interface WorkspacePartition {
 export interface SnapshotValidationResult {
   readonly ok: boolean;
   readonly reason?: string;
+}
+
+/** Summarizes attachment changes made while reconciling the current workspace roots. */
+export interface RootReconcileResult {
+  readonly attachedPartitionIds: readonly string[];
+  readonly detachedPartitionIds: readonly string[];
+  readonly unavailableCanonicalRoots: readonly string[];
+}
+
+/** Adds the current root ordering and labels to a reconciliation result. */
+export interface PartitionLifecycleChange extends RootReconcileResult {
+  readonly currentRoots: readonly RootCandidate[];
+}
+
+/** Selects whether recovery only reattaches or also salvages resolvable bookmark paths. */
+export type RecoveryMode = 'reattach-only' | 'salvage';
+
+/** Presents a stable, tokenized recovery decision before it can be committed. */
+export interface RecoveryPreview {
+  readonly token: string;
+  readonly detachedPartitionId: string;
+  readonly destinationRootUri: string;
+  readonly mode: RecoveryMode;
+  readonly resolving: number;
+  readonly missing: number;
+  readonly incompatible: number;
+}
+
+/** Limits recovery's filesystem dependency to resolution checks for rebased targets. */
+export interface RecoveryFileSystem {
+  stat(uri: vscode.Uri): Thenable<vscode.FileStat>;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
