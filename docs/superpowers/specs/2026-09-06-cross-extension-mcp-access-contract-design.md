@@ -1,6 +1,6 @@
 # Cross-Extension MCP Access Contract Design
 
-**Status:** Revised after third architectural review; pending downstream issue updates
+**Status:** Revised after third architectural review and root-addition review; pending downstream issue updates
 **Issue:** #137
 **Approval gates:** #62 update; glitchwerks/vscode-claude-workspaces#50 update
 **Implementation prerequisites:** #62, #129
@@ -508,19 +508,30 @@ but it must expose the same logical behavior:
 3. A new item is owned by the attached partition for the deepest current workspace folder containing
    its URI. A new empty collection created through MCP is owned by the session's selected attached
    partition.
-4. An item outside every current root is `unassigned`. It remains available through the Bookmarks
+4. Once assigned, an existing item's or collection's owner remains stable when workspace folders are
+   added, nested, or reordered. Adding nested root B does not move items or collections from parent
+   root A, and adding a root around an `unassigned` item does not claim that item.
+5. A newly added root either reattaches its unique same-identity detached partition under the rules
+   below or creates a new empty partition. Only items and empty collections created after that change
+   use the then-current deepest-root rule. Folder addition never triggers implicit repartitioning or
+   live collection splitting. (#62; #137)
+6. An item outside every current root is `unassigned`. It remains available through the Bookmarks
    Plus UI but is invisible and immutable through every root-scoped MCP session.
-5. Collections cannot span logical owners. A root-scoped session sees and mutates only collections
+7. Collections cannot span logical owners. A root-scoped session sees and mutates only collections
    owned by its selected partition and items owned by that same partition.
-6. Every mutation carries the selected root through the bridge. An operation on existing data must
+8. Every mutation carries the selected root through the bridge. An operation on existing data must
    resolve every target identifier inside the selected partition; an identifier from another
    partition is treated as not found, not as an implicit cross-root operation.
-7. Before a workspace-scoped MCP create operation mutates state, the server resolves the proposed
+9. Before a workspace-scoped MCP create operation mutates state, the server resolves the proposed
    item's URI with the same deepest-current-root rule. The resolved partition must equal the
    session's selected partition. A URI resolving to another root or to `unassigned` returns the
    tool's defined not-found or invalid-scope error and performs no mutation.
-8. Imported Claude roots receive no access merely because the selected process has filesystem access
+10. Imported Claude roots receive no access merely because the selected process has filesystem access
    to them. Each additional root requires its own explicit descriptor request.
+11. API v1 exposes no automatic or MCP-triggered reassignment of existing data. If #62 provides a
+    user-facing reassignment or recovery action, the user must invoke and confirm it explicitly; the
+    operation must update ownership and apply the collection-splitting rules below atomically. (#62;
+    #137)
 
 The deepest-root rule matches the repository's existing order-independent nested-folder behavior.
 (`src/workspaceFolders.ts:L72-L94`, `src/test/suite/workspaceFolders.test.ts:L165-L184`;
@@ -579,7 +590,8 @@ activate/discover again rather than reuse the old object. (#137)
 
 | Transition | Descriptor not started | Active session |
 | --- | --- | --- |
-| Unrelated folder added/removed/reordered | Remains usable until bootstrap expiry | Remains connected |
+| Folder added or reordered, including a nested root | Remains usable until bootstrap expiry; existing ownership is unchanged | Remains connected; existing ownership is unchanged |
+| Unrelated folder removed | Remains usable until bootstrap expiry | Remains connected |
 | Selected root removed | Startup validation fails | Bridge closes; server exits |
 | Selected root temporarily unavailable | Startup validation fails | Bridge closes; server exits |
 | Extension reload/disposal | Generation becomes invalid | Bridge closes; server exits |
@@ -634,6 +646,11 @@ https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
   partitions. URI-identity tests cover the documented scheme, authority, path-case, percent-encoding,
   and trailing-separator behavior for local and remote roots and prove the same canonicalization is
   used by attachment, persistence, request validation, containment, and reattachment.
+- Root-addition tests prove that adding or nesting root B does not reassign root-A or `unassigned`
+  items, does not split existing collections, and does not interrupt active root-A sessions or
+  invalidate unstarted root-A descriptors. Items and empty collections created under B after the
+  addition use B's partition, and a root-B session cannot observe the retained A-owned or
+  `unassigned` data.
 
 ### Optional-consumer isolation tests
 
@@ -721,8 +738,8 @@ silently changing while its private transport is implemented. (#137)
 
 1. #62 records the stable attached/detached partition model, deterministic URI canonicalization,
    mandatory unique same-identity reattachment, lossless `unassigned` collection splitting,
-   create-operation scope checks, and recovery responsibilities above without weakening selected-
-   root isolation.
+   stable ownership across root additions, create-operation scope checks, and recovery
+   responsibilities above without weakening selected-root isolation.
 2. The contract's failure-isolation example remains bounded across activation and request and
    discards late descriptors.
 3. Descriptor evolution, environment overlay, absolute-path, and cwd-independent execution rules
