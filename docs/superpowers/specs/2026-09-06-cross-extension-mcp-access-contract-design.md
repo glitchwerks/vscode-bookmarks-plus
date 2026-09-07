@@ -1,9 +1,10 @@
 # Cross-Extension MCP Access Contract Design
 
-**Status:** Proposed for review  
-**Issue:** #137  
-**Prerequisites:** #62, #129  
+**Status:** Revised after architectural review; pending re-review
+**Issue:** #137
+**Prerequisites:** #62, #129
 **Downstream implementation:** #138
+**Consumer integration:** glitchwerks/vscode-claude-workspaces#50
 
 ## Goal
 
@@ -11,6 +12,12 @@ Define the versioned public API that Bookmarks Plus will return from `activate()
 companion extension can request MCP access for one explicit workspace folder without importing
 Bookmarks Plus internals. The first implementation of this contract ships only after multi-root
 storage behavior (#62) and the live extension-to-server bridge (#129) are complete. (#137)
+
+Before this contract is approved, #62 must own the logical root-partition, migration, collection,
+and out-of-root semantics defined below. Before the Claude Workspaces integration ships,
+glitchwerks/vscode-claude-workspaces#50 must own the redacted, ephemeral carrier used to pass a
+bootstrap descriptor to Claude Code. (#137; #62; #129;
+glitchwerks/vscode-claude-workspaces#50)
 
 The returned connection information is an opaque, serializable stdio bootstrap descriptor. The
 consumer may translate that descriptor into its own launch configuration, but it must not infer
@@ -27,6 +34,12 @@ descriptor fields. (#137)
 - Workspace and global stores already exist separately inside activation, but the current native
   server exposes only the single-folder workspace mirror.
   (`src/extension.ts:L439-L444`, `README.md:L108-L117`)
+- The workspace store is one window-wide `BookmarkStore` backed by `context.workspaceState`; its
+  items contain absolute URIs but neither items nor collections record an owning workspace folder.
+  (`src/extension.ts:L439-L444`, `src/bookmarkStore.ts:L57-L80`, `src/types.ts:L3-L23`)
+- Existing workspace utilities already choose the deepest matching root for nested folders. Root
+  ownership must reuse that rule rather than depend on workspace-folder order.
+  (`src/workspaceFolders.ts:L72-L94`, `src/test/suite/workspaceFolders.test.ts:L165-L184`)
 - VS Code supports extension APIs by returning a value from `activate()`; another extension can
   discover the provider with `extensions.getExtension()`, activate it, and read that returned API.
   (https://code.visualstudio.com/api/references/vscode-api, fetched 2026-09-06)
@@ -38,6 +51,18 @@ descriptor fields. (#137)
   instead of exposing its stores or provider objects.
   (https://github.com/glitchwerks/vscode-claude-workspaces/blob/main/src/launch/launchPlanner.ts,
   fetched 2026-09-06)
+- Claude Workspaces currently logs the complete Claude argument array, and Claude Code accepts
+  `--mcp-config` as JSON files or strings. Passing authorization-bearing inline JSON would therefore
+  expose the bootstrap value in diagnostics and process arguments.
+  (https://github.com/glitchwerks/vscode-claude-workspaces/blob/main/src/logging/outputLogger.ts,
+  fetched 2026-09-06;
+  https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
+- Claude Workspaces declares `extensionKind: ["workspace"]`, while Bookmarks Plus currently has no
+  extension-kind preference. Co-location is not guaranteed in remote windows until Bookmarks Plus
+  declares the same workspace-host preference.
+  (https://github.com/glitchwerks/vscode-claude-workspaces/blob/main/package.json,
+  fetched 2026-09-06; `package.json:L1-L17`;
+  https://code.visualstudio.com/api/advanced-topics/extension-host, fetched 2026-09-06)
 
 ## Design decisions
 
@@ -58,6 +83,17 @@ descriptor fields. (#137)
    (#137)
 7. Consumers treat `command`, `args`, and `env` as opaque and potentially sensitive. They forward
    them unchanged, do not persist them, and do not log their values. (#137)
+8. Workspace data has one logical owner root. Root isolation is part of the public behavior even if
+   #62 keeps the physical persistence inside one window-wide state object. (#62; #137)
+9. API v1 trusts every installed extension in the same extension host as an authorized caller. It
+   does not accept a caller-supplied identity and does not add a per-caller consent prompt. The
+   bootstrap authorization authenticates the spawned MCP process to the private bridge; it does not
+   authenticate which co-hosted extension requested it. (#137;
+   https://code.visualstudio.com/api/advanced-topics/remote-extensions, fetched 2026-09-06)
+10. Bookmarks Plus explicitly requires Workspace Trust and prefers the workspace extension host.
+    The API is unavailable until the workspace is trusted, and cross-host calls remain unsupported.
+    (https://code.visualstudio.com/api/extension-guides/workspace-trust, fetched 2026-09-06;
+    https://code.visualstudio.com/api/advanced-topics/extension-host, fetched 2026-09-06)
 
 ## Public API
 
@@ -76,11 +112,13 @@ export interface BookmarksPlusApiVersion {
 
 export interface McpConnectionCapabilities {
   readonly descriptorVersions: readonly number[];
-  readonly transports: readonly ['stdio'];
+  readonly transports: readonly McpTransport[];
   readonly scopes: readonly BookmarkScope[];
   readonly rootSelection: 'explicit-workspace-folder';
   readonly sessionLifecycle: 'pinned-root';
 }
+
+export type McpTransport = 'stdio';
 
 export interface BookmarksPlusCapabilities {
   readonly mcpConnection: McpConnectionCapabilities;
@@ -106,14 +144,19 @@ export interface McpStdioDescriptorV1 {
   readonly command: string;
   readonly args: readonly string[];
   readonly env: Readonly<Record<string, string>>;
+  readonly sensitiveEnvKeys: readonly string[];
   readonly workspaceFolderUri: string;
   readonly grantedScopes: readonly BookmarkScope[];
   readonly bootstrapExpiresAt: string;
 }
 
+// API v1.0 ships only this member. A later API v1 minor may add another
+// descriptor interface to this union without changing existing members.
+export type McpConnectionDescriptor = McpStdioDescriptorV1;
+
 export interface McpConnectionSuccess {
   readonly kind: 'success';
-  readonly descriptor: McpStdioDescriptorV1;
+  readonly descriptor: McpConnectionDescriptor;
 }
 
 export type McpConnectionErrorCode =
@@ -149,9 +192,25 @@ export type McpConnectionResult =
 - `supportedDescriptorVersions` must be non-empty. Bookmarks Plus selects the highest mutually
   supported version; no intersection returns `unsupported-descriptor-version`. (#137)
 - Descriptor version `1` is the stdio shape above. A future transport or incompatible field change
-  requires another descriptor version but does not inherently require another API major. (#137)
+  requires another descriptor version and an additive API minor that extends `McpTransport` and
+  `McpConnectionDescriptor`. Existing consumers remain compatible because a success descriptor's
+  version must be advertised by the producer and included in that request's
+  `supportedDescriptorVersions`. (#137)
 - `bootstrapExpiresAt` is an RFC 3339 UTC timestamp. The producer chooses the validity window and
   consumers must launch before the returned instant rather than assuming a fixed duration. (#137)
+
+Descriptor v1 has these execution invariants:
+
+- `env` is an overlay on the consumer's inherited process environment; descriptor values win on
+  key collisions. It is not a complete replacement environment. This matches VS Code's stdio MCP
+  environment behavior. (https://code.visualstudio.com/api/references/vscode-api,
+  fetched 2026-09-06)
+- `command` and every argument needed to locate an executable or file are absolute. Descriptor v1
+  has no `cwd`, and server behavior must not depend on the consumer's current working directory.
+- Authorization material may appear only in values whose keys are listed by `sensitiveEnvKeys`.
+  It must not appear in `command`, `args`, `workspaceFolderUri`, or other metadata.
+- `sensitiveEnvKeys` contains unique keys that exist in `env`. Consumers redact those values before
+  diagnostics and treat the complete descriptor as ephemeral sensitive data.
 
 ### Request validation
 
@@ -197,44 +256,81 @@ publisher and extension name. (`package.json:L2-L6`)
 
 An optional consumer does not declare `extensionDependencies`, because absence must not block its
 primary feature. It discovers and activates Bookmarks Plus at runtime, validates the API major and
-capabilities, and degrades cleanly when any step fails. This uses VS Code's documented extension
-discovery/activation boundary. (#137;
+capabilities, and degrades cleanly when any step fails. The consumer owns one finite deadline across
+activation and the descriptor request, catches rejected promises, ignores late results, and logs
+only a concise error class or typed failure code. A late success descriptor is abandoned and expires
+unused; it is never launched after the primary fallback path begins. This uses VS Code's documented
+extension discovery/activation boundary. (#137;
+glitchwerks/vscode-claude-workspaces#50;
 https://code.visualstudio.com/api/references/vscode-api, fetched 2026-09-06)
 
 ```ts
 import * as vscode from 'vscode';
 
-const extension = vscode.extensions.getExtension<unknown>(
-  'cbeaulieu-gt.vscode-bookmarks-plus'
-);
+async function resolveOptionalBookmarksMcp(
+  selectedRoot: vscode.WorkspaceFolder,
+  timeoutMs: number
+): Promise<McpConnectionDescriptor | undefined> {
+  const deadlineAt = Date.now() + timeoutMs;
+  try {
+    const extension = vscode.extensions.getExtension<unknown>(
+      'cbeaulieu-gt.vscode-bookmarks-plus'
+    );
+    if (extension === undefined) {
+      return undefined;
+    }
 
-if (extension === undefined) {
-  return launchWithoutBookmarks();
+    const candidate = await withDeadline(extension.activate(), remainingMs(deadlineAt));
+    if (!isBookmarksPlusApiV1(candidate)) {
+      reportOptionalIntegrationWarning('incompatible-api');
+      return undefined;
+    }
+
+    const result = await withDeadline(
+      candidate.requestMcpConnection({
+        workspaceFolderUri: selectedRoot.uri.toString(true),
+        scopes: ['workspace', 'global'],
+        supportedDescriptorVersions: [1]
+      }),
+      remainingMs(deadlineAt)
+    );
+
+    if (result.kind === 'error') {
+      reportOptionalIntegrationWarning(result.error.code);
+      return undefined;
+    }
+    return result.descriptor;
+  } catch (error: unknown) {
+    reportOptionalIntegrationWarning(classifyRedactedFailure(error));
+    return undefined;
+  }
 }
 
-const candidate = await extension.activate();
-if (!isBookmarksPlusApiV1(candidate)) {
-  return launchWithoutBookmarks();
-}
-
-const result = await candidate.requestMcpConnection({
-  workspaceFolderUri: selectedRoot.uri.toString(true),
-  scopes: ['workspace', 'global'],
-  supportedDescriptorVersions: [1]
-});
-
-if (result.kind === 'error') {
-  reportOptionalIntegrationWarning(result.error);
-  return launchWithoutBookmarks();
-}
-
-return launchWithOpaqueMcpDescriptor(result.descriptor);
+const descriptor = await resolveOptionalBookmarksMcp(selectedRoot, integrationTimeoutMs);
+return descriptor === undefined
+  ? launchWithoutBookmarks()
+  : launchWithSecureMcpCarrier(descriptor);
 ```
+
+`withDeadline` must cover the remaining time in one overall integration budget rather than granting
+the full timeout independently to activation and request. Its timeout does not cancel or consume a
+late result; the adapter attaches a rejection handler, discards any eventual descriptor, and starts
+the fallback launch exactly once. The consumer chooses and tests a finite budget appropriate to its
+launch UX; the public API does not prescribe that duration. (glitchwerks/vscode-claude-workspaces#50)
 
 The v1 API is same-extension-host only. A UI-side consumer and workspace-side Bookmarks Plus instance
 cannot exchange this returned object across hosts. A command-based cross-host facade may be designed
 later, but commands would introduce serialization and routing rules that are outside #137.
 (https://code.visualstudio.com/api/advanced-topics/remote-extensions, fetched 2026-09-06)
+
+API v1 requires both extensions to run in a Node workspace extension host. Bookmarks Plus adds
+`"extensionKind": ["workspace"]` to align with Claude Workspaces. Local desktop workspace hosts are
+required coverage. Remote workspace support may be documented as supported only after the packaged
+producer/consumer test runs in a real remote extension host; otherwise README documentation must
+mark it unsupported rather than infer support from manifest placement alone.
+(https://github.com/glitchwerks/vscode-claude-workspaces/blob/main/package.json,
+fetched 2026-09-06;
+https://code.visualstudio.com/api/advanced-topics/extension-host, fetched 2026-09-06)
 
 ## Producer construction
 
@@ -261,6 +357,40 @@ The public module contains only DTO types, literal unions, and the API interface
 bootstrap authorization, bridge endpoints, process paths, and provider instances remain private.
 (#137)
 
+## Caller trust and Workspace Trust
+
+VS Code exposes an activation-return API to extensions in the same extension host, but the method
+call does not carry an authenticated extension identity. API v1 therefore adopts the installed-
+extension trust model: every co-hosted extension may request every advertised scope after Workspace
+Trust is granted. A caller-provided extension ID would be informational only and is deliberately not
+part of the authorization decision.
+(https://code.visualstudio.com/api/advanced-topics/remote-extensions, fetched 2026-09-06)
+
+The bootstrap authorization has a narrower purpose: it proves that one spawned MCP process holds a
+fresh root- and scope-bound authorization issued by Bookmarks Plus. It does not prove which extension
+called `requestMcpConnection()`. If per-extension approval is required later, it needs a separately
+designed user-consent boundary and a new API major rather than an unauthenticated request field.
+(#129; #137)
+
+The #138 implementation adds these manifest declarations:
+
+```json
+{
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Bookmarks Plus MCP access can start a process with access to workspace bookmark data."
+    }
+  }
+}
+```
+
+VS Code already treats an undeclared main-entry extension as unsupported in Restricted Mode, but an
+explicit declaration makes the security decision durable and testable. Bookmarks Plus does not
+activate or export this API until trust is granted.
+(https://code.visualstudio.com/api/extension-guides/workspace-trust, fetched 2026-09-06)
+
 ## Descriptor and startup lifecycle
 
 MCP stdio clients launch the server as a subprocess and exchange JSON-RPC through stdin/stdout. MCP
@@ -275,7 +405,8 @@ The private #129 bridge must provide the following observable lifecycle:
 1. `requestMcpConnection()` captures one root/bridge generation and validates the request.
 2. It creates a cryptographically unguessable, root- and scope-bound bootstrap authorization with an
    expiry, then embeds the private launch data in the descriptor.
-3. The consumer forwards the descriptor without inspection and starts one MCP subprocess.
+3. The consumer serializes the descriptor without interpreting or modifying its launch fields and
+   starts one MCP subprocess.
 4. Before reporting MCP initialization success, the subprocess proves and consumes the bootstrap
    authorization through the private bridge.
 5. A consumed authorization cannot start another process. An expired, consumed, wrong-generation,
@@ -310,9 +441,47 @@ startup failure fits the protocol lifecycle.
 (https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle,
 fetched 2026-09-06)
 
+## Secure Claude Workspaces carrier
+
+The generic Bookmarks Plus API defines sensitivity metadata and bootstrap behavior; the concrete
+Claude CLI carrier belongs to glitchwerks/vscode-claude-workspaces#50. That integration uses a
+secure ephemeral JSON file, not inline `--mcp-config` JSON and not durable user/project MCP
+configuration. Claude Code accepts a JSON file path for `--mcp-config`.
+(glitchwerks/vscode-claude-workspaces#50;
+https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
+
+The consumer must:
+
+1. Translate descriptor v1 to one stdio server entry without changing `command`, `args`, `env`, or
+   their ordering/values. Contract metadata such as `sensitiveEnvKeys`, root URI, scopes, and expiry
+   is not copied into the Claude MCP server entry.
+2. Create the file in an extension-owned temporary location with access limited to the current OS
+   user. The file must not be placed under a workspace, committed configuration directory, or other
+   durable project path.
+3. Pass only the temporary file path to Claude through `--mcp-config`; authorization-bearing JSON
+   must never appear directly in the Claude argument array.
+4. Redact the value following `--mcp-config` and every value named by `sensitiveEnvKeys` from launch,
+   exception, telemetry, and debug output. The existing full-argument launch log must be changed
+   before integration.
+   (https://github.com/glitchwerks/vscode-claude-workspaces/blob/main/src/logging/outputLogger.ts,
+   fetched 2026-09-06)
+5. Delete the file immediately when planning, creation, or process launch fails; when launch is
+   cancelled; when the Claude process exits; or when the consumer extension disposes.
+6. After a successful process spawn, retain the file only until `bootstrapExpiresAt` unless an
+   earlier cleanup condition occurs. The token is already unusable after successful consumption,
+   and expiry bounds the remaining file lifetime without requiring a public live-session object.
+7. Ignore cleanup `FileNotFound` races and surface other cleanup failures only as redacted
+   diagnostics; cleanup failure must not expose descriptor contents.
+
+Tests in glitchwerks/vscode-claude-workspaces#50 must prove that raw descriptor values and
+authorization material never enter logs or durable configuration and that cleanup runs after
+success, failure, cancellation, timeout, process exit, and extension disposal. The Bookmarks Plus
+packaged fixture verifies that this file-derived configuration still completes MCP initialization.
+(#137; glitchwerks/vscode-claude-workspaces#50)
+
 ## Scope and root semantics
 
-- `workspace` grants access only to bookmark state owned by the selected workspace folder.
+- `workspace` grants access only to bookmark state logically owned by the selected workspace folder.
 - `global` grants access to the extension's global bookmark store in addition to, or independently
   from, `workspace`.
 - The descriptor reports exactly the granted scopes in canonical order: `workspace`, then `global`.
@@ -323,8 +492,52 @@ fetched 2026-09-06)
 - Root selection remains explicit even for a global-only request so lifecycle, audit, and consumer
   session ownership remain deterministic.
 
-These semantics implement the explicit-root and least-privilege decisions approved for #137 while
-leaving the storage model itself to #62 and #129. (#62; #129; #137)
+### Logical workspace ownership required from #62
+
+#62 may implement physical storage as one partitioned window state or as distinct per-folder stores,
+but it must expose the same logical behavior:
+
+1. Every workspace bookmark item and collection has exactly one owner: a current workspace-folder
+   URI or an `unassigned` preservation partition.
+2. A new item is owned by the deepest current workspace folder containing its URI. A new empty
+   collection created through MCP is owned by the session's selected root.
+3. An item outside every current root is `unassigned`. It remains available through the Bookmarks
+   Plus UI but is invisible and immutable through every root-scoped MCP session.
+4. Collections cannot span logical roots. A root-scoped session sees and mutates only collections
+   owned by its selected root and items owned by that same root.
+5. Every mutation carries the selected root through the bridge and resolves its target inside that
+   root's partition. An identifier from another root is treated as not found, not as an implicit
+   cross-root operation.
+6. Imported Claude roots receive no access merely because the selected process has filesystem access
+   to them. Each additional root requires its own explicit descriptor request.
+
+The deepest-root rule matches the repository's existing order-independent nested-folder behavior.
+(`src/workspaceFolders.ts:L72-L94`, `src/test/suite/workspaceFolders.test.ts:L165-L184`;
+glitchwerks/vscode-claude-workspaces#50)
+
+### Existing-data migration required from #62
+
+The schema migration must be lossless and idempotent:
+
+1. Assign each existing item to its deepest matching current root; preserve unmatched items in
+   `unassigned`.
+2. Keep a collection in one root when all owned member items resolve to that root.
+3. When an existing collection contains items assigned to multiple roots, create one independent
+   root-owned collection per represented root, preserve its name, description, and relative order,
+   and rebind only that root's items to it.
+4. Preserve an empty existing collection in `unassigned`; do not guess a root.
+5. Generate distinct collection identifiers when a collection is split so later mutations in one
+   root cannot affect another root's collection.
+6. Persist a migration marker/schema version so retries do not duplicate split collections.
+7. Log counts only. Migration diagnostics must not log bookmark URIs, names, descriptions, or
+   descriptor data.
+
+Removing or renaming a root must not delete its data. Its logical partition becomes unavailable to
+new MCP requests and remains preserved for #62's reattachment/recovery behavior. #62 must document
+that recovery behavior before #137 is approved. (#62; #137)
+
+These semantics implement the selected-root and least-privilege contract while leaving the physical
+storage representation to #62 and the authenticated mutation path to #129. (#62; #129; #137)
 
 ## Capability and state transitions
 
@@ -346,17 +559,29 @@ activate/discover again rather than reuse the old object. (#137)
 The companion extension decides whether to request a new descriptor and reconnect. Reconnection is
 never required for its primary Claude launch to continue. (#137)
 
+For Claude Workspaces v1, "reconnect" means acquiring a fresh descriptor for **New Session**,
+**New in Folder**, **Retry**, or **Restart Fresh** before starting a new Claude process. The
+documented `--mcp-config` launch flag does not provide a way for the extension to replace a consumed
+descriptor inside an already-running Claude process. If the Bookmarks Plus server exits during a
+long-running session, that Claude process continues without bookmark tools; transparent in-process
+MCP reconnection is not promised. (glitchwerks/vscode-claude-workspaces#50;
+https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
+
 ## Testing strategy
 
 ### Contract unit tests
 
 - API major/minor and capability snapshots are frozen and stable.
-- Descriptor-version negotiation chooses the highest mutual version and rejects no intersection.
+- Descriptor-version negotiation chooses the highest mutual version and rejects no intersection. A
+  test-only second descriptor variant proves selection and discriminated-union result narrowing;
+  API v1.0 does not ship an otherwise unused production v2 implementation.
 - Request validation covers malformed/unknown roots, empty/duplicate scopes, unsupported scopes,
   empty/duplicate descriptor versions, disposal, and generation changes.
 - Success returns only the public DTO fields, exact granted scopes, an expiry, and opaque frozen
   launch collections.
 - Every expected failure maps to its documented code and retryability.
+- Descriptor v1 tests prove environment overlay precedence, cwd independence, absolute launch paths,
+  and that authorization appears only in `sensitiveEnvKeys` values.
 
 ### Lifecycle unit tests
 
@@ -366,16 +591,45 @@ never required for its primary Claude launch to continue. (#137)
 - Selected-root removal, bridge shutdown, disposal, and consumer disconnect release the session and
   terminate the subprocess boundary deterministically.
 - Concurrent requests cannot consume the same bootstrap authorization or cross scope/root state.
+- Nested-root ownership uses the deepest root. Selected-root reads, collections, and mutations never
+  expose another root or the `unassigned` partition.
+- Existing-data migration covers single-root ownership, split multi-root collections, empty
+  collections, out-of-root items, root removal/reattachment, and idempotent retry without data loss.
+
+### Optional-consumer isolation tests
+
+- Missing extension, incompatible API major, unsupported capabilities, and every typed request
+  failure continue with the primary launch.
+- Activation rejection, request rejection, and activation/request promises that never settle are
+  bounded by one overall deadline and start the fallback launch exactly once.
+- A descriptor that resolves after the deadline is discarded and never launched.
+- Diagnostics contain only redacted classifications/codes; descriptor fields, sensitive environment
+  values, bookmark content, and inline MCP JSON never appear.
+- The secure temporary carrier is removed after successful launch, failed launch, cancellation,
+  timeout, process exit, and extension disposal.
 
 ### Packaged producer/consumer test
 
 Build and install the actual Bookmarks Plus VSIX plus a minimal fixture consumer extension. The
 fixture discovers Bookmarks Plus with `vscode.extensions.getExtension()`, calls `activate()`, checks
-the runtime API version, requests an explicit-root descriptor, forwards it unchanged, completes MCP
-initialization, and verifies the granted tools/scopes. It also proves missing/incompatible Bookmarks
-Plus does not prevent the fixture's primary launch path. This directly covers #137's required
-supported VS Code API boundary. (#137;
+the runtime API version, requests an explicit-root descriptor, serializes its launch fields through
+the secure ephemeral carrier, completes MCP initialization, and verifies the granted tools/scopes.
+It also proves missing/incompatible Bookmarks Plus does not prevent the fixture's primary launch
+path. This directly covers #137's required supported VS Code API boundary. (#137;
 https://code.visualstudio.com/api/references/vscode-api, fetched 2026-09-06)
+
+The packaged suite asserts `extensionKind: ["workspace"]` and explicit
+`capabilities.untrustedWorkspaces.supported: false`. It runs trusted and Restricted Mode cases
+separately. Restricted Mode must leave Bookmarks Plus inactive and the optional consumer on its
+fallback path. VS Code documents separate trusted/untrusted extension-test configurations for this
+behavior. (https://code.visualstudio.com/api/working-with-extensions/testing-extension,
+fetched 2026-09-06)
+
+A real remote extension-host packaged run is required before README documentation may claim remote
+workspace support. That run installs both extensions into the same workspace host, requests a root
+in that host, launches the returned command there, and completes the handshake. A manifest-only test
+is necessary but not sufficient because placement also depends on installed location and available
+hosts. (https://code.visualstudio.com/api/advanced-topics/extension-host, fetched 2026-09-06)
 
 Existing native provider and packaged-MCP suites remain in place to prove the new extension export
 does not change VS Code Agent-mode discovery from #124. (#124; #137)
@@ -388,7 +642,8 @@ The #138 implementation updates `README.md` with:
 - the complete API v1 and descriptor v1 shapes;
 - compatibility rules for API major/minor and descriptor negotiation;
 - explicit root and scope behavior;
-- same-extension-host, bootstrap-expiry, reconnect, and graceful-degradation limitations;
+- installed-extension caller trust, Workspace Trust, workspace-host placement, bootstrap-expiry,
+  secure-carrier, reconnection, and graceful-degradation limitations;
 - a consumer example that does not declare Bookmarks Plus as a mandatory extension dependency.
 
 Breaking changes to an existing field, result code meaning, or method contract require a new API
@@ -402,17 +657,38 @@ version. These rules are the compatibility boundary approved for #137. (#137)
 - Modifying Claude Workspaces.
 - Publishing a separate TypeScript types package.
 - Cross-extension-host or web-extension transport.
-- Consumer-specific Claude configuration syntax.
+- Implementing the Claude-specific secure carrier in this repository.
 - Automatic reconnection inside Bookmarks Plus.
 - Changing the existing native MCP provider or standalone npm compatibility path.
 
 ## Delivery sequence
 
-1. Approve and merge this #137 contract.
-2. Implement multi-root storage semantics in #62.
-3. Implement the authenticated live bridge and lifecycle in #129 against this contract.
-4. Implement and document the exported API in #138.
-5. Integrate the optional consumer in its own repository and verify graceful degradation.
+1. Update #62 to own the logical root-partition, migration, split-collection, and recovery behavior
+   required by this contract.
+2. Approve and merge this #137 contract.
+3. Implement the updated multi-root storage semantics in #62.
+4. Implement the authenticated live bridge and lifecycle in #129 against this contract.
+5. Implement and document the exported API, host placement, and Workspace Trust policy in #138.
+6. Update glitchwerks/vscode-claude-workspaces#50 with the bounded optional adapter, redacted
+   diagnostics, secure temporary carrier, and non-transparent reconnection limitation.
+7. Integrate the optional consumer and verify local, Restricted Mode, and claimed remote behavior.
 
 This preserves the dependency sequence recorded by #137 and prevents the public contract from
 silently changing while its private transport is implemented. (#137)
+
+## Approval criteria
+
+#137 is ready for approval when:
+
+1. #62 records the ownership and migration responsibilities above without weakening selected-root
+   isolation.
+2. The contract's failure-isolation example remains bounded across activation and request and
+   discards late descriptors.
+3. Descriptor evolution, environment overlay, absolute-path, and cwd-independent execution rules
+   are internally consistent.
+4. The installed-extension caller trust model, explicit Workspace Trust requirement, and workspace-
+   host placement are accepted.
+5. glitchwerks/vscode-claude-workspaces#50 owns a non-logging, non-durable carrier with complete
+   cleanup tests and documents that hot reconnection is unavailable.
+6. The verification matrix covers root isolation/migration, thrown and non-settling optional paths,
+   secret redaction, secure cleanup, descriptor negotiation, trust, and every claimed host.
