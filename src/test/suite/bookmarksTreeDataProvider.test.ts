@@ -1732,7 +1732,7 @@ suite('BookmarksTreeDataProvider - workspace partitions (#62)', () => {
     const detachedPartitions = await provider.getChildren(detachedRoot);
     assert.deepStrictEqual(
       detachedPartitions.map((node) => (node as Extract<BookmarkNode, { kind: 'detachedPartition' }>).partitionId),
-      ['detached-a']
+      ['detached-a', 'detached-empty']
     );
   });
 
@@ -1839,5 +1839,71 @@ suite('BookmarksTreeDataProvider - workspace partitions (#62)', () => {
       { kind: 'item', item: partitionItem('b'), scope: 'workspace', owner: OWNER_B }
     ], transfer, token);
     assert.strictEqual(transfer.get(DND_MIME_TYPE), undefined);
+  });
+
+  test('allows an untargeted drop to the attached owner in a flat single-root tree', async () => {
+    const collection = { id: 'collection-a', name: 'Only collection', order: 0 };
+    const { provider, moves } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')], [collection]) }]
+    }));
+    await provider.handleDrop(undefined, partitionEnvelope(OWNER_A, ['a']), new vscode.CancellationTokenSource().token);
+    assert.deepStrictEqual(moves, [{ owner: OWNER_A, id: 'a', collectionId: null, index: 1 }]);
+  });
+
+  test('keeps Detached visible and lists empty detached partitions for recovery', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      detached: [{ partitionId: 'empty-a' }, { partitionId: 'empty-b' }]
+    }));
+    const roots = await provider.getChildren();
+    const detached = roots.find((node) => node.kind === 'detachedRoot')!;
+    assert.ok(detached);
+    assert.deepStrictEqual(
+      (await provider.getChildren(detached)).map((node) => (node as Extract<BookmarkNode, { kind: 'detachedPartition' }>).partitionId),
+      ['empty-a', 'empty-b']
+    );
+  });
+
+  test('rejects Unassigned, Detached, and no-longer-attached workspace drop targets', async () => {
+    const unassignedCollection = { id: 'unassigned-collection', name: 'Unassigned', order: 0 };
+    const detachedCollection = { id: 'detached-collection', name: 'Detached', order: 0 };
+    const view = readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }],
+      unassigned: partitionData([partitionItem('u')], [unassignedCollection]),
+      detached: [{ partitionId: 'detached-a', data: partitionData([partitionItem('d')], [detachedCollection]) }]
+    });
+    const { provider, moves } = providerForWorkspaceView(view);
+    const token = new vscode.CancellationTokenSource().token;
+    const roots = await provider.getChildren();
+    const unassignedTarget = (await provider.getChildren(roots.find((node) => node.kind === 'unassignedRoot')!)).find((node) => node.kind === 'collection')!;
+    const detachedRoot = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedTarget = (await provider.getChildren((await provider.getChildren(detachedRoot))[0])).find((node) => node.kind === 'item')!;
+    await provider.handleDrop(unassignedTarget, partitionEnvelope({ kind: 'unassigned' }, ['u']), token);
+    await provider.handleDrop(detachedTarget, partitionEnvelope({ kind: 'partition', partitionId: 'detached-a' }, ['d']), token);
+
+    const attachedTarget = (await provider.getChildren()).find((node) => node.kind === 'item')!;
+    (view as unknown as { attached: unknown[] }).attached = [];
+    (view as unknown as { detached: unknown[] }).detached = [{
+      partitionId: OWNER_A.partitionId, lastKnownRootUri: 'file:///old/a', canonicalLastKnownRootUri: 'file:///old/a', replacementEligible: false,
+      data: partitionData([partitionItem('a')])
+    }];
+    await provider.handleDrop(attachedTarget, partitionEnvelope(OWNER_A, ['a']), token);
+    assert.deepStrictEqual(moves, []);
+  });
+
+  test('gives equal-label workspace and detached wrappers stable partition identities', async () => {
+    const view = readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Same' }, { partitionId: OWNER_B.partitionId, label: 'Same' }],
+      detached: [{ partitionId: 'old-a', label: 'Same' }, { partitionId: 'old-b', label: 'Same' }]
+    });
+    const { provider } = providerForWorkspaceView(view);
+    const roots = await provider.getChildren();
+    const attachedIds = await Promise.all(roots.filter((node) => node.kind === 'workspaceRoot').map((node) => provider.getTreeItem(node)));
+    assert.strictEqual(new Set(attachedIds.map((item) => item.id)).size, 2);
+    const detached = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedIds = await Promise.all((await provider.getChildren(detached)).map((node) => provider.getTreeItem(node)));
+    assert.strictEqual(new Set(detachedIds.map((item) => item.id)).size, 2);
+    (view.attached[0] as { label: string }).label = 'Renamed';
+    const renamed = await provider.getChildren();
+    assert.strictEqual((await provider.getTreeItem(renamed.find((node) => node.kind === 'workspaceRoot')!)).id, attachedIds[0].id);
   });
 });
