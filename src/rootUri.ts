@@ -31,6 +31,7 @@ const UNRESERVED = /^[A-Za-z0-9._~-]$/;
 interface ComparableUri {
   readonly scheme: string;
   readonly authority: string;
+  readonly path: string;
   readonly segments: readonly string[];
 }
 
@@ -42,12 +43,20 @@ function normalizeEscapes(value: string): string {
   });
 }
 
+/** Removes trailing separators without changing root or interior path components. */
+function trimTrailingSeparators(path: string): string {
+  const trimmed = path.replace(/\/+$/, '');
+  return trimmed || '/';
+}
+
 /** Returns the structural components used for URI identity and containment. */
 function comparable(uri: vscode.Uri): ComparableUri {
+  const path = trimTrailingSeparators(normalizeEscapes(uri.path));
   return {
     scheme: uri.scheme.toLowerCase(),
     authority: uri.authority.toLowerCase(),
-    segments: normalizeEscapes(uri.path).split('/').filter(Boolean)
+    path,
+    segments: path === '/' ? [] : path.slice(1).split('/')
   };
 }
 
@@ -81,7 +90,7 @@ function pathFromSegments(segments: readonly string[]): string {
 export function canonicalizeRootUri(uri: vscode.Uri): string {
   assertValidRootUri(uri);
   const value = comparable(uri);
-  return `${value.scheme}://${value.authority}${pathFromSegments(value.segments)}`;
+  return `${value.scheme}://${value.authority}${value.path}`;
 }
 
 /** Returns whether `uri` is the root itself or lies below it on a path-component boundary. */
@@ -96,7 +105,7 @@ export function isUriInsideRoot(uri: vscode.Uri, root: vscode.Uri): boolean {
 
 /** Finds the deepest root structurally containing `uri`, independent of root-list order. */
 export function findDeepestRoot(uri: vscode.Uri, roots: readonly RootCandidate[]): RootMatch | undefined {
-  let deepestMatch: RootMatch | undefined;
+  const deepestMatches: RootMatch[] = [];
   let deepestLength = -1;
 
   for (const root of roots) {
@@ -107,11 +116,16 @@ export function findDeepestRoot(uri: vscode.Uri, roots: readonly RootCandidate[]
     const length = comparable(root.uri).segments.length;
     if (length > deepestLength) {
       deepestLength = length;
-      deepestMatch = { ...root, canonicalUri: canonicalizeRootUri(root.uri) };
+      deepestMatches.splice(0, deepestMatches.length, {
+        ...root,
+        canonicalUri: canonicalizeRootUri(root.uri)
+      });
+    } else if (length === deepestLength) {
+      deepestMatches.push({ ...root, canonicalUri: canonicalizeRootUri(root.uri) });
     }
   }
 
-  return deepestMatch;
+  return deepestMatches.length === 1 ? deepestMatches[0] : undefined;
 }
 
 /** Groups only the root identities supplied more than once. */
@@ -161,7 +175,13 @@ export function rebaseUri(uri: vscode.Uri, oldRoot: vscode.Uri, newRoot: vscode.
   const relativeSegments = uriValue.segments.slice(oldRootValue.segments.length);
   return {
     kind: 'rebased',
-    uri: newRoot.with({ path: pathFromSegments([...newRootValue.segments, ...relativeSegments]) })
+    uri: vscode.Uri.from({
+      scheme: newRoot.scheme,
+      authority: newRoot.authority,
+      path: pathFromSegments([...newRootValue.segments, ...relativeSegments]),
+      query: uri.query,
+      fragment: uri.fragment
+    })
   };
 }
 
