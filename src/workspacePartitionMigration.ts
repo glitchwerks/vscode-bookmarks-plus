@@ -11,7 +11,8 @@ import {
   BookmarkData,
   BookmarkItem,
   emptyBookmarkData,
-  isStrictBookmarkData
+  isStrictBookmarkData,
+  normalizeDescription
 } from './types';
 import {
   WORKSPACE_PARTITION_STORAGE_KEY,
@@ -164,8 +165,11 @@ export function partitionLegacyData(
     }
   }
 
-  const partitions = partitionOwners.map(({ partition }) => partition);
-  const normalizedUnassigned = unassigned.data;
+  const partitions = partitionOwners.map(({ partition }) => ({
+    ...partition,
+    data: normalizeMigrationOwnerData(partition.data)
+  }));
+  const normalizedUnassigned = normalizeMigrationOwnerData(unassigned.data);
   const snapshot: WorkspacePartitionSnapshot = {
     version: 1,
     partitions,
@@ -256,6 +260,46 @@ function addCollection(
   id: string
 ): void {
   owner.data.collections.push({ ...source, id });
+}
+
+/** Normalizes migration output without applying the store normalizer's duplicate-item repair. */
+function normalizeMigrationOwnerData(data: BookmarkData): BookmarkData {
+  const collections = [...data.collections]
+    .sort((left, right) => left.order - right.order)
+    .map((collection, index) => ({ ...withNormalizedDescription(collection), order: index }));
+
+  const itemsByParent = new Map<string, BookmarkItem[]>();
+  for (const item of data.items) {
+    const parent = item.collectionId ?? '';
+    const siblings = itemsByParent.get(parent) ?? [];
+    siblings.push(item);
+    itemsByParent.set(parent, siblings);
+  }
+  const normalizedOrders = new Map<string, number>();
+  for (const siblings of itemsByParent.values()) {
+    siblings.sort((left, right) => left.order - right.order).forEach((item, index) => {
+      normalizedOrders.set(item.id, index);
+    });
+  }
+
+  return {
+    version: data.version,
+    collections,
+    items: data.items.map((item) => ({
+      ...withNormalizedDescription(item),
+      order: normalizedOrders.get(item.id)!
+    }))
+  };
+}
+
+function withNormalizedDescription<T extends { description?: string }>(entry: T): T {
+  const description = normalizeDescription(entry.description);
+  if (description === undefined) {
+    const normalized = { ...entry };
+    delete normalized.description;
+    return normalized;
+  }
+  return { ...entry, description };
 }
 
 function allocateId(

@@ -173,6 +173,64 @@ suite('workspacePartitionMigration', () => {
     assert.deepStrictEqual(validateWorkspacePartitionSnapshot(persisted), { ok: true });
   });
 
+  test('normalizes orders and descriptions without deduplicating legacy collection members', async () => {
+    const lateCollectionId = '20000000-0000-4000-8000-000000000001';
+    const earlyCollectionId = '20000000-0000-4000-8000-000000000002';
+    const legacy: BookmarkData = {
+      version: 2,
+      collections: [
+        { id: lateCollectionId, name: 'Late', description: '   ', order: 9 },
+        { id: earlyCollectionId, name: 'Early', description: '  early note  ', order: 3 }
+      ],
+      items: [
+        {
+          id: '20000000-0000-4000-8000-000000000003',
+          type: 'file',
+          uri: 'file:///workspace/a/duplicate.ts',
+          collectionId: lateCollectionId,
+          order: 7,
+          description: '   '
+        },
+        {
+          id: '20000000-0000-4000-8000-000000000004',
+          type: 'file',
+          uri: 'file:///workspace/a/duplicate.ts',
+          collectionId: lateCollectionId,
+          order: 7,
+          description: '  keep note  '
+        },
+        {
+          id: '20000000-0000-4000-8000-000000000005',
+          type: 'file',
+          uri: 'file:///workspace/a/early.ts',
+          collectionId: earlyCollectionId,
+          order: 5,
+          description: '  early item  '
+        }
+      ]
+    };
+
+    const assertNormalized = (snapshot: WorkspacePartitionSnapshot): void => {
+      const owner = snapshot.partitions[0].data;
+      assert.deepStrictEqual(owner.collections.map((collection) => collection.name), ['Early', 'Late']);
+      assert.deepStrictEqual(owner.collections.map((collection) => collection.order), [0, 1]);
+      assert.deepStrictEqual(owner.collections.map((collection) => collection.description), ['early note', undefined]);
+      const lateCollection = owner.collections[1];
+      const lateMembers = owner.items.filter((item) => item.collectionId === lateCollection.id);
+      assert.strictEqual(lateMembers.length, 2);
+      assert.deepStrictEqual(lateMembers.map((item) => item.order), [0, 1]);
+      assert.deepStrictEqual(lateMembers.map((item) => item.description), [undefined, 'keep note']);
+      const earlyMember = owner.items.find((item) => item.collectionId === owner.collections[0].id)!;
+      assert.strictEqual(earlyMember.order, 0);
+      assert.strictEqual(earlyMember.description, 'early item');
+    };
+
+    assertNormalized(partitionLegacyData(legacy, roots(), deterministicIds()).snapshot);
+    const state = new FakeMemento({ [LEGACY_STORAGE_KEY]: legacy });
+    await loadOrMigrateWorkspaceSnapshot(state, roots(), deterministicIds(), new FakeOutput());
+    assertNormalized(state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!);
+  });
+
   test('does not delete legacy state when the new snapshot write fails', async () => {
     const state = new FakeMemento({ [LEGACY_STORAGE_KEY]: legacyData() });
     state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
