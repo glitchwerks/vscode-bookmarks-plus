@@ -24,6 +24,12 @@ export interface OutputSink {
   appendLine(value: string): void;
 }
 
+/** The read/change contract shared by global and partitioned bookmark content stores. */
+export interface BookmarkContentReader {
+  readonly onBookmarksChanged: vscode.Event<void>;
+  getAll(): BookmarkData;
+}
+
 export interface BookmarkStoreOptions {
   /** Omit for a non-mirrored store; use null for a workspace whose mirror is disabled. */
   mirror?: MirrorPort | null;
@@ -54,7 +60,7 @@ interface MirrorBinding {
   readonly port: MirrorPort;
 }
 
-export class BookmarkStore {
+export class BookmarkStore implements BookmarkContentReader {
   private data: BookmarkData;
   private dataRevision = 0;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
