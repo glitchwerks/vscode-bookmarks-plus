@@ -1,24 +1,5 @@
 import * as vscode from 'vscode';
-
-/**
- * Splits a URI path into non-empty segments, lowercased for case-insensitive comparison.
- * Filtering empty segments absorbs leading/trailing slashes (e.g. a workspace folder uri
- * with a trailing slash) so segment-array comparison works uniformly.
- */
-function pathSegments(path: string): string[] {
-  return path.split('/').filter((segment) => segment.length > 0).map((segment) => segment.toLowerCase());
-}
-
-/**
- * True when `folderSegments` is a prefix of `uriSegments` — i.e. `uri` is the folder itself or a
- * descendant of it, compared on path-segment boundaries (not raw string prefix).
- */
-function isSegmentPrefix(folderSegments: string[], uriSegments: string[]): boolean {
-  if (folderSegments.length > uriSegments.length) {
-    return false;
-  }
-  return folderSegments.every((segment, index) => segment === uriSegments[index]);
-}
+import { findDeepestRoot, toRootCandidates } from './rootUri';
 
 /**
  * Pure predicate for whether `uri` lies inside one of `folders` — the workspace folder itself
@@ -27,26 +8,14 @@ function isSegmentPrefix(folderSegments: string[], uriSegments: string[]): boole
  * `vscode.workspace` directly so it stays a pure function of its arguments and is unit-testable
  * without a live workspace; call sites pass `vscode.workspace.workspaceFolders`.
  *
- * Comparison is case-insensitive unconditionally (not gated on `process.platform`), since the
- * same (uri, folders) pair must yield the same answer on every host OS, including in CI.
+ * Comparison delegates to the canonical root-URI primitives, which preserve path case while
+ * comparing schemes and authorities case-insensitively.
  */
 export function isInsideWorkspace(
   uri: vscode.Uri,
   folders: readonly vscode.WorkspaceFolder[] | undefined
 ): boolean {
-  if (!folders || folders.length === 0) {
-    return false;
-  }
-
-  const uriSegments = pathSegments(uri.path);
-
-  return folders.some((folder) => {
-    const folderUri = folder.uri;
-    if (uri.scheme !== folderUri.scheme || uri.authority !== folderUri.authority) {
-      return false;
-    }
-    return isSegmentPrefix(pathSegments(folderUri.path), uriSegments);
-  });
+  return findDeepestRoot(uri, toRootCandidates(folders)) !== undefined;
 }
 
 /**
@@ -54,42 +23,19 @@ export function isInsideWorkspace(
  * (POSIX-style, unconditionally — never `path.sep`, so the label is identical on Windows and
  * POSIX hosts). Returns `undefined` — the "no root to be relative to" case — when `uri` is not
  * inside any of `folders` (including when `folders` is `undefined` or empty), matching
- * `isInsideWorkspace`'s own case-insensitive, segment-boundary comparison so the two stay
- * consistent. Case is preserved in the returned path (unlike `isInsideWorkspace`'s internal
- * comparison, which lowercases only for matching).
+ * `isInsideWorkspace`'s canonical structural comparison so the two stay consistent. Case is
+ * preserved in the returned path and in root identity.
  */
 export function getWorkspaceRelativePath(
   uri: vscode.Uri,
   folders: readonly vscode.WorkspaceFolder[] | undefined
 ): string | undefined {
-  if (!folders || folders.length === 0) {
+  const root = findDeepestRoot(uri, toRootCandidates(folders));
+  if (!root) {
     return undefined;
   }
 
-  const uriSegments = uri.path.split('/').filter((segment) => segment.length > 0);
-  const uriSegmentsLower = uriSegments.map((segment) => segment.toLowerCase());
-
-  // #118: nested workspace roots (e.g. both `/workspace` and `/workspace/repo-a` open) can both
-  // satisfy the segment-prefix test for a bookmark under the child root. Track the best (longest
-  // segment-prefix / most specific) match across all folders instead of returning on the first
-  // hit, so the result is independent of folder array order. Ties (equal-length matches) keep the
-  // first one encountered — defensive only, as distinct real filesystem paths won't tie.
-  let bestMatchLength = -1;
-
-  for (const folder of folders) {
-    const folderUri = folder.uri;
-    if (uri.scheme !== folderUri.scheme || uri.authority !== folderUri.authority) {
-      continue;
-    }
-    const folderSegments = pathSegments(folderUri.path);
-    if (isSegmentPrefix(folderSegments, uriSegmentsLower) && folderSegments.length > bestMatchLength) {
-      bestMatchLength = folderSegments.length;
-    }
-  }
-
-  if (bestMatchLength === -1) {
-    return undefined;
-  }
-
-  return uriSegments.slice(bestMatchLength).join('/');
+  const uriSegments = uri.path.split('/').filter(Boolean);
+  const rootSegmentCount = root.uri.path.split('/').filter(Boolean).length;
+  return uriSegments.slice(rootSegmentCount).join('/');
 }

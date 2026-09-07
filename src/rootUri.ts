@@ -1,0 +1,177 @@
+import * as vscode from 'vscode';
+
+/** A workspace root paired with its stable caller-provided identifier. */
+export interface RootCandidate {
+  readonly id: string;
+  readonly label: string;
+  readonly uri: vscode.Uri;
+}
+
+/** A root candidate that structurally contains a URI. */
+export interface RootMatch extends RootCandidate {
+  readonly canonicalUri: string;
+}
+
+/** The result of rebasing a URI from one root onto another. */
+export interface RebaseResult {
+  readonly kind: 'rebased' | 'outside-old-root' | 'incompatible-uri';
+  readonly uri?: vscode.Uri;
+}
+
+/** Raised when a URI cannot safely identify a workspace root. */
+export class InvalidRootUriError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidRootUriError';
+  }
+}
+
+const UNRESERVED = /^[A-Za-z0-9._~-]$/;
+
+interface ComparableUri {
+  readonly scheme: string;
+  readonly authority: string;
+  readonly segments: readonly string[];
+}
+
+/** Normalizes percent escapes while preserving encoded path separators. */
+function normalizeEscapes(value: string): string {
+  return value.replace(/%([0-9a-fA-F]{2})/g, (_escape, hex: string) => {
+    const character = String.fromCharCode(Number.parseInt(hex, 16));
+    return UNRESERVED.test(character) ? character : `%${hex.toUpperCase()}`;
+  });
+}
+
+/** Returns the structural components used for URI identity and containment. */
+function comparable(uri: vscode.Uri): ComparableUri {
+  return {
+    scheme: uri.scheme.toLowerCase(),
+    authority: uri.authority.toLowerCase(),
+    segments: normalizeEscapes(uri.path).split('/').filter(Boolean)
+  };
+}
+
+/** Throws when a URI cannot be used as a canonical workspace-root identity. */
+function assertValidRootUri(uri: vscode.Uri): void {
+  if (!uri.scheme) {
+    throw new InvalidRootUriError('A workspace root URI must be absolute.');
+  }
+  if (uri.query) {
+    throw new InvalidRootUriError('A workspace root URI cannot include a query.');
+  }
+  if (uri.fragment) {
+    throw new InvalidRootUriError('A workspace root URI cannot include a fragment.');
+  }
+}
+
+/** True when `prefix` contains each leading structural path component in `value`. */
+function isSegmentPrefix(prefix: readonly string[], value: readonly string[]): boolean {
+  return prefix.length <= value.length && prefix.every((segment, index) => segment === value[index]);
+}
+
+/** Reconstructs a normalized absolute URI path from structural segments. */
+function pathFromSegments(segments: readonly string[]): string {
+  return `/${segments.join('/')}`;
+}
+
+/**
+ * Returns the stable identity of an absolute root URI. Schemes and authorities are
+ * case-insensitive; path segments preserve case and normalize safe percent escapes.
+ */
+export function canonicalizeRootUri(uri: vscode.Uri): string {
+  assertValidRootUri(uri);
+  const value = comparable(uri);
+  return `${value.scheme}://${value.authority}${pathFromSegments(value.segments)}`;
+}
+
+/** Returns whether `uri` is the root itself or lies below it on a path-component boundary. */
+export function isUriInsideRoot(uri: vscode.Uri, root: vscode.Uri): boolean {
+  assertValidRootUri(root);
+  const uriValue = comparable(uri);
+  const rootValue = comparable(root);
+  return uriValue.scheme === rootValue.scheme
+    && uriValue.authority === rootValue.authority
+    && isSegmentPrefix(rootValue.segments, uriValue.segments);
+}
+
+/** Finds the deepest root structurally containing `uri`, independent of root-list order. */
+export function findDeepestRoot(uri: vscode.Uri, roots: readonly RootCandidate[]): RootMatch | undefined {
+  let deepestMatch: RootMatch | undefined;
+  let deepestLength = -1;
+
+  for (const root of roots) {
+    if (!isUriInsideRoot(uri, root.uri)) {
+      continue;
+    }
+
+    const length = comparable(root.uri).segments.length;
+    if (length > deepestLength) {
+      deepestLength = length;
+      deepestMatch = { ...root, canonicalUri: canonicalizeRootUri(root.uri) };
+    }
+  }
+
+  return deepestMatch;
+}
+
+/** Groups only the root identities supplied more than once. */
+export function findCanonicalRootCollisions(
+  roots: readonly RootCandidate[]
+): ReadonlyMap<string, readonly RootCandidate[]> {
+  const groups = new Map<string, RootCandidate[]>();
+
+  for (const root of roots) {
+    const canonicalUri = canonicalizeRootUri(root.uri);
+    const group = groups.get(canonicalUri);
+    if (group) {
+      group.push(root);
+    } else {
+      groups.set(canonicalUri, [root]);
+    }
+  }
+
+  for (const [canonicalUri, group] of groups) {
+    if (group.length === 1) {
+      groups.delete(canonicalUri);
+    }
+  }
+
+  return groups;
+}
+
+/**
+ * Relocates a URI inside `oldRoot` to the equivalent relative path under `newRoot`.
+ * Roots and item must share scheme and authority; incompatible or outside URIs are unchanged.
+ */
+export function rebaseUri(uri: vscode.Uri, oldRoot: vscode.Uri, newRoot: vscode.Uri): RebaseResult {
+  assertValidRootUri(oldRoot);
+  assertValidRootUri(newRoot);
+  const uriValue = comparable(uri);
+  const oldRootValue = comparable(oldRoot);
+  const newRootValue = comparable(newRoot);
+
+  if (oldRootValue.scheme !== newRootValue.scheme || oldRootValue.authority !== newRootValue.authority
+    || uriValue.scheme !== oldRootValue.scheme || uriValue.authority !== oldRootValue.authority) {
+    return { kind: 'incompatible-uri' };
+  }
+  if (!isSegmentPrefix(oldRootValue.segments, uriValue.segments)) {
+    return { kind: 'outside-old-root' };
+  }
+
+  const relativeSegments = uriValue.segments.slice(oldRootValue.segments.length);
+  return {
+    kind: 'rebased',
+    uri: newRoot.with({ path: pathFromSegments([...newRootValue.segments, ...relativeSegments]) })
+  };
+}
+
+/** Converts VS Code workspace folders into stable root candidates. */
+export function toRootCandidates(
+  folders: readonly vscode.WorkspaceFolder[] | undefined
+): readonly RootCandidate[] {
+  return (folders ?? []).map((folder, index) => ({
+    id: `${index}:${folder.uri.toString(true)}`,
+    label: folder.name,
+    uri: folder.uri
+  }));
+}
