@@ -73,6 +73,39 @@ function snapshotWithAttachedRoot(): WorkspacePartitionSnapshot {
   return snapshot;
 }
 
+class DeferredFirstWorkspaceUpdateMemento extends FakeMemento {
+  private readonly firstUpdateGate: Promise<void>;
+  private releaseFirstUpdate: (() => void) | undefined;
+  private signalFirstUpdate: (() => void) | undefined;
+  private shouldDeferWorkspaceUpdate = true;
+
+  readonly firstWorkspaceUpdateStarted: Promise<void>;
+
+  constructor(initial: Record<string, unknown>) {
+    super(initial);
+    this.firstUpdateGate = new Promise<void>((resolve) => {
+      this.releaseFirstUpdate = resolve;
+    });
+    this.firstWorkspaceUpdateStarted = new Promise<void>((resolve) => {
+      this.signalFirstUpdate = resolve;
+    });
+  }
+
+  releaseFirstWorkspaceUpdate(): void {
+    this.releaseFirstUpdate?.();
+  }
+
+  update(key: string, value: unknown): Thenable<void> {
+    if (key === WORKSPACE_PARTITION_STORAGE_KEY && this.shouldDeferWorkspaceUpdate) {
+      this.shouldDeferWorkspaceUpdate = false;
+      this.signalFirstUpdate?.();
+      return this.firstUpdateGate.then(() => super.update(key, value));
+    }
+
+    return super.update(key, value);
+  }
+}
+
 suite('WorkspaceBookmarkStore content operations', () => {
   test('creates only inside the explicit matching attached partition', async () => {
     const { store, state, ownerA, ownerB } = await readyStore();
@@ -293,6 +326,60 @@ suite('WorkspaceBookmarkStore content operations', () => {
 
     assert.strictEqual(state.updateCallCount, updatesBefore);
     assert.strictEqual(events, 0);
+  });
+
+  test('allows an in-flight write to settle but rejects a queued mutation after disposal', async () => {
+    const state = new DeferredFirstWorkspaceUpdateMemento({
+      [WORKSPACE_PARTITION_STORAGE_KEY]: snapshotWithAttachedRoot()
+    });
+    const store = await WorkspaceBookmarkStore.create({
+      state,
+      roots: roots(),
+      output: new FakeOutput(),
+      createId: ids()
+    });
+    const owner = {
+      kind: 'partition' as const,
+      partitionId: '00000000-0000-4000-8000-000000000001'
+    };
+    let events = 0;
+    store.onBookmarksChanged(() => events++);
+
+    const firstMutation = store.addItem(owner, { type: 'file', uri: 'file:///workspace/a/a.ts' });
+    await state.firstWorkspaceUpdateStarted;
+
+    const secondMutation = store.addItem(owner, { type: 'file', uri: 'file:///workspace/a/b.ts' });
+    const firstSettled = firstMutation.then(
+      (item) => ({ status: 'fulfilled' as const, item }),
+      (error: unknown) => ({ status: 'rejected' as const, error })
+    );
+    const secondSettled = secondMutation.then(
+      (item) => ({ status: 'fulfilled' as const, item }),
+      (error: unknown) => ({ status: 'rejected' as const, error })
+    );
+
+    store.dispose();
+    state.releaseFirstWorkspaceUpdate();
+
+    const [firstResult, secondResult] = await Promise.all([firstSettled, secondSettled]);
+
+    assert.strictEqual(firstResult.status, 'fulfilled');
+    if (firstResult.status === 'fulfilled') {
+      assert.strictEqual(firstResult.item.uri, 'file:///workspace/a/a.ts');
+    }
+    assert.strictEqual(secondResult.status, 'rejected');
+    if (secondResult.status === 'rejected') {
+      assert.ok(secondResult.error instanceof WorkspaceDataUnavailableError);
+      assert.strictEqual(secondResult.error.message, 'Workspace bookmark store is disposed.');
+    }
+    assert.strictEqual(state.updateCallCount, 1);
+    assert.strictEqual(events, 0);
+
+    const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY);
+    assert.deepStrictEqual(
+      persisted?.partitions[0].data.items.map((item) => item.uri),
+      ['file:///workspace/a/a.ts']
+    );
   });
 
   test('keeps malformed workspace state unavailable and rejects every mutation without writing', async () => {
