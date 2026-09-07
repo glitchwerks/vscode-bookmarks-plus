@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { OutputSink } from './bookmarkStore';
 import { UnsupportedSchemaVersionError, migrateBookmarkData } from './migrations';
-import { normalizeBookmarkData } from './normalize';
 import {
   RootCandidate,
   canonicalizeRootUri,
@@ -165,11 +164,8 @@ export function partitionLegacyData(
     }
   }
 
-  const partitions = partitionOwners.map(({ partition }) => ({
-    ...partition,
-    data: normalizeBookmarkData(partition.data).data
-  }));
-  const normalizedUnassigned = normalizeBookmarkData(unassigned.data).data;
+  const partitions = partitionOwners.map(({ partition }) => partition);
+  const normalizedUnassigned = unassigned.data;
   const snapshot: WorkspacePartitionSnapshot = {
     version: 1,
     partitions,

@@ -127,6 +127,52 @@ suite('workspacePartitionMigration', () => {
     assert.ok(partition.data.items.every((item) => item.collectionId === partition.data.collections[0].id));
   });
 
+  test('preserves duplicate legacy collection members through partitioning and persistence', async () => {
+    const collectionId = '10000000-0000-4000-8000-000000000001';
+    const firstItemId = '10000000-0000-4000-8000-000000000002';
+    const secondItemId = '10000000-0000-4000-8000-000000000003';
+    const legacy: BookmarkData = {
+      version: 2,
+      collections: [{ id: collectionId, name: 'Duplicate members', order: 0 }],
+      items: [
+        {
+          id: firstItemId,
+          type: 'file',
+          uri: 'file:///workspace/a/duplicate.ts',
+          collectionId,
+          order: 0
+        },
+        {
+          id: secondItemId,
+          type: 'file',
+          uri: 'file:///workspace/a/duplicate.ts',
+          collectionId,
+          order: 1
+        }
+      ]
+    };
+
+    const partitioned = partitionLegacyData(legacy, roots(), deterministicIds()).snapshot;
+    const partitionedOwner = partitioned.partitions[0];
+    assert.strictEqual(partitionedOwner.data.items.length, 2);
+    assert.strictEqual(new Set(partitionedOwner.data.items.map((item) => item.id)).size, 2);
+    assert.ok(partitionedOwner.data.items.every(
+      (item) => item.collectionId === partitionedOwner.data.collections[0].id
+    ));
+
+    const state = new FakeMemento({ [LEGACY_STORAGE_KEY]: legacy });
+    const loaded = await loadOrMigrateWorkspaceSnapshot(state, roots(), deterministicIds(), new FakeOutput());
+    assert.strictEqual(loaded.kind, 'ready');
+    const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    const persistedOwner = persisted.partitions[0];
+    assert.strictEqual(persistedOwner.data.items.length, 2);
+    assert.strictEqual(new Set(persistedOwner.data.items.map((item) => item.id)).size, 2);
+    assert.ok(persistedOwner.data.items.every(
+      (item) => item.collectionId === persistedOwner.data.collections[0].id
+    ));
+    assert.deepStrictEqual(validateWorkspacePartitionSnapshot(persisted), { ok: true });
+  });
+
   test('does not delete legacy state when the new snapshot write fails', async () => {
     const state = new FakeMemento({ [LEGACY_STORAGE_KEY]: legacyData() });
     state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
