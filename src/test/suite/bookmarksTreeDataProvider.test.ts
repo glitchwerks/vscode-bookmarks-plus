@@ -2,8 +2,17 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { FsGitCache } from '../../fsGitCache';
-import { BookmarksTreeDataProvider, BookmarkNode, DND_MIME_TYPE } from '../../bookmarksTreeDataProvider';
+import {
+  BookmarksTreeDataProvider,
+  BookmarkNode,
+  DND_MIME_TYPE,
+  RecentlyViewedSource,
+  SuggestionsSource
+} from '../../bookmarksTreeDataProvider';
 import { RecentItem } from '../../recentItems';
+import { BookmarkData, BookmarkItem } from '../../types';
+import { WorkspaceBookmarkStore, WorkspaceStoreView } from '../../workspaceBookmarkStore';
+import { WorkspaceOwnerRef } from '../../workspacePartitionTypes';
 import { FakeMemento } from './fixtures';
 
 function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })) {
@@ -1584,5 +1593,251 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
       'a stale (non-existent) recent uri must still render as a clickable node under Recent'
     );
     assert.strictEqual((leaves[0] as unknown as { uri: string }).uri, uri);
+  });
+});
+
+// --- #62: partition-aware workspace topology -----------------------------------------------
+
+const OWNER_A: WorkspaceOwnerRef = { kind: 'partition', partitionId: 'partition-a' };
+const OWNER_B: WorkspaceOwnerRef = { kind: 'partition', partitionId: 'partition-b' };
+
+function partitionItem(id: string, uri = `file:///workspace/${id}.ts`, collectionId: string | null = null): BookmarkItem {
+  return { id, type: 'file', uri, collectionId, order: 0 };
+}
+
+function partitionData(items: BookmarkItem[] = [], collections: BookmarkData['collections'] = []): BookmarkData {
+  return { version: 2, items, collections };
+}
+
+function readyWorkspaceView(options: {
+  attached?: Array<{ partitionId: string; label: string; data?: BookmarkData }>;
+  unassigned?: BookmarkData;
+  detached?: Array<{ partitionId: string; label?: string; data?: BookmarkData }>;
+} = {}): WorkspaceStoreView {
+  return {
+    kind: 'ready',
+    attached: (options.attached ?? []).map((entry) => ({
+      partitionId: entry.partitionId,
+      label: entry.label,
+      rootUri: `file:///workspace/${entry.partitionId}`,
+      canonicalRootUri: `file:///workspace/${entry.partitionId}`,
+      replacementEligible: false,
+      data: entry.data ?? partitionData()
+    })),
+    unassigned: options.unassigned ?? partitionData(),
+    detached: (options.detached ?? []).map((entry) => ({
+      partitionId: entry.partitionId,
+      lastKnownRootUri: entry.label ?? `file:///old/${entry.partitionId}`,
+      canonicalLastKnownRootUri: entry.label ?? `file:///old/${entry.partitionId}`,
+      replacementEligible: false,
+      data: entry.data ?? partitionData()
+    })),
+    unavailableRoots: []
+  };
+}
+
+function unavailableWorkspaceView(): WorkspaceStoreView {
+  return { kind: 'unavailable', attached: [], detached: [], unassigned: partitionData(), unavailableRoots: [], reason: 'bad data' };
+}
+
+function providerForWorkspaceView(
+  view: WorkspaceStoreView,
+  options: {
+    globalStore?: BookmarkStore;
+    repoForUri?: (uri: string) => string | undefined;
+    suggestions?: SuggestionsSource;
+    recentlyViewed?: RecentlyViewedSource;
+  } = {}
+) {
+  const changes = new vscode.EventEmitter<void>();
+  const moves: Array<{ owner: WorkspaceOwnerRef; id: string; collectionId: string | null; index: number }> = [];
+  const aggregate = (): BookmarkData => ({
+    version: 2,
+    items: [
+      ...view.attached.flatMap((partition) => partition.data.items),
+      ...view.detached.flatMap((partition) => partition.data.items),
+      ...view.unassigned.items
+    ],
+    collections: [
+      ...view.attached.flatMap((partition) => partition.data.collections),
+      ...view.detached.flatMap((partition) => partition.data.collections),
+      ...view.unassigned.collections
+    ]
+  });
+  const workspaceStore = {
+    onBookmarksChanged: changes.event,
+    getAll: aggregate,
+    getView: () => view,
+    moveItem: async (owner: WorkspaceOwnerRef, id: string, collectionId: string | null, index: number) => {
+      moves.push({ owner, id, collectionId, index });
+    }
+  } as unknown as WorkspaceBookmarkStore;
+  const provider = new BookmarksTreeDataProvider(
+    workspaceStore,
+    new FsGitCache(async (uri) => ({ exists: true, repoName: options.repoForUri?.(uri) })),
+    options.globalStore,
+    undefined,
+    options.suggestions,
+    options.recentlyViewed
+  );
+  return { provider, moves, changes };
+}
+
+function partitionEnvelope(owner: WorkspaceOwnerRef | undefined, ids: string[]): vscode.DataTransfer {
+  const transfer = new vscode.DataTransfer();
+  transfer.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope: 'workspace', owner, ids }));
+  return transfer;
+}
+
+suite('BookmarksTreeDataProvider - workspace partitions (#62)', () => {
+  test('keeps one attached root flat and carries its partition owner', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'workspaceRoot'), false);
+    const item = roots.find((node) => node.kind === 'item');
+    assert.deepStrictEqual(item && (item as Extract<BookmarkNode, { kind: 'item' }>).owner, OWNER_A);
+  });
+
+  test('wraps every attached root in a multi-root workspace in current workspace order', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_B.partitionId, label: 'Root B' },
+        { partitionId: OWNER_A.partitionId, label: 'Root A' }
+      ]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.deepStrictEqual(
+      roots.filter((node) => node.kind === 'workspaceRoot').map((node) => (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId),
+      [OWNER_B.partitionId, OWNER_A.partitionId]
+    );
+  });
+
+  test('shows preservation sections only when their owner data is populated', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      unassigned: partitionData([partitionItem('unassigned')]),
+      detached: [
+        { partitionId: 'detached-a', data: partitionData([partitionItem('detached-a')]) },
+        { partitionId: 'detached-empty' }
+      ]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'unassignedRoot'), true);
+    assert.strictEqual(roots.some((node) => node.kind === 'detachedRoot'), true);
+    const detachedRoot = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedPartitions = await provider.getChildren(detachedRoot);
+    assert.deepStrictEqual(
+      detachedPartitions.map((node) => (node as Extract<BookmarkNode, { kind: 'detachedPartition' }>).partitionId),
+      ['detached-a']
+    );
+  });
+
+  test('shows a workspace diagnostic instead of unavailable workspace content', async () => {
+    const { provider } = providerForWorkspaceView(unavailableWorkspaceView());
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.filter((node) => node.kind === 'workspaceDiagnostic').length, 1);
+  });
+
+  test('keeps equal repo names isolated inside each owner', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a', 'file:///workspace/a/a.ts')]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([partitionItem('b', 'file:///workspace/b/b.ts')]) }
+      ]
+    }), { repoForUri: () => 'shared-repo' });
+    provider.setGroupMode('byRepo');
+
+    const roots = await provider.getChildren();
+    const rootA = roots.find((node) => node.kind === 'workspaceRoot' && (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId === OWNER_A.partitionId)!;
+    const groups = await provider.getChildren(rootA);
+    assert.strictEqual(groups.length, 1);
+    const items = await provider.getChildren(groups[0]);
+    assert.deepStrictEqual(items.map((node) => (node as Extract<BookmarkNode, { kind: 'item' }>).item.id), ['a']);
+  });
+
+  test('prefixes tree item identities with their owner to prevent collisions', async () => {
+    const shared = partitionItem('same-id');
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([shared]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([{ ...shared, uri: 'file:///workspace/b/same-id.ts' }]) }
+      ]
+    }));
+    const roots = await provider.getChildren();
+    const first = (await provider.getChildren(roots[0]))[0];
+    const second = (await provider.getChildren(roots[1]))[0];
+    assert.notStrictEqual((await provider.getTreeItem(first)).id, (await provider.getTreeItem(second)).id);
+  });
+
+  test('orders Global, workspace, preservation, Suggested, and Recent deterministically', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }],
+      unassigned: partitionData([partitionItem('u')]),
+      detached: [{ partitionId: 'detached-a', data: partitionData([partitionItem('d')]) }]
+    }), {
+      globalStore,
+      suggestions: { getRecentItems: () => [{ uri: 'file:///suggested.ts', firstSeen: 1, previewCount: 0, promoted: true }], maxItems: 1 },
+      recentlyViewed: { getUris: () => ['file:///recent.ts'] }
+    });
+    assert.deepStrictEqual((await provider.getChildren()).map((node) => node.kind), [
+      'globalRoot', 'item', 'unassignedRoot', 'detachedRoot', 'suggestedRoot', 'recentRoot'
+    ]);
+  });
+
+  test('does not re-suggest bookmarks preserved in Detached or Unassigned while Recent stays unfiltered', async () => {
+    const detachedUri = 'file:///old/detached.ts';
+    const unassignedUri = 'file:///outside/unassigned.ts';
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      unassigned: partitionData([partitionItem('u', unassignedUri)]),
+      detached: [{ partitionId: 'old', data: partitionData([partitionItem('d', detachedUri)]) }]
+    }), {
+      suggestions: {
+        getRecentItems: () => [
+          { uri: detachedUri, firstSeen: 2, previewCount: 0, promoted: true },
+          { uri: unassignedUri, firstSeen: 1, previewCount: 0, promoted: true }
+        ], maxItems: 2
+      },
+      recentlyViewed: { getUris: () => [detachedUri] }
+    });
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'suggestedRoot'), false);
+    assert.strictEqual(roots.some((node) => node.kind === 'recentRoot'), true);
+  });
+
+  test('permits same-owner workspace drops and rejects missing or cross-owner envelopes without mutation', async () => {
+    const collection = { id: 'collection-a', name: 'A', order: 0 };
+    const { provider, moves } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')], [collection]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([partitionItem('b')]) }
+      ]
+    }));
+    const token = new vscode.CancellationTokenSource().token;
+    const roots = await provider.getChildren();
+    const rootA = roots.find((node) => node.kind === 'workspaceRoot' && (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId === OWNER_A.partitionId)!;
+    const target = (await provider.getChildren(rootA)).find((node) => node.kind === 'collection')!;
+
+    await provider.handleDrop(target, partitionEnvelope(undefined, ['a']), token);
+    await provider.handleDrop(target, partitionEnvelope(OWNER_B, ['b']), token);
+    assert.deepStrictEqual(moves, []);
+
+    await provider.handleDrop(target, partitionEnvelope(OWNER_A, ['a']), token);
+    assert.deepStrictEqual(moves, [{ owner: OWNER_A, id: 'a', collectionId: 'collection-a', index: 0 }]);
+  });
+
+  test('rejects a multi-selection drag that mixes workspace owners', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView());
+    const transfer = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag([
+      { kind: 'item', item: partitionItem('a'), scope: 'workspace', owner: OWNER_A },
+      { kind: 'item', item: partitionItem('b'), scope: 'workspace', owner: OWNER_B }
+    ], transfer, token);
+    assert.strictEqual(transfer.get(DND_MIME_TYPE), undefined);
   });
 });
