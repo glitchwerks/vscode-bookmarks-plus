@@ -1,8 +1,8 @@
 # Cross-Extension MCP Access Contract Design
 
-**Status:** Revised after third architectural review and root-addition review; pending downstream issue updates
+**Status:** Approved on 2026-09-07
 **Issue:** #137
-**Approval gates:** #62 update; glitchwerks/vscode-claude-workspaces#50 update
+**Approval gates satisfied:** #62 update; glitchwerks/vscode-claude-workspaces#50 update
 **Implementation prerequisites:** #62, #129
 **Downstream implementation:** #138
 **Consumer integration:** glitchwerks/vscode-claude-workspaces#50
@@ -511,10 +511,13 @@ but it must expose the same logical behavior:
 4. Once assigned, an existing item's or collection's owner remains stable when workspace folders are
    added, nested, or reordered. Adding nested root B does not move items or collections from parent
    root A, and adding a root around an `unassigned` item does not claim that item.
-5. A newly added root either reattaches its unique same-identity detached partition under the rules
-   below or creates a new empty partition. Only items and empty collections created after that change
-   use the then-current deepest-root rule. Folder addition never triggers implicit repartitioning or
-   live collection splitting. (#62; #137)
+5. When a root is added, Bookmarks Plus reattaches exactly one same-identity detached partition. If
+   multiple same-identity detached partitions exist, it attaches none, creates no replacement
+   partition, and leaves that root unavailable until the user explicitly selects one through the
+   recovery action below. If no same-identity detached partition exists, it creates a new empty
+   partition. Only items and empty collections created after the root has an attachment use the
+   then-current deepest-root rule. Folder addition never triggers implicit repartitioning or live
+   collection splitting. (#62; #137)
 6. An item outside every current root is `unassigned`. It remains available through the Bookmarks
    Plus UI but is invisible and immutable through every root-scoped MCP session.
 7. Collections cannot span logical owners. A root-scoped session sees and mutates only collections
@@ -570,13 +573,21 @@ The schema migration must be lossless and idempotent:
 
 When exactly one detached partition has the same canonical URI identity as a returning workspace
 folder and no attached partition claims that identity, Bookmarks Plus must reattach it automatically.
+If multiple detached partitions have that identity, the root remains unattached and unavailable to
+MCP requests until the user explicitly selects one; the selected partition is attached and every
+other candidate remains detached. Bookmarks Plus must not auto-merge candidates or create an empty
+partition that would mask the ambiguity.
+
 A folder move or rename that changes the identity must not be inferred from a matching display name,
 basename, path suffix, or bookmark contents. Rebinding a detached partition to a different current
-URI requires an explicit user-confirmed recovery action, preserves the stable partition identity,
-and must fail rather than merge implicitly when that URI is already attached to another partition.
-Ambiguous legacy or corrupt state with multiple matching detached partitions also requires explicit
-recovery and must not auto-merge. Detached partitions remain unavailable to new MCP requests until
-reattached. #62 must document the recovery action before #137 is approved. (#62; #137)
+URI requires an explicit user-confirmed recovery action and preserves the selected partition's stable
+identity. If the destination URI is attached to the automatically created partition for that root,
+recovery may atomically delete and replace that destination partition only while it remains empty. If
+the destination partition is non-empty, was not automatically created for that root, or otherwise
+cannot be safely replaced, recovery returns a conflict and makes no attachment, ownership, or data
+changes; API v1 never merges partitions implicitly. The user must handle the destination data through
+a separate explicit action before retrying recovery. Detached partitions remain unavailable to new
+MCP requests until reattached. #62 must document this recovery action. (#62; #137)
 
 These semantics implement the selected-root and least-privilege contract while leaving the physical
 storage representation to #62 and the authenticated mutation path to #129. (#62; #129; #137)
@@ -594,6 +605,7 @@ activate/discover again rather than reuse the old object. (#137)
 | Unrelated folder removed | Remains usable until bootstrap expiry | Remains connected |
 | Selected root removed | Startup validation fails | Bridge closes; server exits |
 | Selected root temporarily unavailable | Startup validation fails | Bridge closes; server exits |
+| Selected root has no attachment pending explicit recovery | `workspace-folder-unavailable` | No session can start in this state |
 | Extension reload/disposal | Generation becomes invalid | Bridge closes; server exits |
 | Bootstrap expires | Startup fails | No effect after initialization |
 | Descriptor reused | Second startup fails | First active session is unaffected |
@@ -641,11 +653,15 @@ https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
   mixed root-owned and unmatched items, split multi-root collections, empty collections,
   out-of-root items, and idempotent retry without data loss.
 - Root lifecycle tests preserve stable partition identity across detachment, automatically reattach
-  exactly one detached partition with the same canonical URI identity, ignore display-name changes,
-  and require explicit recovery for changed-identity or ambiguous matches without implicitly merging
-  partitions. URI-identity tests cover the documented scheme, authority, path-case, percent-encoding,
-  and trailing-separator behavior for local and remote roots and prove the same canonicalization is
-  used by attachment, persistence, request validation, containment, and reattachment.
+  exactly one detached partition with the same canonical URI identity, and ignore display-name
+  changes. Multiple same-identity candidates leave the root unavailable until explicit selection;
+  selection attaches only the chosen partition and leaves the others detached. Changed-identity
+  recovery atomically replaces an automatically created empty destination partition, while a
+  non-empty or otherwise ineligible destination returns a conflict with no attachment, ownership, or
+  data changes. URI-identity tests cover the documented scheme, authority, path-case,
+  percent-encoding, and trailing-separator behavior for local and remote roots and prove the same
+  canonicalization is used by attachment, persistence, request validation, containment, and
+  reattachment.
 - Root-addition tests prove that adding or nesting root B does not reassign root-A or `unassigned`
   items, does not split existing collections, and does not interrupt active root-A sessions or
   invalidate unstarted root-A descriptors. Items and empty collections created under B after the
@@ -737,8 +753,9 @@ silently changing while its private transport is implemented. (#137)
 #137 is ready for approval when:
 
 1. #62 records the stable attached/detached partition model, deterministic URI canonicalization,
-   mandatory unique same-identity reattachment, lossless `unassigned` collection splitting,
-   stable ownership across root additions, create-operation scope checks, and recovery
+   mandatory unique same-identity reattachment, explicit ambiguous-candidate selection, atomic empty-
+   destination replacement, non-empty recovery conflicts, lossless `unassigned` collection
+   splitting, stable ownership across root additions, create-operation scope checks, and recovery
    responsibilities above without weakening selected-root isolation.
 2. The contract's failure-isolation example remains bounded across activation and request and
    discards late descriptors.

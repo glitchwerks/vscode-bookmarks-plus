@@ -1,8 +1,12 @@
 # Cross-Extension MCP Access Contract Review
 
-**Reviewed specification:** `docs/superpowers/specs/2026-09-06-cross-extension-mcp-access-contract-design.md`  
-**Issue:** #137  
-**Review outcome:** Revisions required before approval
+**Reviewed specification:** `docs/superpowers/specs/2026-09-06-cross-extension-mcp-access-contract-design.md`
+**Reviewed revision:** `389295a`
+**Issue:** #137
+**Review outcome:** Historical review; its findings were resolved in the approved specification
+
+This file records the initial architectural review of revision `389295a`. It is retained as review
+history and is not the current readiness assessment.
 
 ## Summary
 
