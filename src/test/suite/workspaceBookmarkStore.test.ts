@@ -696,6 +696,31 @@ suite('WorkspaceBookmarkStore recovery', () => {
     assert.deepStrictEqual(changes[0].removedReplacementPartitionIds, []);
   });
 
+  test('recovery elsewhere leaves an unattached current root unavailable without reassigning its remaining detached partition', async () => {
+    const snapshot = recoverySnapshot();
+    const remainingDetachedId = '00000000-0000-4000-8000-000000000099';
+    snapshot.partitions.push({
+      id: remainingDetachedId, attachment: null,
+      lastKnownRootUri: 'FILE:///old/repo/', canonicalLastKnownRootUri: 'file:///old/repo',
+      replacementEligible: false, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+    const oldRoot: RootCandidate = { id: 'old-root', label: 'Old repo', uri: vscode.Uri.parse('file:///old/repo') };
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [], output: new FakeOutput(), createId: ids() });
+    await store.reconcileRoots([oldRoot, destination]);
+    const changes: PartitionLifecycleChange[] = [];
+    store.onDidChangePartitions((change) => changes.push(change));
+
+    const preview = await store.previewRecovery(snapshot.partitions[0].id, destination, 'reattach-only', recoveryFilesystem([]));
+    await store.commitRecovery(preview.token);
+
+    assert.deepStrictEqual(store.getView().unavailableRoots, ['file:///old/repo']);
+    assert.strictEqual(store.resolveAttachedOwner(vscode.Uri.parse('file:///old/repo/src/kept.ts')), undefined);
+    assert.ok(store.getView().detached.some((partition) => partition.partitionId === remainingDetachedId));
+    assert.strictEqual(changes.length, 1);
+    assert.deepStrictEqual(changes[0].unavailableCanonicalRoots, ['file:///old/repo']);
+  });
+
   test('recovery publishes one replacement-removal lifecycle change only after persistence succeeds', async () => {
     const { state, store, detachedId } = await recoveryStore('eligible');
     const changes: PartitionLifecycleChange[] = [];
@@ -822,6 +847,20 @@ suite('WorkspaceBookmarkStore recovery', () => {
 
     assert.strictEqual(store.getView().detached[0].partitionId, '00000000-0000-4000-8000-000000000001');
     assert.strictEqual(state.updateCallCount, 1);
+  });
+
+  test('disposing during deferred salvage rejects without issuing a recovery token', async () => {
+    const { store, detachedId } = await recoveryStore();
+    const fs = new DeferredRecoveryFileSystem();
+    const preview = store.previewRecovery(detachedId, destination, 'salvage', fs);
+    await fs.statStarted;
+
+    store.dispose();
+    fs.release();
+
+    await assert.rejects(preview, WorkspaceDataUnavailableError);
+    const pendingRecoveries = (store as unknown as { pendingRecoveries: ReadonlyMap<string, unknown> }).pendingRecoveries;
+    assert.strictEqual(pendingRecoveries.size, 0);
   });
 
   test('salvage marks recovered mirror state dirty while preserving collections, Unassigned data, and URI query fragments', async () => {

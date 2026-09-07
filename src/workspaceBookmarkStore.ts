@@ -517,6 +517,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     if (previewRevision !== this.revision) {
       throw new StaleRecoveryPreviewError('Recovery preview is stale.');
     }
+    this.assertReady();
     const token = randomUUID();
     this.pendingRecoveries.set(token, {
       revision: previewRevision,
@@ -728,13 +729,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         unavailableCanonicalRoots.push(canonical);
         continue;
       }
-      if (snapshot.partitions.some((partition) => partition.attachment?.canonicalRootUri === canonical)) {
-        continue;
-      }
-      const detachedMatches = snapshot.partitions.filter(
-        (partition) => !partition.attachment && partition.canonicalLastKnownRootUri === canonical
-      );
-      if (detachedMatches.length > 1) {
+      if (!snapshot.partitions.some((partition) => partition.attachment?.canonicalRootUri === canonical)) {
         unavailableCanonicalRoots.push(canonical);
       }
     }
