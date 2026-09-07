@@ -5,6 +5,7 @@ import { MirrorPort } from '../../bookmarkMirror';
 export class FakeMemento implements vscode.Memento {
   private store = new Map<string, unknown>();
   updateCallCount = 0;
+  failUpdateForKey: string | undefined;
   /**
    * Counts every call to `get()`, regardless of key. Used by tests that need to prove a
    * `Memento` was actually read from (e.g. that a store was constructed against it) without
@@ -28,6 +29,10 @@ export class FakeMemento implements vscode.Memento {
   }
 
   update(key: string, value: unknown): Thenable<void> {
+    if (this.failUpdateForKey === key) {
+      this.failUpdateForKey = undefined;
+      return Promise.reject(new Error(`simulated update failure: ${key}`));
+    }
     if (value === undefined) {
       this.store.delete(key);
     } else {
