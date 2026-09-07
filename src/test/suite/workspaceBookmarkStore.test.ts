@@ -115,6 +115,31 @@ function recoveryFilesystem(resolving: readonly string[]): RecoveryFileSystem {
   };
 }
 
+class DeferredRecoveryFileSystem implements RecoveryFileSystem {
+  private releaseStat: (() => void) | undefined;
+  private signalStarted: (() => void) | undefined;
+  readonly statStarted: Promise<void>;
+  private readonly statGate: Promise<void>;
+
+  constructor() {
+    this.statStarted = new Promise<void>((resolve) => {
+      this.signalStarted = resolve;
+    });
+    this.statGate = new Promise<void>((resolve) => {
+      this.releaseStat = resolve;
+    });
+  }
+
+  stat(): Thenable<vscode.FileStat> {
+    this.signalStarted?.();
+    return this.statGate.then(() => ({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 1 }));
+  }
+
+  release(): void {
+    this.releaseStat?.();
+  }
+}
+
 class DeferredFirstWorkspaceUpdateMemento extends FakeMemento {
   private readonly firstUpdateGate: Promise<void>;
   private releaseFirstUpdate: (() => void) | undefined;
@@ -511,6 +536,32 @@ suite('WorkspaceBookmarkStore root lifecycle', () => {
     assert.deepStrictEqual(changes[0].detachedPartitionIds, []);
   });
 
+  test('content listeners observe committed roots and ownership during a persisted reconciliation', async () => {
+    const state = new FakeMemento();
+    const parent = vscode.Uri.parse('file:///work');
+    const child = vscode.Uri.parse('file:///work/child');
+    const store = await WorkspaceBookmarkStore.create({
+      state, roots: [{ id: 'parent', label: 'Old label', uri: parent }], output: new FakeOutput(), createId: ids()
+    });
+    const parentId = store.getView().attached[0].partitionId;
+    let observed: { labels: readonly string[]; owner: string | undefined } | undefined;
+    store.onBookmarksChanged(() => {
+      const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///work/child/new.ts'));
+      observed = {
+        labels: store.getView().attached.map((partition) => partition.label),
+        owner: owner?.kind === 'partition' ? owner.partitionId : undefined
+      };
+    });
+
+    await store.reconcileRoots([
+      { id: 'parent', label: 'Renamed parent', uri: parent },
+      { id: 'child', label: 'Child', uri: child }
+    ]);
+
+    assert.deepStrictEqual(observed?.labels, ['Renamed parent', 'Child']);
+    assert.notStrictEqual(observed?.owner, parentId);
+  });
+
   test('canonical collisions keep roots unavailable without replacing or reassigning partitions', async () => {
     const state = new FakeMemento({
       [WORKSPACE_PARTITION_STORAGE_KEY]: {
@@ -621,6 +672,49 @@ suite('WorkspaceBookmarkStore recovery', () => {
     assert.deepStrictEqual(store.getView().attached.map((partition) => partition.partitionId), [detachedId]);
   });
 
+  test('recovery of an explicitly selected duplicate clears availability and publishes one attachment lifecycle change', async () => {
+    const snapshot = recoverySnapshot();
+    snapshot.partitions.push({
+      id: '00000000-0000-4000-8000-000000000099', attachment: null,
+      lastKnownRootUri: 'FILE:///old/repo/', canonicalLastKnownRootUri: 'file:///old/repo',
+      replacementEligible: false, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+    const returning: RootCandidate = { id: 'old-root', label: 'Old repo', uri: vscode.Uri.parse('file:///old/repo') };
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [], output: new FakeOutput(), createId: ids() });
+    await store.reconcileRoots([returning]);
+    assert.deepStrictEqual(store.getView().unavailableRoots, ['file:///old/repo']);
+    const changes: PartitionLifecycleChange[] = [];
+    store.onDidChangePartitions((change) => changes.push(change));
+
+    const preview = await store.previewRecovery(snapshot.partitions[0].id, returning, 'reattach-only', recoveryFilesystem([]));
+    await store.commitRecovery(preview.token);
+
+    assert.deepStrictEqual(store.getView().unavailableRoots, []);
+    assert.strictEqual(changes.length, 1);
+    assert.deepStrictEqual(changes[0].attachedPartitionIds, [snapshot.partitions[0].id]);
+    assert.deepStrictEqual(changes[0].removedReplacementPartitionIds, []);
+  });
+
+  test('recovery publishes one replacement-removal lifecycle change only after persistence succeeds', async () => {
+    const { state, store, detachedId } = await recoveryStore('eligible');
+    const changes: PartitionLifecycleChange[] = [];
+    store.onDidChangePartitions((change) => changes.push(change));
+    const preview = await store.previewRecovery(detachedId, destination, 'reattach-only', recoveryFilesystem([]));
+    state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
+
+    await assert.rejects(store.commitRecovery(preview.token));
+    assert.strictEqual(changes.length, 0);
+    assert.deepStrictEqual(store.getView().attached.map((partition) => partition.partitionId), ['00000000-0000-4000-8000-000000000002']);
+
+    await store.commitRecovery(preview.token);
+
+    assert.strictEqual(changes.length, 1);
+    assert.deepStrictEqual(changes[0].attachedPartitionIds, [detachedId]);
+    assert.deepStrictEqual(changes[0].removedReplacementPartitionIds, ['00000000-0000-4000-8000-000000000002']);
+    assert.deepStrictEqual(changes[0].unavailableCanonicalRoots, []);
+  });
+
   test('recovery rejects established and invalid destinations without mutation', async () => {
     const { state, store, detachedId } = await recoveryStore('established');
     const before = JSON.stringify(store.getView());
@@ -693,6 +787,76 @@ suite('WorkspaceBookmarkStore recovery', () => {
     );
 
     await assert.rejects(store.commitRecovery(preview.token), StaleRecoveryPreviewError);
+  });
+
+  test('an in-flight salvage preview cannot become valid after a persisted mutation', async () => {
+    const otherRoot: RootCandidate = { id: 'other-root', label: 'Other', uri: vscode.Uri.parse('file:///other') };
+    const snapshot = recoverySnapshot();
+    snapshot.partitions.push({
+      id: '00000000-0000-4000-8000-000000000003',
+      attachment: { rootUri: otherRoot.uri.toString(), canonicalRootUri: otherRoot.uri.toString() },
+      lastKnownRootUri: otherRoot.uri.toString(), canonicalLastKnownRootUri: otherRoot.uri.toString(),
+      replacementEligible: true, data: { version: 2, items: [], collections: [] }, mirror: { dirty: false }
+    });
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [destination, otherRoot], output: new FakeOutput(), createId: ids() });
+    const fs = new DeferredRecoveryFileSystem();
+    const previewPromise = store.previewRecovery(
+      '00000000-0000-4000-8000-000000000001', destination, 'salvage', fs
+    );
+    await fs.statStarted;
+    await store.addItem(
+      { kind: 'partition', partitionId: '00000000-0000-4000-8000-000000000003' },
+      { type: 'file', uri: 'file:///other/changed.ts' }
+    );
+    fs.release();
+    const outcome = await previewPromise.then(
+      (preview) => ({ preview }),
+      (error: unknown) => ({ error })
+    );
+    if ('preview' in outcome) {
+      await assert.rejects(store.commitRecovery(outcome.preview.token), StaleRecoveryPreviewError);
+    } else {
+      assert.ok(outcome.error instanceof StaleRecoveryPreviewError);
+    }
+
+    assert.strictEqual(store.getView().detached[0].partitionId, '00000000-0000-4000-8000-000000000001');
+    assert.strictEqual(state.updateCallCount, 1);
+  });
+
+  test('salvage marks recovered mirror state dirty while preserving collections, Unassigned data, and URI query fragments', async () => {
+    const snapshot = recoverySnapshot();
+    const detached = snapshot.partitions[0];
+    const sourceUri = vscode.Uri.parse('file:///old/repo/src/a.ts?view=full#anchor');
+    const rebasedUri = vscode.Uri.parse('file:///new/repo/src/a.ts?view=full#anchor');
+    detached.data.collections.push({ id: '00000000-0000-4000-8000-000000000021', name: 'Keep', order: 0 });
+    detached.data.items[0].collectionId = '00000000-0000-4000-8000-000000000021';
+    detached.data.items[0].uri = sourceUri.toString();
+    detached.mirror = { dirty: false, lastSuccessfulHash: 'a'.repeat(64) };
+    snapshot.unassigned.items.push({
+      id: '00000000-0000-4000-8000-000000000031', type: 'file', uri: 'file:///unassigned/keep.ts', collectionId: null, order: 0
+    });
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [destination], output: new FakeOutput(), createId: ids() });
+    const preview = await store.previewRecovery(
+      detached.id,
+      destination,
+      'salvage',
+      recoveryFilesystem([rebasedUri.toString()])
+    );
+
+    await store.commitRecovery(preview.token);
+
+    const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    const recovered = persisted.partitions.find((partition) => partition.id === detached.id)!;
+    assert.strictEqual(recovered.mirror.dirty, true);
+    assert.strictEqual(recovered.mirror.lastSuccessfulHash, 'a'.repeat(64));
+    assert.strictEqual(recovered.data.collections[0].name, 'Keep');
+    const rewrittenUri = vscode.Uri.parse(recovered.data.items[0].uri);
+    assert.strictEqual(rewrittenUri.path, rebasedUri.path);
+    assert.strictEqual(rewrittenUri.query, sourceUri.query);
+    assert.strictEqual(rewrittenUri.fragment, sourceUri.fragment);
+    assert.deepStrictEqual(persisted.unassigned, snapshot.unassigned);
   });
 
   test('failed recovery persistence rolls back and leaves the current preview retryable', async () => {

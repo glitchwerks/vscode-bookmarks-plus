@@ -51,6 +51,8 @@ export interface RootReconcileResult {
 /** Adds the current root ordering and labels to a reconciliation result. */
 export interface PartitionLifecycleChange extends RootReconcileResult {
   readonly currentRoots: readonly RootCandidate[];
+  /** Empty replacement partitions removed when a recovered partition reclaims their root. */
+  readonly removedReplacementPartitionIds: readonly string[];
 }
 
 /** Selects whether recovery only reattaches or also salvages resolvable bookmark paths. */
