@@ -619,4 +619,99 @@ suite('WorkspaceMirrorCoordinator', () => {
     release.resolve(); await removal;
     assert.strictEqual(observedReads, reads);
   });
+
+  for (const failingRoot of ['/a', '/b']) {
+    test(`failed ${failingRoot} resource disposal attempts every removed binding and restores attached mirrors`, async () => {
+      const f = await fixture(); const retired = [...f.resources.values()]; const attempts: string[] = [];
+      for (const [root, resource] of f.resources) {
+        const dispose = resource.dispose.bind(resource);
+        let fail = root === failingRoot;
+        resource.dispose = () => {
+          attempts.push(root); dispose();
+          if (fail) { fail = false; throw new Error('PRIVATE_disposal_provider_error'); }
+        };
+      }
+      await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/before.ts' });
+      await f.store.addItem(f.ownerB, { type: 'file', uri: 'file:///b/before.ts' });
+      await assert.rejects(f.coordinator.handleRootsChanged([]));
+      assert.deepStrictEqual(attempts, ['/a', '/b']);
+      assert.ok(retired.every((resource) => resource.disposed));
+      assert.strictEqual(f.store.getView().attached.length, 2);
+      assert.ok([...f.resources.values()].every((resource) => !resource.disposed));
+      assert.ok([...f.resources.values()].every((resource) => !retired.includes(resource)));
+      await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/after.ts' });
+      await f.store.addItem(f.ownerB, { type: 'file', uri: 'file:///b/after.ts' });
+      await f.coordinator.flushAll();
+      for (const [root, id] of [['/a', f.a], ['/b', f.b]]) {
+        assert.strictEqual(JSON.parse(f.resources.get(root)!.port.content!).items.length, 2);
+        assert.strictEqual(f.store.getMirrorState(id)!.dirty, false);
+      }
+      assert.ok(f.output.lines.every((line) => !line.includes('PRIVATE')));
+    });
+  }
+
+  test('throwing watcher subscription disposal does not skip other subscriptions or resource disposal', async () => {
+    const f = await fixture(); f.coordinator.dispose();
+    const attempts: string[] = []; let first = true;
+    const coordinator = new WorkspaceMirrorCoordinator({ store: f.store, output: f.output, createResources: (root) => {
+      const resource = new FakePartitionMirrorResources(root.path === '/a' ? f.mirrorA : f.mirrorB);
+      if (root.path !== '/a' || !first) { return resource; }
+      first = false;
+      let fail = true;
+      const subscription = (name: string): vscode.Event<void> => () => ({ dispose: () => {
+        attempts.push(name); if (name === 'change' && fail) { fail = false; throw new Error('PRIVATE_subscription_error'); }
+      } });
+      return {
+        port: resource.port, onDidChange: subscription('change'), onDidCreate: subscription('create'),
+        onDidDelete: subscription('delete'), dispose: () => { attempts.push('resource'); resource.dispose(); }
+      };
+    } });
+    disposables.push(coordinator);
+    await coordinator.reconcileBindings();
+    await assert.rejects(coordinator.handleRootsChanged([]));
+    assert.deepStrictEqual(attempts, ['change', 'create', 'delete', 'resource']);
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/recovered.ts' });
+    await coordinator.flushAll();
+    assert.strictEqual(JSON.parse(f.mirrorA.content!).items[0].uri, 'file:///a/recovered.ts');
+    assert.strictEqual(f.store.getMirrorState(f.a)!.dirty, false);
+  });
+
+  test('partial registration cleanup failures leave no stale binding and retry creates working resources', async () => {
+    const f = await fixture(); f.coordinator.dispose();
+    const attempts: string[] = []; let first = true;
+    const coordinator = new WorkspaceMirrorCoordinator({ store: f.store, output: f.output, createResources: (root) => {
+      const resource = new FakePartitionMirrorResources(root.path === '/a' ? f.mirrorA : f.mirrorB);
+      if (root.path !== '/a' || !first) { return resource; }
+      first = false;
+      return {
+        port: resource.port,
+        onDidChange: () => ({ dispose: () => { attempts.push('subscription'); throw new Error('PRIVATE_subscription'); } }),
+        onDidCreate: () => { throw new Error('PRIVATE_registration'); },
+        onDidDelete: resource.onDidDelete,
+        dispose: () => { attempts.push('resource'); resource.dispose(); throw new Error('PRIVATE_resource'); }
+      };
+    } });
+    // The first attempt may report the aggregate cleanup failure, but it must be retryable.
+    await coordinator.reconcileBindings().catch(() => undefined);
+    await coordinator.reconcileBindings();
+    assert.deepStrictEqual(attempts, ['subscription', 'resource']);
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/retry.ts' });
+    await coordinator.flushAll();
+    const dirty = f.store.getMirrorState(f.a)!.dirty;
+    coordinator.dispose();
+    assert.strictEqual(dirty, false);
+    assert.strictEqual(JSON.parse(f.mirrorA.content!).items[0].uri, 'file:///a/retry.ts');
+  });
+
+  test('coordinator disposal attempts all bindings once even when every resource cleanup throws', async () => {
+    const f = await fixture(); const attempts: string[] = [];
+    for (const [root, resource] of f.resources) {
+      const dispose = resource.dispose.bind(resource);
+      resource.dispose = () => { attempts.push(root); dispose(); throw new Error('PRIVATE_cleanup'); };
+    }
+    assert.throws(() => f.coordinator.dispose(), AggregateError);
+    assert.deepStrictEqual(attempts, ['/a', '/b']);
+    assert.doesNotThrow(() => f.coordinator.dispose());
+    assert.deepStrictEqual(attempts, ['/a', '/b']);
+  });
 });

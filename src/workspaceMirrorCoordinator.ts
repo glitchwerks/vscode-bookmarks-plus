@@ -94,7 +94,7 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
                 throw new MirrorRemovalChangedError();
               }
             }
-            for (const binding of removing) { this.retireBinding(binding); }
+            this.retireBindings(removing);
           });
           await this.reconcileNow();
           return result;
@@ -143,20 +143,21 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
 
   /** Cancels pending work and prevents in-flight reads and writes from publishing metadata. */
   dispose(): void {
+    if (this.disposed) { return; }
     this.disposed = true;
-    this.subscriptions.forEach((subscription) => subscription.dispose());
-    for (const binding of this.bindings.values()) { this.disposeBinding(binding); }
-    this.bindings.clear();
+    runCleanup([
+      ...this.subscriptions.map((subscription) => () => subscription.dispose()),
+      () => this.retireBindings([...this.bindings.values()])
+    ]);
   }
 
   private async reconcileNow(): Promise<void> {
     if (this.disposed) { return; }
     const attached = this.options.store.getView().attached;
-    await Promise.all([...this.bindings.values()].filter((binding) => !attached.some((partition) =>
+    const removalResults = await Promise.allSettled([...this.bindings.values()].filter((binding) => !attached.some((partition) =>
       partition.partitionId === binding.partitionId && partition.canonicalRootUri === binding.rootIdentity
     )).map((binding) => this.removeBinding(binding)));
-    if (this.disposed) { return; }
-    await Promise.all(attached.map(async (partition) => {
+    const bindingResults = await Promise.allSettled((this.disposed ? [] : attached).map(async (partition) => {
       if (this.bindings.has(partition.partitionId)) { return; }
       let resources: PartitionMirrorResources | undefined;
       let binding: PartitionBinding | undefined;
@@ -176,14 +177,19 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
           }));
         }
       } catch {
-        if (binding) { this.disposeBinding(binding); this.bindings.delete(binding.partitionId); }
-        else { resources?.dispose(); }
-        this.log(partition.partitionId, 'bind');
+        try {
+          if (binding) { this.retireBinding(binding); }
+          else { resources?.dispose(); }
+        } finally { this.log(partition.partitionId, 'bind'); }
         return;
       }
       try { await this.enqueue(binding, () => this.reloadNow(binding!, true)); }
       catch { this.log(partition.partitionId, 'reconcile'); }
     }));
+    const failures = [...removalResults, ...bindingResults]
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => result.reason);
+    if (failures.length > 0) { throw new AggregateError(failures, 'Workspace mirror cleanup failed.'); }
   }
 
   private scheduleDirtyPartitions(): void {
@@ -295,15 +301,21 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
   }
 
   private retireBinding(binding: PartitionBinding): void {
-    this.disposeBinding(binding);
-    if (this.bindings.get(binding.partitionId) === binding) { this.bindings.delete(binding.partitionId); }
+    try { this.disposeBinding(binding); }
+    finally {
+      if (this.bindings.get(binding.partitionId) === binding) { this.bindings.delete(binding.partitionId); }
+    }
+  }
+
+  private retireBindings(bindings: readonly PartitionBinding[]): void {
+    runCleanup(bindings.map((binding) => () => this.retireBinding(binding)));
   }
 
   private disposeBinding(binding: PartitionBinding): void {
+    if (binding.disposed) { return; }
     binding.disposed = true;
-    binding.delayer.dispose();
-    binding.subscriptions.forEach((subscription) => subscription.dispose());
-    binding.resources.dispose();
+    runCleanup([binding.delayer, ...binding.subscriptions, binding.resources]
+      .map((disposable) => () => disposable.dispose()));
   }
 
   private isCurrent(binding: PartitionBinding): boolean {
@@ -325,4 +337,14 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
   private log(partitionId: string, category: MirrorDiagnostic): void {
     this.options.output.appendLine(`WorkspaceMirrorCoordinator: ${partitionId} ${category}`);
   }
+}
+
+/** Attempts every cleanup exactly once and surfaces failures only after the entire batch. */
+function runCleanup(actions: readonly (() => void)[]): void {
+  const errors: unknown[] = [];
+  for (const action of actions) {
+    try { action(); }
+    catch (error) { errors.push(error); }
+  }
+  if (errors.length > 0) { throw new AggregateError(errors, 'Workspace mirror cleanup failed.'); }
 }
