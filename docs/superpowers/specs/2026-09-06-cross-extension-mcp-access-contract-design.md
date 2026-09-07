@@ -1,6 +1,6 @@
 # Cross-Extension MCP Access Contract Design
 
-**Status:** Revised after architectural review; pending re-review
+**Status:** Revised after second architectural review; pending downstream issue updates
 **Issue:** #137
 **Prerequisites:** #62, #129
 **Downstream implementation:** #138
@@ -497,18 +497,28 @@ packaged fixture verifies that this file-derived configuration still completes M
 #62 may implement physical storage as one partitioned window state or as distinct per-folder stores,
 but it must expose the same logical behavior:
 
-1. Every workspace bookmark item and collection has exactly one owner: a current workspace-folder
-   URI or an `unassigned` preservation partition.
-2. A new item is owned by the deepest current workspace folder containing its URI. A new empty
-   collection created through MCP is owned by the session's selected root.
-3. An item outside every current root is `unassigned`. It remains available through the Bookmarks
+1. Every workspace bookmark item and collection has exactly one owner: a stable root-partition
+   identity or the `unassigned` preservation partition. A root-partition identity is durable and is
+   not the workspace folder's display name or current URI.
+2. A root partition is either attached to exactly one current workspace-folder URI or detached with
+   no current URI. At most one partition may be attached to a current workspace-folder URI. Removing
+   a workspace folder detaches its partition without changing the partition identity or deleting its
+   data; changing only the folder's displayed workspace name does not detach it.
+3. A new item is owned by the attached partition for the deepest current workspace folder containing
+   its URI. A new empty collection created through MCP is owned by the session's selected attached
+   partition.
+4. An item outside every current root is `unassigned`. It remains available through the Bookmarks
    Plus UI but is invisible and immutable through every root-scoped MCP session.
-4. Collections cannot span logical roots. A root-scoped session sees and mutates only collections
-   owned by its selected root and items owned by that same root.
-5. Every mutation carries the selected root through the bridge and resolves its target inside that
-   root's partition. An identifier from another root is treated as not found, not as an implicit
-   cross-root operation.
-6. Imported Claude roots receive no access merely because the selected process has filesystem access
+5. Collections cannot span logical owners. A root-scoped session sees and mutates only collections
+   owned by its selected partition and items owned by that same partition.
+6. Every mutation carries the selected root through the bridge. An operation on existing data must
+   resolve every target identifier inside the selected partition; an identifier from another
+   partition is treated as not found, not as an implicit cross-root operation.
+7. Before a workspace-scoped MCP create operation mutates state, the server resolves the proposed
+   item's URI with the same deepest-current-root rule. The resolved partition must equal the
+   session's selected partition. A URI resolving to another root or to `unassigned` returns the
+   tool's defined not-found or invalid-scope error and performs no mutation.
+8. Imported Claude roots receive no access merely because the selected process has filesystem access
    to them. Each additional root requires its own explicit descriptor request.
 
 The deepest-root rule matches the repository's existing order-independent nested-folder behavior.
@@ -519,22 +529,31 @@ glitchwerks/vscode-claude-workspaces#50)
 
 The schema migration must be lossless and idempotent:
 
-1. Assign each existing item to its deepest matching current root; preserve unmatched items in
-   `unassigned`.
-2. Keep a collection in one root when all owned member items resolve to that root.
-3. When an existing collection contains items assigned to multiple roots, create one independent
-   root-owned collection per represented root, preserve its name, description, and relative order,
-   and rebind only that root's items to it.
-4. Preserve an empty existing collection in `unassigned`; do not guess a root.
-5. Generate distinct collection identifiers when a collection is split so later mutations in one
-   root cannot affect another root's collection.
-6. Persist a migration marker/schema version so retries do not duplicate split collections.
-7. Log counts only. Migration diagnostics must not log bookmark URIs, names, descriptions, or
+1. Assign each existing item to the stable partition for its deepest matching current root; preserve
+   unmatched items in `unassigned`.
+2. Treat every represented current-root partition and `unassigned` as independent preservation
+   partitions when assigning a collection.
+3. Keep a non-empty collection in one partition when all member items resolve to that partition. A
+   collection containing only unmatched items remains one non-empty `unassigned` collection.
+4. When a collection contains items assigned to multiple represented partitions, including any
+   mixture of current roots and `unassigned`, create one independent collection per represented
+   partition, preserve its name, description, and relative order, and rebind only that partition's
+   items to it. For example, root A, root B, and unmatched members become root-A, root-B, and
+   `unassigned` collections.
+5. Preserve an empty existing collection in `unassigned`; do not guess a root.
+6. Generate distinct collection identifiers when a collection is split so later mutations in one
+   partition cannot affect another partition's collection.
+7. Persist a migration marker/schema version so retries do not duplicate split collections.
+8. Log counts only. Migration diagnostics must not log bookmark URIs, names, descriptions, or
    descriptor data.
 
-Removing or renaming a root must not delete its data. Its logical partition becomes unavailable to
-new MCP requests and remains preserved for #62's reattachment/recovery behavior. #62 must document
-that recovery behavior before #137 is approved. (#62; #137)
+When a detached root returns with the same normalized URI identity, #62 may reattach it to its
+existing partition automatically. A folder move or rename that changes the URI must not be inferred
+from a matching display name, basename, path suffix, or bookmark contents. Rebinding a detached
+partition to a different current URI requires an explicit user-confirmed recovery action, preserves
+the stable partition identity, and must fail rather than merge implicitly when that URI is already
+attached to another partition. Detached partitions remain unavailable to new MCP requests until
+reattached. #62 must document the recovery action before #137 is approved. (#62; #137)
 
 These semantics implement the selected-root and least-privilege contract while leaving the physical
 storage representation to #62 and the authenticated mutation path to #129. (#62; #129; #137)
@@ -592,9 +611,14 @@ https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
   terminate the subprocess boundary deterministically.
 - Concurrent requests cannot consume the same bootstrap authorization or cross scope/root state.
 - Nested-root ownership uses the deepest root. Selected-root reads, collections, and mutations never
-  expose another root or the `unassigned` partition.
-- Existing-data migration covers single-root ownership, split multi-root collections, empty
-  collections, out-of-root items, root removal/reattachment, and idempotent retry without data loss.
+  expose another root or the `unassigned` partition. Cross-root and out-of-root create attempts
+  return the defined tool error and leave state unchanged.
+- Existing-data migration covers single-root ownership, collections containing only unmatched items,
+  mixed root-owned and unmatched items, split multi-root collections, empty collections,
+  out-of-root items, and idempotent retry without data loss.
+- Root lifecycle tests preserve stable partition identity across detachment, automatically reattach
+  only the same normalized URI, ignore display-name changes, and require explicit recovery for a
+  changed URI without implicitly merging partitions.
 
 ### Optional-consumer isolation tests
 
@@ -680,8 +704,9 @@ silently changing while its private transport is implemented. (#137)
 
 #137 is ready for approval when:
 
-1. #62 records the ownership and migration responsibilities above without weakening selected-root
-   isolation.
+1. #62 records the stable attached/detached partition model, lossless `unassigned` collection
+   splitting, create-operation scope checks, and recovery responsibilities above without weakening
+   selected-root isolation.
 2. The contract's failure-isolation example remains bounded across activation and request and
    discards late descriptors.
 3. Descriptor evolution, environment overlay, absolute-path, and cwd-independent execution rules
