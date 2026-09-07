@@ -3,7 +3,9 @@ import { BookmarkData } from '../../types';
 import {
   WorkspacePartition,
   WorkspacePartitionSnapshot,
+  cloneWorkspacePartitionSnapshot,
   emptyWorkspacePartitionSnapshot,
+  ownerKey,
   validateWorkspacePartitionSnapshot
 } from '../../workspacePartitionTypes';
 
@@ -79,4 +81,65 @@ suite('workspacePartitionTypes', () => {
       assert.strictEqual(validateWorkspacePartitionSnapshot(value).ok, false);
     });
   }
+
+  test('accepts the lowercase SHA-256 mirror hash produced by the mirror writer', () => {
+    const value: MutableSnapshot = seededSnapshot();
+    value.partitions[0].mirror.lastSuccessfulHash = 'a'.repeat(64);
+    assert.deepStrictEqual(validateWorkspacePartitionSnapshot(value), { ok: true });
+  });
+
+  for (const hash of ['', 'A'.repeat(64), 'a'.repeat(63), 'g'.repeat(64)]) {
+    test(`rejects malformed mirror hash ${JSON.stringify(hash)}`, () => {
+      const value: MutableSnapshot = seededSnapshot();
+      value.partitions[0].mirror.lastSuccessfulHash = hash;
+      assert.strictEqual(validateWorkspacePartitionSnapshot(value).ok, false);
+    });
+  }
+
+  for (const [name, mutate] of [
+    ['malformed owner content', (value: MutableSnapshot) => {
+      value.unassigned.items[0] = { type: 'invalid' } as unknown as BookmarkData['items'][number];
+    }],
+    ['an invalid UUID', (value: MutableSnapshot) => { value.partitions[0].id = 'not-a-uuid'; }],
+    ['an identifier collision across item and partition kinds', (value: MutableSnapshot) => {
+      value.unassigned.collections[0].id = PARTITION_ID;
+    }],
+    ['inconsistent attachment canonical metadata', (value: MutableSnapshot) => {
+      value.partitions[0].attachment!.canonicalRootUri = 'file:///workspace/other';
+    }],
+    ['inconsistent last-known root canonical metadata', (value: MutableSnapshot) => {
+      value.partitions[0].canonicalLastKnownRootUri = 'file:///workspace/other';
+    }],
+    ['a non-boolean mirror dirty value', (value: MutableSnapshot) => {
+      value.partitions[0].mirror.dirty = 'true' as unknown as boolean;
+    }],
+    ['a non-string mirror hash value', (value: MutableSnapshot) => {
+      value.partitions[0].mirror.lastSuccessfulHash = 1 as unknown as string;
+    }]
+  ] as const) {
+    test(`rejects ${name}`, () => {
+      const value: MutableSnapshot = seededSnapshot();
+      mutate(value);
+      assert.strictEqual(validateWorkspacePartitionSnapshot(value).ok, false);
+    });
+  }
+
+  test('clones nested snapshot data without sharing mutable records', () => {
+    const source = seededSnapshot();
+    const clone = cloneWorkspacePartitionSnapshot(source);
+    clone.partitions[0].attachment!.rootUri = 'file:///workspace/replacement';
+    clone.partitions[0].data.items[0].description = 'changed';
+    clone.partitions[0].mirror.dirty = true;
+    clone.unassigned.collections[0].name = 'Changed';
+
+    assert.strictEqual(source.partitions[0].attachment!.rootUri, 'file:///workspace/project');
+    assert.strictEqual(source.partitions[0].data.items[0].description, undefined);
+    assert.strictEqual(source.partitions[0].mirror.dirty, false);
+    assert.strictEqual(source.unassigned.collections[0].name, 'Unassigned');
+  });
+
+  test('returns stable keys for each workspace owner kind', () => {
+    assert.strictEqual(ownerKey({ kind: 'partition', partitionId: PARTITION_ID }), `partition:${PARTITION_ID}`);
+    assert.strictEqual(ownerKey({ kind: 'unassigned' }), 'unassigned');
+  });
 });

@@ -41,6 +41,7 @@ export interface SnapshotValidationResult {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_HASH_PATTERN = /^[0-9a-f]{64}$/;
 
 /** Creates a valid, empty snapshot for the current workspace partition schema. */
 export function emptyWorkspacePartitionSnapshot(): WorkspacePartitionSnapshot {
@@ -127,7 +128,7 @@ function validatePartition(value: unknown, allIds: Set<string>): string | undefi
   }
   if (!isRecord(value.mirror)
     || typeof value.mirror.dirty !== 'boolean'
-    || (value.mirror.lastSuccessfulHash !== undefined && typeof value.mirror.lastSuccessfulHash !== 'string')) {
+    || (value.mirror.lastSuccessfulHash !== undefined && !isSha256Hash(value.mirror.lastSuccessfulHash))) {
     return 'mirror metadata is malformed';
   }
 
@@ -154,6 +155,10 @@ function isCanonicalUriMetadata(rootUri: unknown, canonicalRootUri: unknown): bo
 
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+function isSha256Hash(value: unknown): value is string {
+  return typeof value === 'string' && SHA256_HASH_PATTERN.test(value);
 }
 
 function validateOwnerData(data: unknown, allIds: Set<string>): string | undefined {
