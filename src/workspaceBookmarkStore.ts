@@ -254,10 +254,17 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     } : undefined;
   }
 
-  /** Atomically adopts a validated mirror only while committed local content is clean. */
-  adoptMirrorData(partitionId: string, data: BookmarkData, hash: string, rewriteRequired: boolean): Promise<void> {
+  /**
+   * Atomically adopts a validated mirror while local content is clean and its binding is allowed.
+   * The guard runs when queued work begins; an already-started persistence completes normally.
+   */
+  adoptMirrorData(
+    partitionId: string, data: BookmarkData, hash: string, rewriteRequired: boolean,
+    allow: () => boolean = () => true
+  ): Promise<void> {
     const incoming = cloneData(data);
     return this.enqueue((draft) => {
+      if (!allow()) { return unchanged(); }
       const partition = this.requireAttachedCreateOwner(draft, { kind: 'partition', partitionId });
       if (partition.mirror.dirty) { return unchanged(); }
       for (const item of incoming.items) {
@@ -295,9 +302,10 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
-  /** Records a successful physical write without clearing a newer local content mutation. */
-  recordMirrorWrite(partitionId: string, hash: string): Promise<void> {
+  /** Records a successful write if its binding is still allowed when this queued mutation begins. */
+  recordMirrorWrite(partitionId: string, hash: string, allow: () => boolean = () => true): Promise<void> {
     return this.enqueue((draft) => {
+      if (!allow()) { return unchanged(); }
       const partition = draft.partitions.find((entry) => entry.id === partitionId);
       if (!partition) { return unchanged(); }
       const dirty = hashContent(serializeBookmarkData(partition.data)) !== hash;
@@ -307,9 +315,10 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
-  /** Persists failed-write precedence without emitting a content event. */
-  recordMirrorDirty(partitionId: string): Promise<void> {
+  /** Persists failed-write precedence if its binding is still allowed when queued work begins. */
+  recordMirrorDirty(partitionId: string, allow: () => boolean = () => true): Promise<void> {
     return this.enqueue((draft) => {
+      if (!allow()) { return unchanged(); }
       const partition = draft.partitions.find((entry) => entry.id === partitionId);
       if (!partition || partition.mirror.dirty) { return unchanged(); }
       partition.mirror.dirty = true;
@@ -523,8 +532,11 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
-  /** Reconciles the supplied workspace roots without moving existing content between partitions. */
-  reconcileRoots(roots: readonly RootCandidate[]): Promise<RootReconcileResult> {
+  /**
+   * Reconciles roots atomically. The synchronous beforeCommit hook may fence mirror disposal
+   * against the last committed content; it must never await operations on this store's queue.
+   */
+  reconcileRoots(roots: readonly RootCandidate[], beforeCommit?: () => void): Promise<RootReconcileResult> {
     const run = this.operationTail.then(async () => {
       this.assertReady();
       const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);
@@ -534,6 +546,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         if (!validation.ok) {
           throw new WorkspaceSnapshotInvariantError(validation.reason ?? 'Workspace snapshot is invalid.');
         }
+        beforeCommit?.();
         await this.state.update(WORKSPACE_PARTITION_STORAGE_KEY, draft);
         this.snapshot = draft;
         this.roots = roots.slice();
@@ -541,6 +554,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         this.revision++;
         this._onBookmarksChanged.fire();
       } else {
+        beforeCommit?.();
         this.roots = roots.slice();
         this.unavailableCanonicalRoots = reconciliation.result.unavailableCanonicalRoots;
       }

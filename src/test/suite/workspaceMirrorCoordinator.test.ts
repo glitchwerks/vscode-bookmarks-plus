@@ -481,4 +481,142 @@ suite('WorkspaceMirrorCoordinator', () => {
     assert.strictEqual(importedB.items[0].collectionId, importedB.collections[0].id);
     assert.deepStrictEqual(JSON.parse(f.mirrorB.content!), importedB);
   });
+
+  test('multi-root removal flushes edits accepted after another root has drained', async () => {
+    const f = await fixture(); const aDrained = deferred(); const bStarted = deferred(); const releaseB = deferred();
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/first.ts' });
+    await f.store.addItem(f.ownerB, { type: 'file', uri: 'file:///b/first.ts' });
+    const flush = f.coordinator.flushPartition.bind(f.coordinator);
+    f.coordinator.flushPartition = (id) => {
+      const result = flush(id);
+      if (id === f.a) { void result.then(() => queueMicrotask(() => aDrained.resolve())); }
+      return result;
+    };
+    const writeB = f.mirrorB.write.bind(f.mirrorB);
+    f.mirrorB.write = async (content) => { bStarted.resolve(); await releaseB.promise; await writeB(content); };
+    const removal = f.coordinator.handleRootsChanged([]);
+    await Promise.all([aDrained.promise, bStarted.promise]);
+    // A's binding may have retired while B's independent write is still pending.
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/late.ts' });
+    releaseB.resolve(); await removal;
+    assert.deepStrictEqual(JSON.parse(f.mirrorA.content!).items.map((item: { uri: string }) => item.uri), ['file:///a/first.ts', 'file:///a/late.ts']);
+    assert.strictEqual(f.store.getView().attached.length, 0);
+    assert.strictEqual(f.store.getMirrorState(f.a)!.dirty, false);
+  });
+
+  test('queued adoption is fenced when coordinator is disposed behind an unrelated store update', async () => {
+    const f = await fixture(); const started = deferred(); const release = deferred(); const queued = deferred();
+    const update = f.state.update.bind(f.state);
+    f.state.update = async (key, value) => { started.resolve(); await release.promise; await update(key, value); };
+    const blocking = f.store.addCollection(f.ownerB, 'Block the store queue');
+    await started.promise;
+    const adopt = f.store.adoptMirrorData.bind(f.store);
+    f.store.adoptMirrorData = (...args) => { const result = adopt(...args); queued.resolve(); return result; };
+    const before = f.store.getMirrorState(f.a);
+    f.mirrorA.content = JSON.stringify(external());
+    const reload = f.coordinator.reloadPartition(f.a); await queued.promise;
+    f.coordinator.dispose(); release.resolve(); await Promise.all([blocking, reload]);
+    assert.deepStrictEqual(f.store.getMirrorState(f.a), before);
+  });
+
+  test('queued hash bookkeeping is fenced when coordinator is disposed behind an unrelated store update', async () => {
+    const f = await fixture(); const started = deferred(); const release = deferred(); const queued = deferred();
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/local.ts' });
+    const before = f.store.getMirrorState(f.a);
+    const update = f.state.update.bind(f.state);
+    f.state.update = async (key, value) => { started.resolve(); await release.promise; await update(key, value); };
+    const blocking = f.store.addCollection(f.ownerB, 'Block the store queue'); await started.promise;
+    const record = f.store.recordMirrorWrite.bind(f.store);
+    f.store.recordMirrorWrite = (...args) => { const result = record(...args); queued.resolve(); return result; };
+    const flush = f.coordinator.flushPartition(f.a); await queued.promise;
+    f.coordinator.dispose(); release.resolve(); await Promise.all([blocking, flush]);
+    assert.deepStrictEqual(f.store.getMirrorState(f.a), before);
+  });
+
+  test('mirror diagnostics contain only category and partition ID, never payload or provider secrets', async () => {
+    const f = await fixture(); f.output.lines.length = 0;
+    const secret = 'PRIVATE_BOOKMARK_NAME_DESCRIPTION_file:///secret/project';
+    f.mirrorA.content = `${secret}{not-json`;
+    await f.coordinator.reloadPartition(f.a);
+    f.mirrorA.read = async () => { throw new Error(secret); };
+    await f.coordinator.reloadPartition(f.a);
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/local.ts' });
+    f.mirrorA.write = async () => { throw new Error(secret); };
+    await assert.rejects(f.coordinator.flushAll());
+    assert.strictEqual(f.output.lines.length, 3);
+    assert.ok(f.output.lines.every((line) => !line.includes('PRIVATE') && !line.includes('secret') && !line.includes('file:')));
+    assert.ok(f.output.lines.every((line) => line.includes(f.a)));
+  });
+
+  test('queued dirty bookkeeping is fenced when its seed binding is disposed', async () => {
+    const f = await fixture(); f.coordinator.dispose();
+    const started = deferred(); const release = deferred(); const queued = deferred();
+    const update = f.state.update.bind(f.state);
+    f.state.update = async (key, value) => { started.resolve(); await release.promise; await update(key, value); };
+    const blocking = f.store.addCollection(f.ownerB, 'Block the store queue'); await started.promise;
+    const record = f.store.recordMirrorDirty.bind(f.store);
+    f.store.recordMirrorDirty = (...args) => { const result = record(...args); queued.resolve(); return result; };
+    const before = f.store.getMirrorState(f.a);
+    f.mirrorA.content = undefined; f.mirrorA.failNextWrite = true;
+    const coordinator = new WorkspaceMirrorCoordinator({ store: f.store, output: f.output,
+      createResources: (root) => new FakePartitionMirrorResources(root.path === '/a' ? f.mirrorA : f.mirrorB) });
+    disposables.push(coordinator);
+    const binding = coordinator.reconcileBindings(); await queued.promise;
+    coordinator.dispose(); release.resolve(); await Promise.all([blocking, binding]);
+    assert.deepStrictEqual(f.store.getMirrorState(f.a), before);
+  });
+
+  test('an adoption whose persistence already began completes after coordinator disposal', async () => {
+    const f = await fixture(); const started = deferred(); const release = deferred();
+    const update = f.state.update.bind(f.state);
+    f.state.update = async (key, value) => { started.resolve(); await release.promise; await update(key, value); };
+    const data = external(); f.mirrorA.content = JSON.stringify(data);
+    const reload = f.coordinator.reloadPartition(f.a); await started.promise;
+    f.coordinator.dispose(); release.resolve(); await reload;
+    assert.deepStrictEqual(f.store.getOwnerData(f.ownerA), data);
+  });
+
+  test('root removal rejects creates queued after watcher retirement and before detachment persistence finishes', async () => {
+    const f = await fixture(); const started = deferred(); const release = deferred();
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/first.ts' });
+    await f.coordinator.flushAll();
+    const update = f.state.update.bind(f.state);
+    f.state.update = async (key, value) => { started.resolve(); await release.promise; await update(key, value); };
+    const removal = f.coordinator.handleRootsChanged([]); await started.promise;
+    assert.strictEqual(f.resources.get('/a')!.disposed, true);
+    assert.strictEqual(f.store.getView().attached.length, 2);
+    const late = f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/rejected.ts' });
+    const rejected = assert.rejects(late);
+    release.resolve(); await Promise.all([removal, rejected]);
+    assert.deepStrictEqual(JSON.parse(f.mirrorA.content!), f.store.getOwnerData(f.ownerA));
+  });
+
+  test('removal retries a mutation between successful flush completion and its result being observed', async () => {
+    const f = await fixture(); const drained = deferred(); const release = deferred();
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/first.ts' });
+    const flush = f.coordinator.flushPartition.bind(f.coordinator); let first = true;
+    f.coordinator.flushPartition = async (id) => {
+      await flush(id);
+      if (id === f.a && first) { first = false; drained.resolve(); await release.promise; }
+    };
+    const removal = f.coordinator.handleRootsChanged([]); await drained.promise;
+    await f.store.addItem(f.ownerA, { type: 'file', uri: 'file:///a/late.ts' });
+    release.resolve(); await removal;
+    assert.strictEqual(JSON.parse(f.mirrorA.content!).items.length, 2);
+    assert.strictEqual(f.store.getMirrorState(f.a)!.dirty, false);
+  });
+
+  test('removing bindings stop admitting watcher reloads while independent root writes drain', async () => {
+    const f = await fixture(); const started = deferred(); const release = deferred();
+    await f.store.addItem(f.ownerB, { type: 'file', uri: 'file:///b/local.ts' });
+    const write = f.mirrorB.write.bind(f.mirrorB);
+    f.mirrorB.write = async (content) => { started.resolve(); await release.promise; await write(content); };
+    const removal = f.coordinator.handleRootsChanged([]); await started.promise;
+    const reads = f.mirrorA.readCount;
+    f.resources.get('/a')!.change.fire();
+    await f.coordinator.reloadPartition(f.a);
+    const observedReads = f.mirrorA.readCount;
+    release.resolve(); await removal;
+    assert.strictEqual(observedReads, reads);
+  });
 });

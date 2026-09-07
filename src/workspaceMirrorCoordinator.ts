@@ -36,8 +36,14 @@ interface PartitionBinding {
   writeTail: Promise<void>;
   scheduledRevision: number;
   scheduledContent?: string;
+  removing: boolean;
   disposed: boolean;
 }
+
+/** A root acquired newer content between its flush and the serialized detachment check. */
+class MirrorRemovalChangedError extends Error {}
+
+type MirrorDiagnostic = 'reconcile' | 'reload' | 'flush' | 'bind' | 'write' | 'read' | 'reject' | 'deleted' | 'remove-flush';
 
 /** Owns independent mirror queues and watcher lifetimes for attached workspace partitions. */
 export class WorkspaceMirrorCoordinator implements vscode.Disposable {
@@ -51,7 +57,7 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     this.subscriptions = [
       options.store.onBookmarksChanged(() => this.scheduleDirtyPartitions()),
       options.store.onDidChangePartitions(() => {
-        void this.reconcileBindings().catch((error) => this.log('lifecycle', 'reconcile', error));
+        void this.reconcileBindings().catch(() => this.log('lifecycle', 'reconcile'));
       })
     ];
   }
@@ -66,21 +72,48 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     return this.enqueueLifecycle(async () => {
       if (this.disposed) { throw new Error('Workspace mirror coordinator is disposed.'); }
       const retained = new Set(roots.map((root) => canonicalizeRootUri(root.uri)));
-      await Promise.all([...this.bindings.values()].filter((binding) => !retained.has(binding.rootIdentity))
-        .map((binding) => this.removeBinding(binding)));
-      if (this.disposed) { throw new Error('Workspace mirror coordinator is disposed.'); }
-      let result: RootReconcileResult;
-      try { result = await this.options.store.reconcileRoots(roots); }
-      catch (error) { await this.reconcileNow(); throw error; }
-      await this.reconcileNow();
-      return result;
+      const removing = [...this.bindings.values()].filter((binding) => !retained.has(binding.rootIdentity));
+      removing.forEach((binding) => { binding.removing = true; });
+      while (!this.disposed) {
+        const flushed = new Map<string, { content?: string; failed: boolean }>();
+        await Promise.all(removing.map(async (binding) => {
+          let failed = false;
+          try { await this.flushPartition(binding.partitionId); }
+          catch { failed = true; this.log(binding.partitionId, 'remove-flush'); }
+          const state = this.options.store.getMirrorState(binding.partitionId);
+          flushed.set(binding.partitionId, { content: state && serializeBookmarkData(state.data), failed });
+        }));
+        try {
+          const result = await this.options.store.reconcileRoots(roots, () => {
+            if (this.disposed) { throw new Error('Workspace mirror coordinator is disposed.'); }
+            // This runs inside the store queue. Later mutations cannot begin until detach commits.
+            for (const binding of removing) {
+              const state = this.options.store.getMirrorState(binding.partitionId);
+              const attempt = flushed.get(binding.partitionId)!;
+              if (attempt.content !== (state && serializeBookmarkData(state.data)) || (state?.dirty && !attempt.failed)) {
+                throw new MirrorRemovalChangedError();
+              }
+            }
+            for (const binding of removing) { this.retireBinding(binding); }
+          });
+          await this.reconcileNow();
+          return result;
+        } catch (error) {
+          if (error instanceof MirrorRemovalChangedError) { continue; }
+          removing.forEach((binding) => { binding.removing = false; });
+          this.scheduleDirtyPartitions();
+          await this.reconcileNow();
+          throw error;
+        }
+      }
+      throw new Error('Workspace mirror coordinator is disposed.');
     });
   }
 
   /** Reads one mirror after its queued local writes; other partitions never enter this queue. */
   reloadPartition(partitionId: string): Promise<void> {
     const binding = this.bindings.get(partitionId);
-    return binding ? this.enqueue(binding, () => this.reloadNow(binding, false)) : Promise.resolve();
+    return binding && !binding.removing ? this.enqueue(binding, () => this.reloadNow(binding, false)) : Promise.resolve();
   }
 
   /** Writes the latest dirty snapshot after all earlier work for this partition. */
@@ -101,7 +134,7 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     const errors: unknown[] = [];
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
-        this.log(bindings[index].partitionId, 'flush', result.reason);
+        this.log(bindings[index].partitionId, 'flush');
         errors.push(result.reason);
       }
     });
@@ -133,36 +166,36 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
           partitionId: partition.partitionId, rootIdentity: partition.canonicalRootUri,
           generation: this.nextGeneration++, resources, subscriptions: [],
           delayer: new Delayer(this.options.writeDelayMs ?? 250),
-          operationTail: Promise.resolve(), writeTail: Promise.resolve(), scheduledRevision: 0, disposed: false
+          operationTail: Promise.resolve(), writeTail: Promise.resolve(), scheduledRevision: 0, removing: false, disposed: false
         };
         this.bindings.set(binding.partitionId, binding);
         const current = binding;
         for (const event of [resources.onDidChange, resources.onDidCreate, resources.onDidDelete]) {
           binding.subscriptions.push(event(() => {
-            void this.reloadPartition(current.partitionId).catch((error) => this.log(current.partitionId, 'reload', error));
+            void this.reloadPartition(current.partitionId).catch(() => this.log(current.partitionId, 'reload'));
           }));
         }
-      } catch (error) {
+      } catch {
         if (binding) { this.disposeBinding(binding); this.bindings.delete(binding.partitionId); }
         else { resources?.dispose(); }
-        this.log(partition.partitionId, 'bind', error);
+        this.log(partition.partitionId, 'bind');
         return;
       }
       try { await this.enqueue(binding, () => this.reloadNow(binding!, true)); }
-      catch (error) { this.log(partition.partitionId, 'reconcile', error); }
+      catch { this.log(partition.partitionId, 'reconcile'); }
     }));
   }
 
   private scheduleDirtyPartitions(): void {
     for (const binding of this.bindings.values()) {
       const state = this.options.store.getMirrorState(binding.partitionId);
-      if (!this.isCurrent(binding) || !state?.dirty) { continue; }
+      if (!this.isCurrent(binding) || binding.removing || !state?.dirty) { continue; }
       const content = serializeBookmarkData(state.data);
       if (content === binding.scheduledContent) { continue; }
       binding.scheduledContent = content;
       binding.scheduledRevision++;
       binding.delayer.trigger(() => this.enqueue(binding, () => this.writeCurrent(binding))
-        .catch((error) => this.log(binding.partitionId, 'write', error)));
+        .catch(() => this.log(binding.partitionId, 'write')));
     }
   }
 
@@ -174,22 +207,22 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     const revision = binding.scheduledRevision;
     let content: string | undefined;
     try { content = await binding.resources.port.read(); }
-    catch (error) { this.log(binding.partitionId, 'read', error); return; }
+    catch { this.log(binding.partitionId, 'read'); return; }
     const current = this.options.store.getMirrorState(binding.partitionId);
     if (!this.isCurrent(binding) || !current || current.dirty || revision !== binding.scheduledRevision
       || serializeBookmarkData(current.data) !== serializeBookmarkData(initial.data)) { return; }
     if (content === undefined) {
       if (seedMissing) { await this.writeCurrent(binding, true); }
-      else { this.log(binding.partitionId, 'reload', 'Mirror deleted; keeping current bookmarks.'); }
+      else { this.log(binding.partitionId, 'deleted'); }
       return;
     }
     const hash = hashContent(content);
     if (hash === current.hash) { return; }
     let prepared: { data: BookmarkData; rewrite: boolean };
     try { prepared = this.prepareExternal(binding.partitionId, content, current.data); }
-    catch (error) { this.log(binding.partitionId, 'reject', error); return; }
+    catch { this.log(binding.partitionId, 'reject'); return; }
     if (!this.isCurrent(binding)) { return; }
-    await this.options.store.adoptMirrorData(binding.partitionId, prepared.data, hash, prepared.rewrite);
+    await this.options.store.adoptMirrorData(binding.partitionId, prepared.data, hash, prepared.rewrite, () => this.isCurrent(binding));
     if (this.options.store.getMirrorState(binding.partitionId)?.dirty) {
       binding.delayer.dispose();
       await this.writeCurrent(binding);
@@ -205,9 +238,11 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
       const content = serializeBookmarkData(state.data);
       try {
         await binding.resources.port.write(content);
-        if (this.isCurrent(binding)) { await this.options.store.recordMirrorWrite(binding.partitionId, hashContent(content)); }
+        if (this.isCurrent(binding)) {
+          await this.options.store.recordMirrorWrite(binding.partitionId, hashContent(content), () => this.isCurrent(binding));
+        }
       } catch (error) {
-        if (this.isCurrent(binding)) { await this.options.store.recordMirrorDirty(binding.partitionId); }
+        if (this.isCurrent(binding)) { await this.options.store.recordMirrorDirty(binding.partitionId, () => this.isCurrent(binding)); }
         throw error;
       } finally { binding.scheduledContent = undefined; }
     });
@@ -255,7 +290,11 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
 
   private async removeBinding(binding: PartitionBinding): Promise<void> {
     try { await this.flushPartition(binding.partitionId); }
-    catch (error) { this.log(binding.partitionId, 'remove flush', error); }
+    catch { this.log(binding.partitionId, 'remove-flush'); }
+    this.retireBinding(binding);
+  }
+
+  private retireBinding(binding: PartitionBinding): void {
     this.disposeBinding(binding);
     if (this.bindings.get(binding.partitionId) === binding) { this.bindings.delete(binding.partitionId); }
   }
@@ -283,7 +322,7 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     return result;
   }
 
-  private log(partitionId: string, operation: string, error: unknown): void {
-    this.options.output.appendLine(`WorkspaceMirrorCoordinator: ${partitionId} ${operation}: ${error instanceof Error ? error.message : String(error)}`);
+  private log(partitionId: string, category: MirrorDiagnostic): void {
+    this.options.output.appendLine(`WorkspaceMirrorCoordinator: ${partitionId} ${category}`);
   }
 }
