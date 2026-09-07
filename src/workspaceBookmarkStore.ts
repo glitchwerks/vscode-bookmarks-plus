@@ -87,6 +87,7 @@ interface MutationResult<T> {
 }
 
 const noopOutput: OutputSink = { appendLine: () => {} };
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * Owns the complete workspace-partition snapshot and commits every content change atomically.
@@ -495,7 +496,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     ]);
     for (let attempts = 0; attempts < 10_000; attempts++) {
       const id = this.createId();
-      if (!used.has(id)) {
+      if (UUID_PATTERN.test(id) && !used.has(id)) {
         return id;
       }
     }

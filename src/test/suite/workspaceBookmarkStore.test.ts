@@ -255,6 +255,46 @@ suite('WorkspaceBookmarkStore content operations', () => {
     assert.strictEqual(item.id, '00000000-0000-4000-8000-000000000002');
   });
 
+  test('skips a unique malformed generated identifier before publishing the snapshot', async () => {
+    const state = new FakeMemento({
+      [WORKSPACE_PARTITION_STORAGE_KEY]: snapshotWithAttachedRoot()
+    });
+    const generated = ['not-a-uuid', '00000000-0000-4000-8000-000000000002'];
+    const store = await WorkspaceBookmarkStore.create({
+      state,
+      roots: roots(),
+      output: new FakeOutput(),
+      createId: () => generated.shift()!
+    });
+    const owner = { kind: 'partition' as const, partitionId: '00000000-0000-4000-8000-000000000001' };
+
+    const item = await store.addItem(owner, { type: 'file', uri: 'file:///workspace/a/a.ts' });
+
+    assert.strictEqual(item.id, '00000000-0000-4000-8000-000000000002');
+  });
+
+  test('rejects mutations after disposal without writing, firing, or blocking later calls', async () => {
+    const { store, state, ownerA } = await readyStore();
+    let events = 0;
+    store.onBookmarksChanged(() => events++);
+    const updatesBefore = state.updateCallCount;
+    store.dispose();
+
+    await assert.rejects(
+      store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/a.ts' }),
+      (error: unknown) => error instanceof WorkspaceDataUnavailableError
+        && error.message === 'Workspace bookmark store is disposed.'
+    );
+    await assert.rejects(
+      store.removeItem(ownerA, 'missing'),
+      (error: unknown) => error instanceof WorkspaceDataUnavailableError
+        && error.message === 'Workspace bookmark store is disposed.'
+    );
+
+    assert.strictEqual(state.updateCallCount, updatesBefore);
+    assert.strictEqual(events, 0);
+  });
+
   test('keeps malformed workspace state unavailable and rejects every mutation without writing', async () => {
     const state = new FakeMemento({
       [WORKSPACE_PARTITION_STORAGE_KEY]: { version: 99, partitions: [], unassigned: {} }
