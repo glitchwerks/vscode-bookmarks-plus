@@ -1,8 +1,9 @@
 # Cross-Extension MCP Access Contract Design
 
-**Status:** Revised after second architectural review; pending downstream issue updates
+**Status:** Revised after third architectural review; pending downstream issue updates
 **Issue:** #137
-**Prerequisites:** #62, #129
+**Approval gates:** #62 update; glitchwerks/vscode-claude-workspaces#50 update
+**Implementation prerequisites:** #62, #129
 **Downstream implementation:** #138
 **Consumer integration:** glitchwerks/vscode-claude-workspaces#50
 
@@ -13,11 +14,11 @@ companion extension can request MCP access for one explicit workspace folder wit
 Bookmarks Plus internals. The first implementation of this contract ships only after multi-root
 storage behavior (#62) and the live extension-to-server bridge (#129) are complete. (#137)
 
-Before this contract is approved, #62 must own the logical root-partition, migration, collection,
-and out-of-root semantics defined below. Before the Claude Workspaces integration ships,
-glitchwerks/vscode-claude-workspaces#50 must own the redacted, ephemeral carrier used to pass a
-bootstrap descriptor to Claude Code. (#137; #62; #129;
-glitchwerks/vscode-claude-workspaces#50)
+Before this contract is approved, #62 must own the logical root-partition, URI-identity, migration,
+collection, and out-of-root semantics defined below, and glitchwerks/vscode-claude-workspaces#50
+must own the bounded optional adapter plus the redacted, ephemeral carrier used to pass a bootstrap
+descriptor to Claude Code. These are issue-tracking approval gates; their implementations remain in
+the delivery sequence below. (#137; #62; #129; glitchwerks/vscode-claude-workspaces#50)
 
 The returned connection information is an opaque, serializable stdio bootstrap descriptor. The
 consumer may translate that descriptor into its own launch configuration, but it must not infer
@@ -525,6 +526,15 @@ The deepest-root rule matches the repository's existing order-independent nested
 (`src/workspaceFolders.ts:L72-L94`, `src/test/suite/workspaceFolders.test.ts:L165-L184`;
 glitchwerks/vscode-claude-workspaces#50)
 
+#62 owns one deterministic root-URI canonicalization function. The same function must normalize URI
+components before root containment/equality comparisons and provide the identity used for current-
+folder attachment, persisted partition metadata, exact-root request validation, and detached-root
+reattachment. It must not depend on process locale, current working directory, or workspace-folder
+order, and it must not collapse two distinct current workspace folders to one identity. #62 must
+document and test the chosen behavior for scheme and authority casing, path casing, percent-encoding,
+and trailing separators for both local `file` and supported remote workspace-folder URIs. (#62;
+#137; `src/workspaceFolders.ts:L1-L94`)
+
 ### Existing-data migration required from #62
 
 The schema migration must be lossless and idempotent:
@@ -547,12 +557,14 @@ The schema migration must be lossless and idempotent:
 8. Log counts only. Migration diagnostics must not log bookmark URIs, names, descriptions, or
    descriptor data.
 
-When a detached root returns with the same normalized URI identity, #62 may reattach it to its
-existing partition automatically. A folder move or rename that changes the URI must not be inferred
-from a matching display name, basename, path suffix, or bookmark contents. Rebinding a detached
-partition to a different current URI requires an explicit user-confirmed recovery action, preserves
-the stable partition identity, and must fail rather than merge implicitly when that URI is already
-attached to another partition. Detached partitions remain unavailable to new MCP requests until
+When exactly one detached partition has the same canonical URI identity as a returning workspace
+folder and no attached partition claims that identity, Bookmarks Plus must reattach it automatically.
+A folder move or rename that changes the identity must not be inferred from a matching display name,
+basename, path suffix, or bookmark contents. Rebinding a detached partition to a different current
+URI requires an explicit user-confirmed recovery action, preserves the stable partition identity,
+and must fail rather than merge implicitly when that URI is already attached to another partition.
+Ambiguous legacy or corrupt state with multiple matching detached partitions also requires explicit
+recovery and must not auto-merge. Detached partitions remain unavailable to new MCP requests until
 reattached. #62 must document the recovery action before #137 is approved. (#62; #137)
 
 These semantics implement the selected-root and least-privilege contract while leaving the physical
@@ -617,8 +629,11 @@ https://code.claude.com/docs/en/cli-usage, fetched 2026-09-06)
   mixed root-owned and unmatched items, split multi-root collections, empty collections,
   out-of-root items, and idempotent retry without data loss.
 - Root lifecycle tests preserve stable partition identity across detachment, automatically reattach
-  only the same normalized URI, ignore display-name changes, and require explicit recovery for a
-  changed URI without implicitly merging partitions.
+  exactly one detached partition with the same canonical URI identity, ignore display-name changes,
+  and require explicit recovery for changed-identity or ambiguous matches without implicitly merging
+  partitions. URI-identity tests cover the documented scheme, authority, path-case, percent-encoding,
+  and trailing-separator behavior for local and remote roots and prove the same canonicalization is
+  used by attachment, persistence, request validation, containment, and reattachment.
 
 ### Optional-consumer isolation tests
 
@@ -687,14 +702,14 @@ version. These rules are the compatibility boundary approved for #137. (#137)
 
 ## Delivery sequence
 
-1. Update #62 to own the logical root-partition, migration, split-collection, and recovery behavior
-   required by this contract.
-2. Approve and merge this #137 contract.
-3. Implement the updated multi-root storage semantics in #62.
-4. Implement the authenticated live bridge and lifecycle in #129 against this contract.
-5. Implement and document the exported API, host placement, and Workspace Trust policy in #138.
-6. Update glitchwerks/vscode-claude-workspaces#50 with the bounded optional adapter, redacted
+1. Update #62 to own the logical root-partition, URI-identity, migration, split-collection, and
+   recovery behavior required by this contract.
+2. Update glitchwerks/vscode-claude-workspaces#50 with the bounded optional adapter, redacted
    diagnostics, secure temporary carrier, and non-transparent reconnection limitation.
+3. Approve and merge this #137 contract.
+4. Implement the updated multi-root storage semantics in #62.
+5. Implement the authenticated live bridge and lifecycle in #129 against this contract.
+6. Implement and document the exported API, host placement, and Workspace Trust policy in #138.
 7. Integrate the optional consumer and verify local, Restricted Mode, and claimed remote behavior.
 
 This preserves the dependency sequence recorded by #137 and prevents the public contract from
@@ -704,9 +719,10 @@ silently changing while its private transport is implemented. (#137)
 
 #137 is ready for approval when:
 
-1. #62 records the stable attached/detached partition model, lossless `unassigned` collection
-   splitting, create-operation scope checks, and recovery responsibilities above without weakening
-   selected-root isolation.
+1. #62 records the stable attached/detached partition model, deterministic URI canonicalization,
+   mandatory unique same-identity reattachment, lossless `unassigned` collection splitting,
+   create-operation scope checks, and recovery responsibilities above without weakening selected-
+   root isolation.
 2. The contract's failure-isolation example remains bounded across activation and request and
    discards late descriptors.
 3. Descriptor evolution, environment overlay, absolute-path, and cwd-independent execution rules
