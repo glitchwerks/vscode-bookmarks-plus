@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
   canonicalizeRootUri,
+  InvalidRootUriError,
   findCanonicalRootCollisions,
   findDeepestRoot,
   isUriInsideRoot,
@@ -9,6 +10,20 @@ import {
 } from '../../rootUri';
 
 suite('rootUri', () => {
+  for (const value of ['vscode-remote:relative/repo', 'custom:repo']) {
+    test(`rejects scheme-qualified relative root ${value} before structural operations`, () => {
+      const root = vscode.Uri.parse(value);
+      const absolute = vscode.Uri.from({ scheme: root.scheme, path: '/absolute' });
+      const candidate = { id: 'relative', label: 'Relative', uri: root };
+      assert.throws(() => canonicalizeRootUri(root), InvalidRootUriError);
+      assert.throws(() => findCanonicalRootCollisions([candidate]), InvalidRootUriError);
+      assert.throws(() => findDeepestRoot(absolute, [candidate]), InvalidRootUriError);
+      assert.throws(() => isUriInsideRoot(absolute, root), InvalidRootUriError);
+      assert.throws(() => rebaseUri(absolute, root, absolute), InvalidRootUriError);
+      assert.throws(() => rebaseUri(absolute, absolute, root), InvalidRootUriError);
+    });
+  }
+
   test('canonicalizes identity without folding path case', () => {
     const upper = vscode.Uri.parse('VSCODE-REMOTE://WSL+Ubuntu/Work/Repo/%7efile/');
     const lower = vscode.Uri.parse('vscode-remote://wsl+ubuntu/Work/Repo/~file');

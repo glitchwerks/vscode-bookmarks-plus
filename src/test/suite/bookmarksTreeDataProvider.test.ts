@@ -217,6 +217,51 @@ function getTransferEnvelope(dt: vscode.DataTransfer): DragEnvelope | undefined 
 }
 
 suite('BookmarksTreeDataProvider - drag and drop', () => {
+  for (const scope of ['workspace', 'global'] as const) {
+    test(`${scope} drop retains successful moves around multiple failures and warns once`, async () => {
+      const workspace = await createSingleRootFixtureStore();
+      const global = new BookmarkStore(new FakeMemento());
+      const store = scope === 'workspace' ? workspace : global;
+      const source = await store.addCollection('Source');
+      const destination = await store.addCollection('Destination');
+      const add = (name: string, collectionId: string) => store.addItem({ type: 'file', uri: `file:///${name}.txt`, collectionId });
+      const first = await add('first', source.id);
+      const blockedA = await add('blocked-a', source.id);
+      const blockedB = await add('blocked-b', source.id);
+      const last = await add('last', source.id);
+      const existingA = await add('blocked-a', destination.id);
+      const existingB = await add('blocked-b', destination.id);
+      const warnings: string[] = [];
+      // Supply the warning boundary without replacing VS Code's read-only window API.
+      const provider = new BookmarksTreeDataProvider(workspace,
+        new FsGitCache(async () => ({ exists: true })), global, undefined, undefined, undefined, undefined,
+        (message: string) => { warnings.push(message); });
+      const token = new vscode.CancellationTokenSource();
+      let changes = 0;
+      const subscription = store.onBookmarksChanged(() => changes++);
+      try {
+        const target: BookmarkNode = { kind: 'item', item: existingA, scope,
+          ...(scope === 'workspace' ? { owner: SINGLE_ROOT_OWNER } : {}) };
+        await provider.handleDrop(target, makeDropTransfer(scope, [first.id, blockedA.id, blockedB.id, last.id]), token.token);
+        const inCollection = (id: string) => store.getAll().items.filter(item => item.collectionId === id)
+          .sort((a, b) => a.order - b.order).map(item => ({ id: item.id, order: item.order }));
+        assert.deepStrictEqual(inCollection(source.id), [{ id: blockedA.id, order: 0 }, { id: blockedB.id, order: 1 }]);
+        // Global nodes retain their live item reference; workspace nodes are snapshots.
+        const destinationIds = scope === 'global'
+          ? [first.id, last.id, existingA.id, existingB.id]
+          : [last.id, first.id, existingA.id, existingB.id];
+        assert.deepStrictEqual(inCollection(destination.id), destinationIds
+          .map((id, order) => ({ id, order })));
+        assert.strictEqual(changes, 2, 'only successful item moves publish changes');
+        assert.strictEqual(warnings.length, 1, 'multiple item failures produce one drop warning');
+        assert.match(warnings[0], /some bookmarks could not be moved/i);
+        assert.deepStrictEqual((scope === 'workspace' ? global : workspace).getAll().items, []);
+        await provider.handleDrop(target, makeDropTransfer(scope, [last.id]), token.token);
+        assert.strictEqual(warnings.length, 1, 'a subsequent successful drop produces no warning');
+      } finally { subscription.dispose(); token.dispose(); workspace.dispose(); global.dispose(); }
+    });
+  }
+
   test('dropping with no target appends the item to the root, at the end', async () => {
     const { store, provider } = await makeProvider();
     const a = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
@@ -1691,6 +1736,23 @@ function partitionEnvelope(owner: WorkspaceOwnerRef | undefined, ids: string[]):
 }
 
 suite('BookmarksTreeDataProvider - workspace partitions (#62)', () => {
+  test('unavailable workspace suppresses Suggested including stale expansion while retaining Global and Recent', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global.ts' });
+    const { provider, changes } = providerForWorkspaceView(unavailableWorkspaceView(), {
+      globalStore,
+      suggestions: { getRecentItems: () => [{ uri: 'file:///preserved.ts', firstSeen: 1, previewCount: 0, promoted: true }], maxItems: 1 },
+      recentlyViewed: { getUris: () => ['file:///recent.ts'] }
+    });
+    try {
+      assert.deepStrictEqual((await provider.getChildren()).map(node => node.kind), ['globalRoot', 'workspaceDiagnostic', 'recentRoot']);
+      assert.deepStrictEqual(await provider.getChildren({ kind: 'suggestedRoot' }), []);
+      const globalChildren = await provider.getChildren({ kind: 'globalRoot' });
+      assert.strictEqual(globalChildren[0].kind === 'item' && globalChildren[0].item.id, globalItem.id);
+      assert.deepStrictEqual(await provider.getChildren({ kind: 'recentRoot' }), [{ kind: 'recentItem', uri: 'file:///recent.ts' }]);
+    } finally { changes.dispose(); globalStore.dispose(); }
+  });
+
   test('keeps one attached root flat and carries its partition owner', async () => {
     const { provider } = providerForWorkspaceView(readyWorkspaceView({
       attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }]

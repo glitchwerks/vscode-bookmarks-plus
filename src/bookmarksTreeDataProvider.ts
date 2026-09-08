@@ -61,7 +61,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () => vscode.workspace.workspaceFolders,
     private readonly suggestions?: SuggestionsSource,
     private readonly recentlyViewed?: RecentlyViewedSource,
-    private readonly viewState?: vscode.Memento
+    private readonly viewState?: vscode.Memento,
+    private readonly showWarning: (message: string) => void = message => { void vscode.window.showWarningMessage(message); }
   ) {
     this.showFullPath = this.viewState?.get<boolean>(SHOW_FULL_PATH_STATE_KEY, false) ?? false;
     this.workspaceStore.onBookmarksChanged(() => this.refreshFromStore());
@@ -93,15 +94,23 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     const sourceOwner = envelope.scope === 'workspace' ? envelope.owner : undefined;
     const targetInfo = this.dropTarget(target, envelope.scope, sourceOwner);
     if (!targetInfo) return;
+    let moveFailed = false;
     if (envelope.scope === 'global') {
       if (!this.globalStore) return;
       const data = this.globalStore.getAll();
-      for (const id of envelope.ids) await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data));
-      return;
+      for (const id of envelope.ids) {
+        try { await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data)); }
+        catch { moveFailed = true; }
+      }
+    } else {
+      const data = this.workspaceDataForOwner(sourceOwner!);
+      if (!data) return;
+      for (const id of envelope.ids) {
+        try { await this.workspaceStore.moveItem(sourceOwner!, id, targetInfo.collectionId, targetInfo.index(data)); }
+        catch { moveFailed = true; }
+      }
     }
-    const data = this.workspaceDataForOwner(sourceOwner!);
-    if (!data) return;
-    for (const id of envelope.ids) await this.workspaceStore.moveItem(sourceOwner!, id, targetInfo.collectionId, targetInfo.index(data));
+    if (moveFailed) this.showWarning('Some bookmarks could not be moved. Other selected bookmarks were processed.');
   }
 
   getGroupMode(): GroupMode { return this.groupMode; }
@@ -173,7 +182,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   private async getSuggestedLeaves(): Promise<BookmarkNode[]> {
-    if (!this.suggestions || this.suggestions.maxItems <= 0) return [];
+    if (!this.suggestions || this.suggestions.maxItems <= 0 || this.workspaceStore.getView().kind === 'unavailable') return [];
     const bookmarked = new Set([...this.workspaceStore.getAll().items.map((item) => item.uri), ...(this.globalStore?.getAll().items.map((item) => item.uri) ?? [])]);
     const candidates = this.suggestions.getRecentItems().filter((item) => item.promoted && !bookmarked.has(item.uri)).sort((left, right) => right.firstSeen - left.firstSeen);
     const existing: RecentItem[] = []; for (const item of candidates) if ((await this.cache.get(item.uri)).exists) existing.push(item);

@@ -57,7 +57,7 @@ function comparable(uri: vscode.Uri): ComparableUri {
 
 /** Throws when a URI cannot be used as a canonical workspace-root identity. */
 function assertValidRootUri(uri: vscode.Uri): void {
-  if (!uri.scheme) {
+  if (!uri.scheme || (uri.path !== '' && !uri.path.startsWith('/'))) {
     throw new InvalidRootUriError('A workspace root URI must be absolute.');
   }
   if (uri.query) {

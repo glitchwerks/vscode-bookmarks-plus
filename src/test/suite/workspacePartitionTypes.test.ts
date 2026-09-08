@@ -1,8 +1,13 @@
 import * as assert from 'assert';
+import * as vscode from 'vscode';
+import { WorkspaceBookmarkStore, WorkspaceDataUnavailableError } from '../../workspaceBookmarkStore';
+import { WorkspaceMirrorCoordinator } from '../../workspaceMirrorCoordinator';
+import { FakeMemento, FakeOutput, FakePartitionMirrorResources } from './fixtures';
 import { BookmarkData } from '../../types';
 import {
   WorkspacePartition,
   WorkspacePartitionSnapshot,
+  WORKSPACE_PARTITION_STORAGE_KEY,
   cloneWorkspacePartitionSnapshot,
   emptyWorkspacePartitionSnapshot,
   ownerKey,
@@ -61,6 +66,74 @@ function seededSnapshot(): WorkspacePartitionSnapshot {
 }
 
 suite('workspacePartitionTypes', () => {
+  for (const field of ['attachment', 'lastKnownRootUri'] as const) {
+    test(`rejects scheme-qualified relative persisted ${field} metadata`, () => {
+      const snapshot = seededSnapshot();
+      const partition = snapshot.partitions[0];
+      if (field === 'attachment') {
+        partition.attachment = { rootUri: 'custom:relative/repo', canonicalRootUri: 'custom://relative/repo' };
+      } else {
+        partition.lastKnownRootUri = 'custom:relative/repo';
+        partition.canonicalLastKnownRootUri = 'custom://relative/repo';
+      }
+      assert.strictEqual(validateWorkspacePartitionSnapshot(snapshot).ok, false);
+    });
+  }
+
+  test('rejects distinct partitions attached to the same canonical root', () => {
+    const snapshot = seededSnapshot();
+    snapshot.partitions.push({
+      ...snapshot.partitions[0], id: '10000000-0000-4000-8000-000000000002',
+      attachment: { rootUri: 'FILE:///workspace/project/', canonicalRootUri: 'file:///workspace/project' },
+      data: { version: 2, items: [], collections: [] }
+    });
+    assert.strictEqual(validateWorkspacePartitionSnapshot(snapshot).ok, false);
+  });
+
+  test('allows shared last-known identities when only one partition is attached', () => {
+    const snapshot = seededSnapshot();
+    snapshot.partitions.push({
+      ...snapshot.partitions[0], id: '10000000-0000-4000-8000-000000000002', attachment: null,
+      data: { version: 2, items: [], collections: [] }
+    });
+    assert.deepStrictEqual(validateWorkspacePartitionSnapshot(snapshot), { ok: true });
+    snapshot.partitions[0].attachment = null;
+    assert.deepStrictEqual(validateWorkspacePartitionSnapshot(snapshot), { ok: true });
+  });
+
+  for (const malformed of ['duplicate attached roots', 'relative attachment', 'relative last-known root']) {
+    test(`preserves ${malformed} snapshot as unavailable without publishing mirrors`, async () => {
+      const snapshot = seededSnapshot();
+      if (malformed === 'duplicate attached roots') {
+        snapshot.partitions.push({ ...snapshot.partitions[0], id: '10000000-0000-4000-8000-000000000002',
+          data: { version: 2, items: [], collections: [] } });
+      } else if (malformed === 'relative attachment') {
+        snapshot.partitions[0].attachment = { rootUri: 'custom:relative/repo', canonicalRootUri: 'custom://relative/repo' };
+      } else {
+        snapshot.partitions[0].lastKnownRootUri = 'custom:relative/repo';
+        snapshot.partitions[0].canonicalLastKnownRootUri = 'custom://relative/repo';
+      }
+      const before = JSON.stringify(snapshot);
+      const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+      const output = new FakeOutput();
+      const roots = [{ id: 'project', label: 'Project', uri: vscode.Uri.parse('file:///workspace/project') }];
+      const store = await WorkspaceBookmarkStore.create({ state, roots, output });
+      const resources: FakePartitionMirrorResources[] = [];
+      const coordinator = new WorkspaceMirrorCoordinator({ store, output, createResources: () => {
+        const resource = new FakePartitionMirrorResources(); resources.push(resource); return resource;
+      } });
+      try {
+        assert.strictEqual(store.getView().kind, 'unavailable');
+        assert.deepStrictEqual(store.getView().attached, []);
+        await coordinator.reconcileBindings();
+        assert.strictEqual(resources.length, 0);
+        await assert.rejects(store.reconcileRoots(roots), WorkspaceDataUnavailableError);
+        assert.strictEqual(state.updateCallCount, 0);
+        assert.strictEqual(JSON.stringify(state.get(WORKSPACE_PARTITION_STORAGE_KEY)), before);
+      } finally { coordinator.dispose(); store.dispose(); }
+    });
+  }
+
   for (const version of [3, 999, 1.5, 0, -1, NaN, Infinity]) {
     for (const owner of ['attached', 'detached', 'unassigned']) {
       test(`rejects unsupported ${owner} content version ${version}`, () => {

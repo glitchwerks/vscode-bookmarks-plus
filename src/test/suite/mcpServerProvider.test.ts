@@ -32,21 +32,24 @@ suite('MCP server definitions (#126)', () => {
     assert.strictEqual(definition.version, '1.3.0');
   });
 
-  test('a no-folder window publishes no server and explains why', () => {
-    const output = new FakeOutput();
+  for (const roots of [undefined, []]) {
+    test(`no attached roots (${roots === undefined ? 'undefined' : 'empty'}) publishes no server and explains why`, () => {
+      const output = new FakeOutput();
 
-    const definitions = buildMcpServerDefinitions(
-      undefined,
-      vscode.Uri.file('/extensions/bookmarks-plus'),
-      '1.3.0',
-      output
-    );
+      const definitions = buildMcpServerDefinitions(
+        roots,
+        vscode.Uri.file('/extensions/bookmarks-plus'),
+        '1.3.0',
+        output
+      );
 
-    assert.deepStrictEqual(definitions, []);
-    assert.strictEqual(output.lines.length, 1);
-    assert.match(output.lines[0], /native MCP server is unavailable/i);
-    assert.match(output.lines[0], /no workspace folder/i);
-  });
+      assert.deepStrictEqual(definitions, []);
+      assert.strictEqual(output.lines.length, 1);
+      assert.match(output.lines[0], /native MCP server is unavailable/i);
+      assert.match(output.lines[0], /no attached workspace roots are available/i);
+      assert.doesNotMatch(output.lines[0], /no workspace folder is open/i);
+    });
+  }
 
   test('a multi-root window publishes one explicitly rooted server per attached folder', () => {
     const output = new FakeOutput();
@@ -130,7 +133,7 @@ suite('MCP server definitions (#126)', () => {
       {} as vscode.CancellationToken
     );
     assert.deepStrictEqual(changedDefinitions, []);
-    assert.match(output.lines[0], /no workspace folder/i);
+    assert.match(output.lines[0], /no attached workspace roots are available/i);
 
     folders = [
       { uri: vscode.Uri.file('/workspaces/first') },

@@ -28,7 +28,7 @@ export function buildMcpServerDefinitions(
 ): vscode.McpStdioServerDefinition[] {
   if (!folders || folders.length === 0) {
     output.appendLine(
-      'Bookmarks Plus: native MCP server is unavailable — no workspace folder is open.'
+      'Bookmarks Plus: native MCP server is unavailable — no attached workspace roots are available.'
     );
     return [];
   }

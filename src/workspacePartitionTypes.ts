@@ -101,8 +101,9 @@ export function validateWorkspacePartitionSnapshot(value: unknown): SnapshotVali
   }
 
   const allIds = new Set<string>();
+  const attachedRoots = new Set<string>();
   for (const partition of value.partitions) {
-    const reason = validatePartition(partition, allIds);
+    const reason = validatePartition(partition, allIds, attachedRoots);
     if (reason) {
       return invalid(reason);
     }
@@ -141,7 +142,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
 }
 
-function validatePartition(value: unknown, allIds: Set<string>): string | undefined {
+function validatePartition(value: unknown, allIds: Set<string>, attachedRoots: Set<string>): string | undefined {
   if (!isRecord(value)) {
     return 'partition shape is malformed';
   }
@@ -159,6 +160,12 @@ function validatePartition(value: unknown, allIds: Set<string>): string | undefi
   if (!isValidAttachment(value.attachment)) {
     return 'attachment metadata is malformed';
   }
+  if (value.attachment !== null) {
+    if (attachedRoots.has(value.attachment.canonicalRootUri)) {
+      return 'attached root identity is duplicated';
+    }
+    attachedRoots.add(value.attachment.canonicalRootUri);
+  }
   if (typeof value.replacementEligible !== 'boolean') {
     return 'replacement eligibility is malformed';
   }
@@ -171,7 +178,7 @@ function validatePartition(value: unknown, allIds: Set<string>): string | undefi
   return validateOwnerData(value.data, allIds);
 }
 
-function isValidAttachment(value: unknown): boolean {
+function isValidAttachment(value: unknown): value is WorkspacePartition['attachment'] {
   if (value === null) {
     return true;
   }
