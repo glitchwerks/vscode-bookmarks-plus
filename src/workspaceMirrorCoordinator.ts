@@ -145,7 +145,7 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
     if (errors.length > 0) { throw new AggregateError(errors, 'Workspace mirror flush failed.'); }
   }
 
-  /** Drains accepted store/lifecycle work before flushing the final shutdown binding set. */
+  /** Drains accepted store, lifecycle, and binding work before completing the shutdown flush. */
   async drainAndFlush(): Promise<void> {
     const errors: unknown[] = [];
     for (;;) {
@@ -158,9 +158,15 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
       const contentRevision = this.contentRevision;
       try { await this.flushAll(); }
       catch (error) { errors.push(error); }
+      // A watcher can enqueue a read after its root flushed while another root is still writing.
+      // Reads have no store/content event until I/O finishes, so their tails must also settle.
+      const operations = [...this.bindings.values()].map(binding => ({ binding, tail: binding.operationTail }));
+      await Promise.all(operations.map(operation => operation.tail));
       await this.options.store.whenIdle();
+      const bindingsIdle = operations.length === this.bindings.size && operations.every(({ binding, tail }) =>
+        this.bindings.get(binding.partitionId) === binding && binding.operationTail === tail);
       // An edit can arrive after its root flushed while another root still has pending I/O.
-      if (lifecycle === this.lifecycleTail && contentRevision === this.contentRevision) { break; }
+      if (bindingsIdle && lifecycle === this.lifecycleTail && contentRevision === this.contentRevision) { break; }
     }
     if (errors.length > 0) { throw new AggregateError(errors, 'Workspace mirror shutdown flush failed.'); }
   }

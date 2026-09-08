@@ -272,6 +272,54 @@ suite('Extension - partitioned activation (#62)', () => {
       assert.deepStrictEqual((await f.provider.getChildren()).map(node => node.kind), ['globalRoot', 'workspaceRoot', 'workspaceRoot']);
     } finally { await f.stop(); }
   });
+
+  test('deactivation waits for a watcher read accepted after its root flushed and completes its rewrite', async () => {
+    const f = activationFixture();
+    const writeB = barrier(), readA = barrier(), rewriteA = barrier();
+    let stop: Promise<void> | undefined;
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const ownerB = store.resolveAttachedOwner(vscode.Uri.parse('file:///b/first'))!;
+      await store.addItem(ownerB, { type: 'file', uri: 'file:///b/first' });
+      const resourceA = f.resources.get('file:///a')!;
+      const resourceB = f.resources.get('file:///b')!;
+      const originalWriteB = resourceB.port.write.bind(resourceB.port);
+      resourceB.port.write = async content => { await writeB.wait(); await originalWriteB(content); };
+      let stopped = false;
+      stop = deactivate().then(() => { stopped = true; });
+      await writeB.entered;
+      // A's empty flush has settled; B still holds the shutdown flush open.
+      await f.coordinator.flushPartition(store.getView().attached.find(root => root.rootUri === 'file:///a')!.partitionId);
+      resourceA.port.read = async () => {
+        await readA.wait();
+        return JSON.stringify({ version: 2, collections: [], items: [
+          { id: 'external-id-needs-repair', type: 'file', uri: 'file:///a/external', collectionId: null, order: 0 }
+        ] });
+      };
+      const originalWriteA = resourceA.port.write.bind(resourceA.port);
+      resourceA.port.write = async content => { await rewriteA.wait(); await originalWriteA(content); };
+      resourceA.change.fire();
+      await readA.entered;
+      writeB.release();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(stopped, false, 'accepted watcher reads must settle before shutdown returns');
+      assert.strictEqual(resourceA.disposed, false);
+      readA.release();
+      await rewriteA.entered;
+      assert.strictEqual(stopped, false, 'the imported payload rewrite must finish before disposal');
+      assert.strictEqual(resourceA.disposed, false);
+      rewriteA.release();
+      await stop;
+      const partition = store.getView().attached.find(root => root.rootUri === 'file:///a')!;
+      assert.deepStrictEqual(partition.data.items.map(item => item.uri), ['file:///a/external']);
+      assert.notStrictEqual(partition.data.items[0].id, 'external-id-needs-repair');
+      assert.deepStrictEqual(JSON.parse(resourceA.port.content!).items, partition.data.items);
+      assert.strictEqual(store.getMirrorState(partition.partitionId)!.dirty, false);
+      assert.strictEqual(resourceA.disposed, true);
+      assert.strictEqual(resourceB.disposed, true);
+    } finally { writeB.release(); readA.release(); rewriteA.release(); await stop; await f.stop(); }
+  });
   test('root removal flushes, disposes, preserves content and refreshes consumers from committed state', async () => {
     const f = activationFixture();
     try {
