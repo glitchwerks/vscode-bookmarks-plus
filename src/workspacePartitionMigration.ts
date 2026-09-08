@@ -10,6 +10,7 @@ import {
 import {
   BookmarkData,
   BookmarkItem,
+  CURRENT_SCHEMA_VERSION,
   emptyBookmarkData,
   isStrictBookmarkData,
   normalizeDescription
@@ -209,10 +210,22 @@ export async function loadOrMigrateWorkspaceSnapshot(
     if (!validation.ok) {
       return unavailable(output, validation.reason ?? 'snapshot is invalid');
     }
-    return {
-      kind: 'ready',
-      snapshot: cloneWorkspacePartitionSnapshot(storedSnapshot as WorkspacePartitionSnapshot)
-    };
+    const snapshot = cloneWorkspacePartitionSnapshot(storedSnapshot as WorkspacePartitionSnapshot);
+    let migrated = false;
+    for (const partition of snapshot.partitions) {
+      if (partition.data.version !== CURRENT_SCHEMA_VERSION) {
+        partition.data = migrateBookmarkData(partition.data);
+        partition.mirror.dirty = true;
+        migrated = true;
+      }
+    }
+    if (snapshot.unassigned.version !== CURRENT_SCHEMA_VERSION) {
+      snapshot.unassigned = migrateBookmarkData(snapshot.unassigned);
+      migrated = true;
+    }
+    // Publish all supported owner migrations in one update; never partially migrate a snapshot.
+    if (migrated) await state.update(WORKSPACE_PARTITION_STORAGE_KEY, snapshot);
+    return { kind: 'ready', snapshot };
   }
 
   const storedLegacy = state.get<unknown>(LEGACY_STORAGE_KEY);

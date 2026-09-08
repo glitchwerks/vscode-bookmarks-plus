@@ -112,4 +112,33 @@ suite('rootUri', () => {
     assert.strictEqual(result?.query, source.query);
     assert.strictEqual(result?.fragment, source.fragment);
   });
+
+  for (const [name, other, encoded] of [
+    ['%61', 'a', '%2561'], ['%7e', '~', '%257e'], ['%2F', '%2f', '%252F'],
+    ['a b', 'ab', 'a%20b'], ['a#b', 'ab', 'a%23b'], ['a?b', 'ab', 'a%3Fb']
+  ]) {
+    test(`preserves literal ${name} names through file, parse, identity, containment and rebase`, () => {
+      const root = vscode.Uri.file('/work/' + name);
+      const roundTrip = vscode.Uri.parse(root.toString());
+      const canonical = canonicalizeRootUri(root);
+      assert.strictEqual(canonical, 'file:///work/' + encoded);
+      assert.strictEqual(canonicalizeRootUri(roundTrip), canonical);
+      assert.strictEqual(canonicalizeRootUri(vscode.Uri.parse(canonical)), canonical);
+      assert.notStrictEqual(canonical, canonicalizeRootUri(vscode.Uri.file('/work/' + other)));
+      assert.strictEqual(isUriInsideRoot(vscode.Uri.file('/work/' + other + '/private'), root), false);
+      assert.strictEqual(isUriInsideRoot(vscode.Uri.file('/work/' + name + '/file'), roundTrip), true);
+      const source = vscode.Uri.parse(vscode.Uri.file('/old/' + name + '.ts').toString());
+      const rebased = rebaseUri(source, vscode.Uri.file('/old'), vscode.Uri.file('/new')).uri!;
+      assert.strictEqual(rebased.path, '/new/' + name + '.ts');
+      assert.strictEqual(vscode.Uri.parse(rebased.toString()).path, rebased.path);
+    });
+  }
+
+  test('a literal encoded-separator filename never becomes a structural separator', () => {
+    const literal = vscode.Uri.parse('file:///work/%252Fchild');
+    assert.strictEqual(isUriInsideRoot(vscode.Uri.parse('file:///work//child/private'), literal), false);
+    assert.strictEqual(canonicalizeRootUri(literal), 'file:///work/%252Fchild');
+    assert.strictEqual(rebaseUri(vscode.Uri.file('/old/%2F/child'), vscode.Uri.file('/old'), vscode.Uri.file('/new')).uri!.path,
+      '/new/%2F/child');
+  });
 });

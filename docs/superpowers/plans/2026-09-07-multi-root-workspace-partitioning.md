@@ -215,28 +215,13 @@ Expected: FAIL because `../../rootUri` and its exports do not exist.
 
 - [ ] **Step 3: Implement canonical structural operations**
 
-Implement percent-escape normalization without decoding encoded separators, remove only non-root
-trailing separators, preserve path case, compare complete components, and retain relative paths when
-rebasing:
-
-```ts
-const UNRESERVED = /^[A-Za-z0-9._~-]$/;
-
-function normalizeEscapes(value: string): string {
-  return value.replace(/%([0-9a-fA-F]{2})/g, (_escape, hex: string) => {
-    const character = String.fromCharCode(Number.parseInt(hex, 16));
-    return UNRESERVED.test(character) ? character : `%${hex.toUpperCase()}`;
-  });
-}
-
-function comparable(uri: vscode.Uri): { scheme: string; authority: string; segments: string[] } {
-  return {
-    scheme: uri.scheme.toLowerCase(),
-    authority: uri.authority.toLowerCase(),
-    segments: normalizeEscapes(uri.path).split('/').filter(Boolean)
-  };
-}
-```
+Use VS Code's already-decoded path components without decoding percent-like literal names again.
+Remove only non-root trailing separators, preserve interior empty components and path case (except
+the Windows file drive letter), compare complete components, and retain relative paths when rebasing.
+Serialize each path component with URI-safe escaping while preserving structural separators and the
+established `file:///c:/...` drive-colon spelling. Require canonical parse/serialization idempotence
+and distinct identities for literal `%61`, `%7e`, `%2F`, spaces, `#`, and `?` names.
+(`src/test/suite/rootUri.test.ts:L22-L34`; `src/test/suite/rootUri.test.ts:L106-L143`)
 
 Build `canonicalizeRootUri`, `findDeepestRoot`, collision grouping, and `rebaseUri` only from this
 structural representation. Throw a descriptive `InvalidRootUriError` for a relative root, query, or

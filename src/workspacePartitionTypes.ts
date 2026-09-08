@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import { canonicalizeRootUri } from './rootUri';
 import { RootCandidate } from './rootUri';
+import { migrateBookmarkData } from './migrations';
 import {
   BookmarkData,
+  CURRENT_SCHEMA_VERSION,
   emptyBookmarkData,
   isStrictBookmarkData
 } from './types';
@@ -198,6 +200,10 @@ function isSha256Hash(value: unknown): value is string {
 function validateOwnerData(data: unknown, allIds: Set<string>): string | undefined {
   if (!isStrictBookmarkData(data)) {
     return 'owner content is malformed';
+  }
+  if (data.version !== CURRENT_SCHEMA_VERSION) {
+    try { migrateBookmarkData(data); }
+    catch { return 'owner content version is unsupported'; }
   }
   const collectionIds = new Set<string>();
   for (const collection of data.collections) {

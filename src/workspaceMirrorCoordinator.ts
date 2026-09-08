@@ -183,7 +183,8 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
 
   private async reconcileNow(): Promise<void> {
     if (this.disposed) { return; }
-    const attached = this.options.store.getView().attached;
+    const view = this.options.store.getView();
+    const attached = view.attached.filter(partition => !view.unavailableRoots.includes(partition.canonicalRootUri));
     const removalResults = await Promise.allSettled([...this.bindings.values()].filter((binding) => !attached.some((partition) =>
       partition.partitionId === binding.partitionId && partition.canonicalRootUri === binding.rootIdentity
     )).map((binding) => this.removeBinding(binding)));
@@ -349,7 +350,8 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
   }
 
   private isCurrent(binding: PartitionBinding): boolean {
-    return !this.disposed && !binding.disposed && this.bindings.get(binding.partitionId)?.generation === binding.generation;
+    return !this.disposed && !binding.disposed && this.bindings.get(binding.partitionId)?.generation === binding.generation
+      && !this.options.store.getView().unavailableRoots.includes(binding.rootIdentity);
   }
 
   private enqueue(binding: PartitionBinding, operation: () => Promise<void>): Promise<void> {

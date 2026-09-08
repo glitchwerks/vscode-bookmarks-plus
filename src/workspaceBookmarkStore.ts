@@ -326,22 +326,29 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
-  /** Finds exact stored URI matches without exposing the mutable snapshot records. */
+  /** Finds parsed resource identities without conflating literal names or mutable snapshot records. */
   findItemsByUri(uri: vscode.Uri): readonly { owner: WorkspaceOwnerRef; item: BookmarkItem }[] {
     if (!this.snapshot) {
       return [];
     }
-    const target = uri.toString();
+    const target = canonicalizeRootUri(uri.with({ query: '', fragment: '' }));
+    const matchesResource = (stored: string): boolean => {
+      try {
+        const parsed = vscode.Uri.parse(stored, true);
+        return canonicalizeRootUri(parsed.with({ query: '', fragment: '' })) === target
+          && parsed.query === uri.query && parsed.fragment === uri.fragment;
+      } catch { return false; }
+    };
     const matches: { owner: WorkspaceOwnerRef; item: BookmarkItem }[] = [];
     for (const partition of this.snapshot.partitions) {
       for (const item of partition.data.items) {
-        if (item.uri === target) {
+        if (matchesResource(item.uri)) {
           matches.push({ owner: { kind: 'partition', partitionId: partition.id }, item: { ...item } });
         }
       }
     }
     for (const item of this.snapshot.unassigned.items) {
-      if (item.uri === target) {
+      if (matchesResource(item.uri)) {
         matches.push({ owner: { kind: 'unassigned' }, item: { ...item } });
       }
     }
@@ -594,11 +601,15 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         }
         try {
           await fs.stat(rebased.uri);
-          resolving++;
-          rewrites.set(item.id, rebased.uri.toString());
         } catch {
           missing++;
+          continue;
         }
+        if (findDeepestRoot(rebased.uri, this.roots)?.canonicalUri !== canonicalizeRootUri(recovery.destination.uri)) {
+          throw new RecoveryConflictError('A salvaged bookmark would belong to another workspace root.');
+        }
+        resolving++;
+        rewrites.set(item.id, rebased.uri.toString());
       }
     }
     if (previewRevision !== this.revision) {
@@ -653,12 +664,19 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       for (const item of partition.data.items) {
         const rewrittenUri = pending.rewrites.get(item.id);
         if (rewrittenUri) {
+          const owner = this.resolveAttachedOwnerIn(draft, vscode.Uri.parse(rewrittenUri));
+          if (owner?.kind !== 'partition' || owner.partitionId !== partition.id) {
+            throw new RecoveryConflictError('A salvaged bookmark would belong to another workspace root.');
+          }
           item.uri = rewrittenUri;
         }
       }
       if (pending.rewrites.size > 0) {
         markContentMutation(partition);
       }
+      // The destination may contain the replaced empty partition's mirror. Recovery wins first,
+      // including reattach-only and salvage with no resolving targets.
+      partition.mirror.dirty = true;
       return {
         value: undefined,
         changed: true,
@@ -882,6 +900,9 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     const partition = snapshot.partitions.find((candidate) => candidate.id === owner.partitionId);
     if (!partition || !partition.attachment) {
       throw new PartitionBoundaryError('Detached partitions cannot receive newly created content.');
+    }
+    if (this.unavailableCanonicalRoots.includes(partition.attachment.canonicalRootUri)) {
+      throw new PartitionBoundaryError('Unavailable workspace roots cannot receive new content.');
     }
     return partition;
   }

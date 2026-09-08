@@ -61,6 +61,17 @@ function seededSnapshot(): WorkspacePartitionSnapshot {
 }
 
 suite('workspacePartitionTypes', () => {
+  for (const version of [3, 999, 1.5, 0, -1, NaN, Infinity]) {
+    for (const owner of ['attached', 'detached', 'unassigned']) {
+      test(`rejects unsupported ${owner} content version ${version}`, () => {
+        const snapshot = seededSnapshot();
+        if (owner === 'detached') snapshot.partitions[0].attachment = null;
+        (owner === 'unassigned' ? snapshot.unassigned : snapshot.partitions[0].data).version = version;
+        assert.strictEqual(validateWorkspacePartitionSnapshot(snapshot).ok, false);
+      });
+    }
+  }
+
   test('accepts the empty current snapshot', () => {
     assert.deepStrictEqual(validateWorkspacePartitionSnapshot(emptyWorkspacePartitionSnapshot()), { ok: true });
   });

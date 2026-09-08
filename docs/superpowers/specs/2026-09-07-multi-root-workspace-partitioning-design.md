@@ -146,12 +146,15 @@ Canonicalization:
 1. Parse the value as a URI and reject relative values, non-empty query components, and non-empty
    fragments for workspace-root identity.
 2. Lowercase the scheme and authority.
-3. Normalize percent escapes consistently: decode percent-encoded unreserved octets and uppercase
-   hexadecimal digits in escapes that remain encoded. Encoded path separators remain encoded and
-   never become structural separators.
+3. Compare VS Code's already-decoded path components without decoding them again. Literal percent
+   names such as `%61`, `%7e`, and `%2F` remain literal names, distinct from decoded characters or
+   structural separators. (`src/test/suite/rootUri.test.ts:L116-L143`)
 4. Remove trailing path separators except when the path is the URI root.
 5. Preserve path-component case: normalize only Windows file-URI drive-letter case to survive VS Code URI parse/serialization round trips; all remaining path components retain their case. (`src/test/suite/rootUri.test.ts:L22-L34`; `src/test/suite/workspaceFolders.test.ts:L85-L102`)
-6. Serialize the normalized structural components into the canonical identity string.
+6. Serialize path components with URI-safe escaping, including literal percent, space, `#`, and `?`,
+   while retaining structural separators and the established `file:///c:/...` drive-colon spelling.
+   Parsing the canonical identity and canonicalizing again is idempotent.
+   (`src/test/suite/rootUri.test.ts:L22-L34`; `src/test/suite/rootUri.test.ts:L116-L143`)
 
 Containment compares scheme and authority identity first, then complete path components. Raw string
 prefixes are never used. The deepest containing root is the candidate with the greatest number of
@@ -455,7 +458,7 @@ behavior.
 
 - scheme and authority case;
 - path-component case preservation;
-- percent-escape normalization, including encoded separators;
+- decoded-component identity and URI-safe serialization, including literal percent names and encoded-separator safety (`src/test/suite/rootUri.test.ts:L116-L143`);
 - trailing separators and URI roots;
 - query, fragment, and relative-URI rejection;
 - segment-boundary containment;

@@ -26,21 +26,11 @@ export class InvalidRootUriError extends Error {
   }
 }
 
-const UNRESERVED = /^[A-Za-z0-9._~-]$/;
-
 interface ComparableUri {
   readonly scheme: string;
   readonly authority: string;
   readonly path: string;
   readonly segments: readonly string[];
-}
-
-/** Normalizes percent escapes while preserving encoded path separators. */
-function normalizeEscapes(value: string): string {
-  return value.replace(/%([0-9a-fA-F]{2})/g, (_escape, hex: string) => {
-    const character = String.fromCharCode(Number.parseInt(hex, 16));
-    return UNRESERVED.test(character) ? character : `%${hex.toUpperCase()}`;
-  });
 }
 
 /** Removes trailing separators without changing root or interior path components. */
@@ -55,7 +45,8 @@ function comparable(uri: vscode.Uri): ComparableUri {
   const uriPath = uri.scheme.toLowerCase() === 'file'
     ? uri.path.replace(/^\/[A-Z]:(?=\/|$)/, drive => drive.toLowerCase())
     : uri.path;
-  const path = trimTrailingSeparators(normalizeEscapes(uriPath));
+  // VS Code components are already decoded. A literal %61 directory must never become "a".
+  const path = trimTrailingSeparators(uriPath);
   return {
     scheme: uri.scheme.toLowerCase(),
     authority: uri.authority.toLowerCase(),
@@ -89,12 +80,15 @@ function pathFromSegments(segments: readonly string[]): string {
 
 /**
  * Returns the stable identity of an absolute root URI. Schemes and authorities are
- * case-insensitive; path segments preserve case and normalize safe percent escapes.
+ * case-insensitive; decoded path segments preserve literal names and are safely serialized.
  */
 export function canonicalizeRootUri(uri: vscode.Uri): string {
   assertValidRootUri(uri);
   const value = comparable(uri);
-  return `${value.scheme}://${value.authority}${value.path}`;
+  let path = value.path.split('/').map(encodeURIComponent).join('/');
+  // Preserve the established canonical file-drive spelling without unescaping other colons.
+  if (value.scheme === 'file') path = path.replace(/^\/([a-z])%3A(?=\/|$)/, '/$1:');
+  return `${value.scheme}://${value.authority}${path}`;
 }
 
 /** Returns whether `uri` is the root itself or lies below it on a path-component boundary. */

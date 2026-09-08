@@ -193,6 +193,66 @@ class DeferredFirstWorkspaceUpdateMemento extends FakeMemento {
 }
 
 suite('WorkspaceBookmarkStore content operations', () => {
+  for (const failure of [false, true]) {
+    test(`supported older owner schemas migrate atomically before publishing, persistence failure=${failure}`, async () => {
+      const snapshot = snapshotWithAttachedRoot();
+      snapshot.partitions[0].data.version = 1;
+      snapshot.partitions.push({ ...snapshot.partitions[0], id: '00000000-0000-4000-8000-000000000002', attachment: null,
+        lastKnownRootUri: ROOT_B.toString(), canonicalLastKnownRootUri: ROOT_B.toString(),
+        data: { version: 1, collections: [], items: [] } });
+      snapshot.unassigned.version = 1;
+      const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+      if (failure) state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
+      const loading = WorkspaceBookmarkStore.create({ state, roots: roots(), output: new FakeOutput() });
+      if (failure) {
+        await assert.rejects(loading);
+        assert.deepStrictEqual(state.get(WORKSPACE_PARTITION_STORAGE_KEY), snapshot);
+        assert.strictEqual(state.updateCallCount, 0);
+      } else {
+        const store = await loading;
+        try {
+          assert.strictEqual(state.updateCallCount, 1);
+          const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+          assert.deepStrictEqual(persisted.partitions.map(partition => partition.data.version), [2, 2]);
+          assert.strictEqual(persisted.unassigned.version, 2);
+          assert.deepStrictEqual(persisted.partitions.map(partition => partition.mirror.dirty), [true, true]);
+          assert.strictEqual(store.getView().attached[0].data.version, 2);
+          assert.strictEqual(store.getView().detached[0].data.version, 2);
+        } finally { store.dispose(); }
+      }
+    });
+  }
+
+  test('branch-created unsafe canonical percent metadata remains unavailable without remapping', async () => {
+    const snapshot = snapshotWithAttachedRoot();
+    snapshot.partitions[0].attachment = { rootUri: 'file:///work/%2561', canonicalRootUri: 'file:///work/a' };
+    snapshot.partitions[0].lastKnownRootUri = 'file:///work/%2561';
+    snapshot.partitions[0].canonicalLastKnownRootUri = 'file:///work/a';
+    const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+    const store = await WorkspaceBookmarkStore.create({ state, roots: [], output: new FakeOutput() });
+    try {
+      assert.strictEqual(store.getView().kind, 'unavailable');
+      assert.deepStrictEqual(state.get(WORKSPACE_PARTITION_STORAGE_KEY), snapshot);
+      assert.strictEqual(state.updateCallCount, 0);
+    } finally { store.dispose(); }
+  });
+
+  test('resource lookup safely parses Unassigned URIs without conflating literal percent names or path case', async () => {
+    const snapshot = snapshotWithDetachedAndUnassigned();
+    snapshot.unassigned.items = ['not an absolute URI', 'file:///a/%66ile.ts', 'file:///a/%2566ile.ts', 'file:///a/File.ts', 'file:///a/file.ts?view=1#part']
+      .map((uri, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, uri, type: 'file', collectionId: null, order: index }));
+    const store = await WorkspaceBookmarkStore.create({ state: new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot }),
+      roots: [], output: new FakeOutput() });
+    try {
+      const matches = store.findItemsByUri(vscode.Uri.parse('file:///a/file.ts'));
+      assert.deepStrictEqual(matches.map(match => match.item.id), ['00000000-0000-4000-8000-000000000011']);
+      assert.deepStrictEqual(matches[0].owner, { kind: 'unassigned' });
+      assert.deepStrictEqual(store.findItemsByUri(vscode.Uri.file('/a/%66ile.ts')).map(match => match.item.id), ['00000000-0000-4000-8000-000000000012']);
+      assert.deepStrictEqual(store.findItemsByUri(vscode.Uri.parse('file:///a/File.ts')).map(match => match.item.id), ['00000000-0000-4000-8000-000000000013']);
+      assert.deepStrictEqual(store.findItemsByUri(vscode.Uri.parse('file:///a/file.ts?view=1#part')).map(match => match.item.id), ['00000000-0000-4000-8000-000000000014']);
+    } finally { store.dispose(); }
+  });
+
   test('whenIdle drains operations accepted while an earlier write is pending', async () => {
     const { store, state, ownerA } = await readyStore();
     let releaseFirst!: () => void, releaseSecond!: () => void;

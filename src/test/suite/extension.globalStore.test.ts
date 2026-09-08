@@ -1,12 +1,12 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { activate, deactivate } from '../../extension';
-import { ScopedStores } from '../../commands';
-import { WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
+import { createRemoveHandler, ScopedStores } from '../../commands';
+import { RecoveryConflictError, WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
 import { WorkspaceMirrorCoordinator } from '../../workspaceMirrorCoordinator';
 import { BookmarksTreeDataProvider } from '../../bookmarksTreeDataProvider';
-import { WORKSPACE_PARTITION_STORAGE_KEY } from '../../workspacePartitionTypes';
-import { createFakeExtensionContext, FakeMemento, FakePartitionMirrorResources, FakeOutput } from './fixtures';
+import { WORKSPACE_PARTITION_STORAGE_KEY, WorkspacePartitionSnapshot } from '../../workspacePartitionTypes';
+import { createFakeExtensionContext, FakeMemento, FakeMirror, FakePartitionMirrorResources, FakeOutput } from './fixtures';
 
 /** Real stores/coordinator; only VS Code registrations and filesystem ports are replaced. */
 function activationFixture(names = ['a', 'b'], malformed = false) {
@@ -15,6 +15,7 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
   let folders = names.map((name, index) => ({ name, index, uri: vscode.Uri.parse('file:///' + name) }));
   const output = Object.assign(new FakeOutput(), { dispose() {}, show() {} });
   const resources = new Map<string, FakePartitionMirrorResources>();
+  const files = new Map<string, FakeMirror>();
   let changed: (() => void | Promise<void>) | undefined;
   let stores: ScopedStores<WorkspaceBookmarkStore> | undefined;
   let provider: BookmarksTreeDataProvider | undefined;
@@ -26,7 +27,9 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
     onDidChangeWorkspaceFolders: (listener: () => void | Promise<void>) => { changed = listener; return new vscode.Disposable(() => { changed = undefined; }); },
     createOutputChannel: () => output,
     createMirrorResources: (root: vscode.Uri) => {
-      const value = new FakePartitionMirrorResources(); resources.set(root.toString(), value); return value;
+      const port = files.get(root.toString()) ?? new FakeMirror();
+      files.set(root.toString(), port);
+      const value = new FakePartitionMirrorResources(port); resources.set(root.toString(), value); return value;
     },
     registerCommands: (_context: vscode.ExtensionContext, value: ScopedStores<WorkspaceBookmarkStore>, tree: BookmarksTreeDataProvider, mirrors: WorkspaceMirrorCoordinator) => {
       stores = value; provider = tree; coordinator = mirrors;
@@ -56,6 +59,157 @@ function barrier() {
 }
 
 suite('Extension - partitioned activation (#62)', () => {
+  for (const owner of ['attached', 'detached', 'unassigned']) {
+    test(`unsupported ${owner} content stays untouched with no workspace mirrors and Global available`, async () => {
+      const f = activationFixture(['a']);
+      const snapshot: WorkspacePartitionSnapshot = {
+        version: 1, partitions: [{ id: '00000000-0000-4000-8000-000000000001',
+          attachment: owner === 'detached' ? null : { rootUri: 'file:///a', canonicalRootUri: 'file:///a' },
+          lastKnownRootUri: 'file:///a', canonicalLastKnownRootUri: 'file:///a', replacementEligible: true,
+          data: { version: owner === 'unassigned' ? 2 : 999, collections: [], items: [] }, mirror: { dirty: false } }],
+        unassigned: { version: owner === 'unassigned' ? 999 : 2, collections: [], items: [] }
+      };
+      f.context.workspaceState = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+      try {
+        await f.start();
+        assert.strictEqual(f.stores.workspace.getView().kind, 'unavailable');
+        assert.strictEqual(f.context.workspaceState.updateCallCount, 0);
+        assert.deepStrictEqual(f.context.workspaceState.get(WORKSPACE_PARTITION_STORAGE_KEY), snapshot);
+        assert.strictEqual(f.resources.size, 0);
+        await f.stores.global.addItem({ type: 'file', uri: 'file:///global' });
+        assert.strictEqual(f.stores.global.getAll().items.length, 1);
+      } finally { await f.stop(); }
+    });
+  }
+
+  test('canonical collision suspends existing mirrors and resumes the same partition when unique', async () => {
+    const f = activationFixture(['a']);
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///a/file'))!;
+      await store.addItem(owner, { type: 'file', uri: 'file:///a/file' });
+      await f.coordinator.flushAll();
+      const before = store.getOwnerData(owner);
+      const original = f.resources.get('file:///a')!;
+      await f.change(['a', 'a/']);
+      assert.strictEqual(original.disposed, true);
+      assert.strictEqual(store.getView().attached.length, 1);
+      assert.deepStrictEqual(store.getOwnerData(owner), before);
+      const reads = original.port.readCount, writes = original.port.writeCount;
+      original.change.fire(); original.create.fire(); original.delete.fire();
+      await f.coordinator.reloadPartition(store.getView().attached[0].partitionId);
+      await f.coordinator.flushAll();
+      assert.strictEqual(original.port.readCount, reads);
+      assert.strictEqual(original.port.writeCount, writes);
+      await f.change(['a']);
+      assert.notStrictEqual(f.resources.get('file:///a'), original);
+      assert.strictEqual(f.resources.get('file:///a')!.disposed, false);
+      assert.deepStrictEqual(store.getOwnerData(owner), before);
+      await store.addCollection(owner, 'Available again');
+    } finally { await f.stop(); }
+  });
+
+  test('canonical collision rejects new collections and items without persistence', async () => {
+    const f = activationFixture(['a']);
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///a/file'))!;
+      await f.change(['a', 'a/']);
+      const writes = f.context.workspaceState.updateCallCount;
+      await assert.rejects(store.addCollection(owner, 'Unavailable'));
+      await assert.rejects(store.addItem(owner, { type: 'file', uri: 'file:///a/file' }));
+      assert.strictEqual(f.context.workspaceState.updateCallCount, writes);
+    } finally { await f.stop(); }
+  });
+
+  for (const withGlobal of [false, true]) {
+    test(`resource removal finds encoded-equivalent workspace bookmarks with Global=${withGlobal}`, async () => {
+      const f = activationFixture(['a']);
+      try {
+        await f.start();
+        const uri = vscode.Uri.parse('file:///a/file.ts');
+        const owner = f.stores.workspace.resolveAttachedOwner(uri)!;
+        await f.stores.workspace.addItem(owner, { type: 'file', uri: 'file:///a/%66ile.ts' });
+        if (withGlobal) await f.stores.global.addItem({ type: 'file', uri: uri.toString() });
+        await createRemoveHandler(f.stores)(uri);
+        assert.deepStrictEqual(f.stores.workspace.getOwnerData(owner)!.items, []);
+        assert.strictEqual(f.stores.global.getAll().items.length, withGlobal ? 1 : 0);
+      } finally { await f.stop(); }
+    });
+  }
+
+  test('encoded-equivalent matches across owners prompt once and preserve the unselected and Global copies', async () => {
+    const f = activationFixture(['a']);
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const uri = vscode.Uri.parse('file:///a/child/file.ts');
+      const parent = store.resolveAttachedOwner(uri)!;
+      await store.addItem(parent, { type: 'file', uri: 'file:///a/child/%66ile.ts' });
+      await f.change(['a', 'a/child']);
+      const child = store.resolveAttachedOwner(uri)!;
+      await store.addItem(child, { type: 'file', uri: 'file:///a/child/f%69le.ts' });
+      await f.stores.global.addItem({ type: 'file', uri: uri.toString() });
+      let choices = 0;
+      await createRemoveHandler(f.stores, { showQuickPick: async items => { choices = items.length; return items[1]; } })(uri);
+      assert.strictEqual(choices, 2);
+      assert.strictEqual(store.getOwnerData(parent)!.items.length, 1);
+      assert.strictEqual(store.getOwnerData(child)!.items.length, 0);
+      assert.strictEqual(f.stores.global.getAll().items.length, 1);
+    } finally { await f.stop(); }
+  });
+
+  test('salvage atomically rejects a resolving rewrite owned by an attached nested destination', async () => {
+    const f = activationFixture(['anchor', 'old']);
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///old/file'))!;
+      await store.addItem(owner, { type: 'file', uri: 'file:///old/file' });
+      await store.addItem(owner, { type: 'file', uri: 'file:///old/child/file' });
+      await f.change(['anchor', 'new', 'new/child']);
+      const before = f.context.workspaceState.get(WORKSPACE_PARTITION_STORAGE_KEY);
+      const writes = f.context.workspaceState.updateCallCount;
+      await assert.rejects(store.previewRecovery(store.getView().detached[0].partitionId,
+        { id: 'new', label: 'new', uri: vscode.Uri.parse('file:///new') }, 'salvage',
+        { stat: async () => ({ type: vscode.FileType.File, size: 0, ctime: 0, mtime: 0 }) }), RecoveryConflictError);
+      await f.coordinator.drainAndFlush();
+      assert.deepStrictEqual(f.context.workspaceState.get(WORKSPACE_PARTITION_STORAGE_KEY), before);
+      assert.strictEqual(f.context.workspaceState.updateCallCount, writes);
+      assert.deepStrictEqual(JSON.parse(f.resources.get('file:///new')!.port.content!).items, []);
+      assert.deepStrictEqual(store.getOwnerData(owner)!.items.map(item => item.uri), ['file:///old/file', 'file:///old/child/file']);
+    } finally { await f.stop(); }
+  });
+
+  for (const mode of ['reattach-only', 'salvage'] as const) {
+    test(`${mode} recovery overwrites the persistent empty destination mirror even without URI rewrites`, async () => {
+      const f = activationFixture(['anchor', 'old']);
+      try {
+        await f.start();
+        const store = f.stores.workspace;
+        const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///old/file'))!;
+        const collection = await store.addCollection(owner, 'Preserved');
+        await store.addItem(owner, { type: 'file', uri: 'file:///old/file', collectionId: collection.id });
+        await f.coordinator.flushAll();
+        const before = store.getOwnerData(owner);
+        await f.change(['anchor', 'new']);
+        const replacement = f.resources.get('file:///new')!;
+        assert.deepStrictEqual(JSON.parse(replacement.port.content!).items, []);
+        const preview = await store.previewRecovery(store.getView().detached[0].partitionId,
+          { id: 'new', label: 'new', uri: vscode.Uri.parse('file:///new') }, mode,
+          { stat: async () => { throw new Error('missing'); } });
+        await store.commitRecovery(preview.token);
+        await f.coordinator.reconcileBindings();
+        assert.strictEqual(replacement.disposed, true);
+        assert.strictEqual(f.resources.get('file:///new')!.port, replacement.port, 'filesystem content survives watcher recreation');
+        assert.deepStrictEqual(store.getOwnerData(owner), before);
+        assert.deepStrictEqual(JSON.parse(replacement.port.content!), before);
+      } finally { await f.stop(); }
+    });
+  }
+
   test('folder changes during migration are reconciled before activation completes', async () => {
     const f = activationFixture(['a']);
     const gate = barrier();
