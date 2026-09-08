@@ -81,16 +81,15 @@ suite('workspaceFolders.isInsideWorkspace', () => {
   // difference behavior, independent of whatever normalization
   // Uri.file() may or may not already do.
   //
-  // Root identity is structural and preserves path case on every host. Case-only changes must not
-  // accidentally select a root, including for drive-letter-shaped paths.
-  test('a descendant differing only in drive-letter casing is outside', () => {
+  // File drive letters follow VS Code serialization; remaining path components preserve case.
+  test('a descendant differing only in file drive-letter casing is inside', () => {
     const root = vscode.Uri.from({ scheme: 'file', authority: '', path: '/c:/Users/dev/project' });
     const descendant = vscode.Uri.from({
       scheme: 'file',
       authority: '',
       path: '/C:/Users/dev/project/src/file.ts'
     });
-    assert.strictEqual(isInsideWorkspace(descendant, [folder(root)]), false);
+    assert.strictEqual(isInsideWorkspace(descendant, [folder(root)]), true);
   });
 
   test('a descendant differing in a non-drive path segment\'s casing is outside', () => {

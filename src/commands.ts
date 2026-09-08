@@ -96,8 +96,8 @@ export function registerRecoveryCommand(context: vscode.ExtensionContext, deps: 
   context.subscriptions.push(vscode.commands.registerCommand('bookmarks.recoverPartition', createRecoverPartitionHandler(deps)));
 }
 
-/** Legacy workspace support lasts only until activation is migrated in Task 9. */
-export interface ScopedStores<W extends BookmarkStore | WorkspaceBookmarkStore = BookmarkStore | WorkspaceBookmarkStore> {
+/** Workspace commands always receive a partition store; Global remains independent. */
+export interface ScopedStores<W extends WorkspaceBookmarkStore = WorkspaceBookmarkStore> {
   workspace: W;
   global: BookmarkStore;
 }
@@ -110,7 +110,6 @@ type ContentCommands = Pick<BookmarkStore, 'getAll' | 'removeItem' | 'renameColl
 function storeForNode(stores: ScopedStores, node: Extract<BookmarkNode, { kind: 'item' | 'collection' }>): ContentCommands | undefined {
   if (node.scope === 'global') return stores.global;
   const store = stores.workspace;
-  if (!(store instanceof WorkspaceBookmarkStore)) return store;
   const owner = node.owner;
   if (!owner || !store.getOwnerData(owner)) return undefined;
   return {
@@ -193,7 +192,7 @@ export function createAddFolderHandler(
  * a `ScopedStores` bag.
  */
 export function createPromoteSuggestionHandler(
-  store: CommandStore,
+  store: WorkspaceBookmarkStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
@@ -212,7 +211,7 @@ export function createPromoteSuggestionHandler(
  * node kind) is correctly ignored by this handler.
  */
 export function createPromoteRecentItemHandler(
-  store: CommandStore,
+  store: WorkspaceBookmarkStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
@@ -230,7 +229,7 @@ export function createPromoteRecentItemHandler(
  * workspace match exists; canceling an owner selection must never remove the Global copy.
  */
 async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri, prompter: Pick<Prompter, 'showQuickPick'>): Promise<void> {
-  if (stores.workspace instanceof WorkspaceBookmarkStore) {
+  {
     const matches = stores.workspace.findItemsByUri(uri);
     const owners = [...new Map(matches.map(match => [ownerKey(match.owner), match.owner])).values()];
     if (owners.length > 0) {
@@ -249,9 +248,7 @@ async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri, prompt
     }
   }
   const targetKey = decorationUriKey(uri);
-  const legacyStores = stores.workspace instanceof WorkspaceBookmarkStore
-    ? [stores.global] : [stores.workspace, stores.global];
-  for (const store of legacyStores) {
+  for (const store of [stores.global]) {
     const match = store.getAll().items.find((item) => {
       try {
         return decorationUriKey(vscode.Uri.parse(item.uri, true)) === targetKey;
@@ -465,7 +462,7 @@ export function createMoveToCollectionHandler(
     if (pick === undefined) {
       return;
     }
-    if (node.scope === 'workspace' && stores.workspace instanceof WorkspaceBookmarkStore
+    if (node.scope === 'workspace'
       && ((pick.owner && ownerKey(pick.owner) !== ownerKey(node.owner!))
         || (pick.id !== null && !data.collections.some(collection => collection.id === pick.id)))) {
       await prompter.showInfo('Bookmarks cannot be moved between workspace roots.');
@@ -553,14 +550,14 @@ export function registerAddCommands(
 
 export function registerAddToWorkspaceCommand(
   context: vscode.ExtensionContext,
-  workspaceStore: BookmarkStore
+  flushMirrors: () => Promise<void>
 ): void {
   const deps: AddToWorkspaceDeps = {
     prompter: createPrompter(),
     getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
     updateWorkspaceFolders: (start, deleteCount, ...foldersToAdd) =>
       vscode.workspace.updateWorkspaceFolders(start, deleteCount, ...foldersToAdd),
-    flushMirrorWrites: () => workspaceStore.flushMirrorWrites()
+    flushMirrorWrites: flushMirrors
   };
   context.subscriptions.push(
     vscode.commands.registerCommand(

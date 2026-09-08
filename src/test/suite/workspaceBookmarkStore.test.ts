@@ -50,6 +50,25 @@ async function readyStore() {
   };
 }
 
+suite('WorkspaceBookmarkStore - move position regression (#62)', () => {
+  test('moving within one collection preserves the requested insertion position', async () => {
+    const { store, ownerA } = await readyStore();
+    const collection = await store.addCollection(ownerA, 'Collection');
+    const first = await store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/first', collectionId: collection.id });
+    const second = await store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/second', collectionId: collection.id });
+    const third = await store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/third', collectionId: collection.id });
+    await store.moveItem(ownerA, third.id, collection.id, 0);
+    assert.deepStrictEqual(store.getOwnerData(ownerA)!.items.slice().sort((a, b) => a.order - b.order).map(item => item.id),
+      [third.id, first.id, second.id]);
+    await store.moveItem(ownerA, third.id, null, 0);
+    assert.deepStrictEqual(store.getOwnerData(ownerA)!.items.filter(item => item.collectionId === collection.id).map(item => item.order), [0, 1]);
+    const before = store.getAll();
+    await store.moveItem(ownerA, 'missing', collection.id, 0);
+    assert.deepStrictEqual(store.getAll(), before);
+    store.dispose();
+  });
+});
+
 function snapshotWithDetachedAndUnassigned(): WorkspacePartitionSnapshot {
   return {
     version: 1,

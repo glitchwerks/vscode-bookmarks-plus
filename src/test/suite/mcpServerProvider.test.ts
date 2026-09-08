@@ -48,7 +48,7 @@ suite('MCP server definitions (#126)', () => {
     assert.match(output.lines[0], /no workspace folder/i);
   });
 
-  test('a multi-root window publishes no server instead of choosing the first folder', () => {
+  test('a multi-root window publishes one explicitly rooted server per attached folder', () => {
     const output = new FakeOutput();
 
     const definitions = buildMcpServerDefinitions(
@@ -61,10 +61,26 @@ suite('MCP server definitions (#126)', () => {
       output
     );
 
-    assert.deepStrictEqual(definitions, []);
-    assert.strictEqual(output.lines.length, 1);
-    assert.match(output.lines[0], /native MCP server is unavailable/i);
-    assert.match(output.lines[0], /multiple workspace folders/i);
+    assert.strictEqual(definitions.length, 2);
+    assert.deepStrictEqual(definitions.map(definition => definition.args[1]), [
+      vscode.Uri.file('/workspaces/first').fsPath,
+      vscode.Uri.file('/workspaces/second').fsPath
+    ]);
+    assert.deepStrictEqual(definitions.map(definition => definition.label), [
+      'Bookmarks Plus (first)', 'Bookmarks Plus (second)'
+    ]);
+  });
+
+  test('duplicate display names use canonical root URI labels independent of folder order', () => {
+    const roots = [
+      { name: 'Shared', uri: vscode.Uri.parse('file:///alpha/shared') },
+      { name: 'Shared', uri: vscode.Uri.parse('file:///beta/shared') }
+    ];
+    const build = (values: typeof roots) => buildMcpServerDefinitions(values,
+      vscode.Uri.file('/extension'), '1.3.0', new FakeOutput());
+    const labels = ['Bookmarks Plus (Shared — file:///alpha/shared)', 'Bookmarks Plus (Shared — file:///beta/shared)'];
+    assert.deepStrictEqual(build(roots).map(value => value.label), labels);
+    assert.deepStrictEqual(build([...roots].reverse()).map(value => value.label), [...labels].reverse());
   });
 
   test('registration publishes definitions, refreshes on workspace changes, and owns its resources', async () => {
@@ -80,7 +96,7 @@ suite('MCP server definitions (#126)', () => {
     let listenerDisposeCount = 0;
 
     const registered = registerBookmarksMcpProvider(subscriptions, {
-      getWorkspaceFolders: () => folders,
+      getAttachedRoots: () => folders,
       extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
       extensionVersion: '1.3.0',
       output,
@@ -89,7 +105,7 @@ suite('MCP server definitions (#126)', () => {
         registeredProvider = provider;
         return new vscode.Disposable(() => providerDisposeCount++);
       },
-      onDidChangeWorkspaceFolders: (listener: () => void) => {
+      onDidChangePartitions: (listener: () => void) => {
         workspaceListener = listener;
         return new vscode.Disposable(() => listenerDisposeCount++);
       }
@@ -125,8 +141,7 @@ suite('MCP server definitions (#126)', () => {
     const multiRootDefinitions = await registeredProvider.provideMcpServerDefinitions(
       {} as vscode.CancellationToken
     );
-    assert.deepStrictEqual(multiRootDefinitions, []);
-    assert.match(output.lines[1], /multiple workspace folders/i);
+    assert.strictEqual(multiRootDefinitions?.length, 2);
 
     folders = [{ uri: vscode.Uri.file('/workspaces/reopened') }];
     workspaceListener();
@@ -155,12 +170,12 @@ suite('MCP server definitions (#126)', () => {
     let registered: vscode.McpServerDefinitionProvider | undefined;
     assert.doesNotThrow(() => {
       registered = registerBookmarksMcpProvider(subscriptions, {
-        getWorkspaceFolders: () => [{ uri: vscode.Uri.file('/workspaces/project') }],
+        getAttachedRoots: () => [{ uri: vscode.Uri.file('/workspaces/project') }],
         extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
         extensionVersion: '1.3.0',
         output,
         registerProvider: () => new vscode.Disposable(() => providerDisposeCount++),
-        onDidChangeWorkspaceFolders: () => {
+        onDidChangePartitions: () => {
           throw new Error('simulated workspace-listener failure');
         }
       });
@@ -189,8 +204,8 @@ suite('MCP server definitions (#126)', () => {
 
     try {
       try {
-        activate(context as unknown as vscode.ExtensionContext, {
-          getWorkspaceFolders: () => [{ uri: workspaceUri }],
+        await activate(context as unknown as vscode.ExtensionContext, {
+          getWorkspaceFolders: () => [{ uri: workspaceUri, name: 'activation-project', index: 0 }],
           registerProvider: (id: string, provider: vscode.McpServerDefinitionProvider) => {
             registeredId = id;
             registeredProvider = provider;

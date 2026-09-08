@@ -1,3 +1,4 @@
+import { createSingleRootFixtureStore, SINGLE_ROOT_OWNER, SingleRootFixtureStore } from './singleRootFixture';
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import * as fs from 'fs';
@@ -23,7 +24,6 @@ import {
   OPEN_IN_NEW_WINDOW_LABEL,
   Prompter,
   RevealDeps,
-  ScopedStores,
   createNewCollectionHandler,
   createRenameCollectionHandler,
   createDeleteCollectionHandler,
@@ -558,9 +558,9 @@ function makePrompter(overrides: Partial<Prompter> = {}): Prompter {
  * supplied gets a fresh, empty BookmarkStore backed by its own FakeMemento — never shared with
  * the other scope, so "the other store is untouched" assertions are meaningful.
  */
-function makeScopedStores(overrides: Partial<ScopedStores<BookmarkStore>> = {}): ScopedStores<BookmarkStore> {
+async function makeScopedStores(overrides: Partial<{ workspace: SingleRootFixtureStore; global: BookmarkStore }> = {}): Promise<{ workspace: SingleRootFixtureStore; global: BookmarkStore }> {
   return {
-    workspace: overrides.workspace ?? new BookmarkStore(new FakeMemento()),
+    workspace: overrides.workspace ?? await createSingleRootFixtureStore(),
     global: overrides.global ?? new BookmarkStore(new FakeMemento())
   };
 }
@@ -570,7 +570,7 @@ interface StoreSnapshot {
   updateCallCount: number;
 }
 
-function snapshotStore(store: BookmarkStore, memento: FakeMemento): StoreSnapshot {
+function snapshotStore(store: Pick<BookmarkStore, 'getAll'>, memento: FakeMemento): StoreSnapshot {
   // Deep-copy via JSON round-trip (BookmarkData is plain primitives/arrays) so this snapshot is
   // immune to `getAll()` returning the store's live internal object by reference — otherwise a
   // later `assertUntouched` deep-equal would tautologically compare the mutated object to itself.
@@ -585,7 +585,7 @@ function snapshotStore(store: BookmarkStore, memento: FakeMemento): StoreSnapsho
  * snapshot) and the fact that no write was even attempted (Memento.update call count unchanged).
  */
 function assertUntouched(
-  store: BookmarkStore,
+  store: Pick<BookmarkStore, 'getAll'>,
   memento: FakeMemento,
   before: StoreSnapshot,
   label: string
@@ -600,7 +600,7 @@ function assertUntouched(
 
 suite('commands - addFile / addFolder / remove / reveal', () => {
   test('addFile handler adds a root-level file bookmark for the given uri', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = vscode.Uri.file('/workspace/a.txt');
     await createAddFileHandler(store, makePrompter())(uri);
 
@@ -611,7 +611,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 
   test('addFolder handler adds a root-level folder bookmark for the given uri', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = vscode.Uri.file('/workspace/dir');
     await createAddFolderHandler(store, makePrompter())(uri);
 
@@ -621,7 +621,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 
   test('addFile handler notifies exactly once for a duplicate and not for a normal add', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = vscode.Uri.file('/workspace/a.txt');
     const messages: string[] = [];
     const prompter = makePrompter({
@@ -642,7 +642,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 
   test('addFolder handler notifies exactly once for a duplicate and not for a normal add', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = vscode.Uri.file('/workspace/dir');
     const messages: string[] = [];
     const prompter = makePrompter({
@@ -663,7 +663,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   });
 
   test('remove handler deletes the targeted item and ignores non-item nodes', async () => {
-    const stores = makeScopedStores();
+    const stores = await makeScopedStores();
     const item = await stores.workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
     const handler = createRemoveHandler(stores);
 
@@ -671,21 +671,21 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
     await handler(nonItemNode);
     assert.strictEqual(stores.workspace.getAll().items.length, 1, 'non-item nodes must be a no-op');
 
-    await handler({ kind: 'item', item, scope: 'workspace' });
+    await handler({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(stores.workspace.getAll().items.length, 0);
   });
 
   test('remove handler on a workspace-scoped node removes only from the workspace store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
     const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
     const globalBefore = snapshotStore(global, globalMemento);
-    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+    const handler = createRemoveHandler(await makeScopedStores({ workspace, global }));
 
-    await handler({ kind: 'item', item: workspaceItem, scope: 'workspace' });
+    await handler({ kind: 'item', item: workspaceItem, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(workspace.getAll().items.length, 0, 'the workspace item must be removed');
     assertUntouched(global, globalMemento, globalBefore, 'global');
@@ -695,12 +695,12 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
   test('remove handler on a global-scoped node removes only from the global store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
     const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
-    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+    const handler = createRemoveHandler(await makeScopedStores({ workspace, global }));
 
     await handler({ kind: 'item', item: globalItem, scope: 'global' });
 
@@ -730,7 +730,7 @@ suite('commands - addFile / addFolder / remove / reveal', () => {
 // deliberately not asserted here.
 suite('commands - remove (resource URI from Explorer/editor context, #114)', () => {
   test('removes the matching bookmark when invoked with a workspace-bookmarked resource Uri', async () => {
-    const stores = makeScopedStores();
+    const stores = await makeScopedStores();
     const uri = vscode.Uri.file('/workspace/a.txt');
     await stores.workspace.addItem({ type: 'file', uri: uri.toString() });
     const handler = createRemoveHandler(stores);
@@ -743,12 +743,12 @@ suite('commands - remove (resource URI from Explorer/editor context, #114)', () 
   test('removes only the global bookmark when the resource is bookmarked globally; workspace store untouched', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const uri = vscode.Uri.file('/global/a.txt');
     await global.addItem({ type: 'file', uri: uri.toString() });
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
-    const handler = createRemoveHandler(makeScopedStores({ workspace, global }));
+    const handler = createRemoveHandler(await makeScopedStores({ workspace, global }));
 
     await handler(uri);
 
@@ -757,7 +757,7 @@ suite('commands - remove (resource URI from Explorer/editor context, #114)', () 
   });
 
   test('is a no-op and does not throw when the given resource Uri is not bookmarked in any scope', async () => {
-    const stores = makeScopedStores();
+    const stores = await makeScopedStores();
     const uri = vscode.Uri.file('/workspace/not-bookmarked.txt');
     const handler = createRemoveHandler(stores);
 
@@ -768,7 +768,7 @@ suite('commands - remove (resource URI from Explorer/editor context, #114)', () 
   });
 
   test('removes a folder bookmark matching the given resource Uri, leaving unrelated items untouched', async () => {
-    const stores = makeScopedStores();
+    const stores = await makeScopedStores();
     const targetUri = vscode.Uri.file('/workspace/dir');
     const otherUri = vscode.Uri.file('/workspace/other.txt');
     await stores.workspace.addItem({ type: 'folder', uri: targetUri.toString() });
@@ -818,7 +818,7 @@ suite('commands - registerAddCommands (workspace + global)', () => {
     await withIsolatedCommandRegistry(async () => {
       const workspaceMemento = new FakeMemento();
       const globalMemento = new FakeMemento();
-      const workspace = new BookmarkStore(workspaceMemento);
+      const workspace = await createSingleRootFixtureStore(workspaceMemento);
       const global = new BookmarkStore(globalMemento);
       const workspaceBefore = snapshotStore(workspace, workspaceMemento);
       const subscriptions: vscode.Disposable[] = [];
@@ -843,7 +843,7 @@ suite('commands - registerAddCommands (workspace + global)', () => {
     await withIsolatedCommandRegistry(async () => {
       const workspaceMemento = new FakeMemento();
       const globalMemento = new FakeMemento();
-      const workspace = new BookmarkStore(workspaceMemento);
+      const workspace = await createSingleRootFixtureStore(workspaceMemento);
       const global = new BookmarkStore(globalMemento);
       const workspaceBefore = snapshotStore(workspace, workspaceMemento);
       const subscriptions: vscode.Disposable[] = [];
@@ -868,7 +868,7 @@ suite('commands - registerAddCommands (workspace + global)', () => {
     await withIsolatedCommandRegistry(async () => {
       const workspaceMemento = new FakeMemento();
       const globalMemento = new FakeMemento();
-      const workspace = new BookmarkStore(workspaceMemento);
+      const workspace = await createSingleRootFixtureStore(workspaceMemento);
       const global = new BookmarkStore(globalMemento);
       const globalBefore = snapshotStore(global, globalMemento);
       const subscriptions: vscode.Disposable[] = [];
@@ -893,7 +893,7 @@ suite('commands - registerAddCommands (workspace + global)', () => {
     await withIsolatedCommandRegistry(async () => {
       const workspaceMemento = new FakeMemento();
       const globalMemento = new FakeMemento();
-      const workspace = new BookmarkStore(workspaceMemento);
+      const workspace = await createSingleRootFixtureStore(workspaceMemento);
       const global = new BookmarkStore(globalMemento);
       const globalBefore = snapshotStore(global, globalMemento);
       const subscriptions: vscode.Disposable[] = [];
@@ -917,7 +917,7 @@ suite('commands - registerAddCommands (workspace + global)', () => {
 
 suite('commands - collections', () => {
   test('newCollection handler creates a collection with the prompted name', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const prompter = makePrompter({ showInputBox: async () => 'Work' });
 
     await createNewCollectionHandler(store, prompter)();
@@ -928,7 +928,7 @@ suite('commands - collections', () => {
   });
 
   test('newCollection handler does nothing when the prompt is cancelled', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await createNewCollectionHandler(store, makePrompter())();
     assert.strictEqual(store.getAll().collections.length, 0);
   });
@@ -941,7 +941,7 @@ suite('commands - collections', () => {
   test('createNewCollectionHandler bound to the global store creates a collection in the global store only, workspace store untouched', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
     const prompter = makePrompter({ showInputBox: async () => 'My Global Collection' });
@@ -955,34 +955,34 @@ suite('commands - collections', () => {
   });
 
   test('renameCollection handler renames the targeted collection', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const prompter = makePrompter({ showInputBox: async () => 'Work Stuff' });
 
-    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createRenameCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'collection',
       collection,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work Stuff');
   });
 
   test('renameCollection handler does nothing when the prompt is cancelled', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
 
-    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), makePrompter())({
+    await createRenameCollectionHandler(await makeScopedStores({ workspace: store }), makePrompter())({
       kind: 'collection',
       collection,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().collections[0].name, 'Work', 'cancelled prompt must not rename');
   });
 
   test('renameCollection handler ignores non-collection nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     let inputBoxCalled = false;
     const prompter = makePrompter({
@@ -992,10 +992,10 @@ suite('commands - collections', () => {
       }
     });
 
-    await createRenameCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createRenameCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
     assert.strictEqual(store.getAll().collections.length, 0);
     assert.strictEqual(inputBoxCalled, false, 'must not prompt for a non-collection node');
@@ -1004,17 +1004,17 @@ suite('commands - collections', () => {
   test('renameCollection handler on a workspace-scoped node renames only in the workspace store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceCollection = await workspace.addCollection('Work');
     await global.addCollection('Work'); // deliberately colliding name, distinct store
     const globalBefore = snapshotStore(global, globalMemento);
     const prompter = makePrompter({ showInputBox: async () => 'Work Stuff' });
 
-    await createRenameCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createRenameCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'collection',
       collection: workspaceCollection,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(workspace.getAll().collections[0].name, 'Work Stuff');
@@ -1024,14 +1024,14 @@ suite('commands - collections', () => {
   test('renameCollection handler on a global-scoped node renames only in the global store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     await workspace.addCollection('Work'); // deliberately colliding name, distinct store
     const globalCollection = await global.addCollection('Work');
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
     const prompter = makePrompter({ showInputBox: async () => 'Personal' });
 
-    await createRenameCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createRenameCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'collection',
       collection: globalCollection,
       scope: 'global'
@@ -1042,15 +1042,15 @@ suite('commands - collections', () => {
   });
 
   test('deleteCollection handler does nothing when the confirmation is declined', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const declining = makePrompter({ showWarningConfirm: async () => false });
 
-    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), declining)({
+    await createDeleteCollectionHandler(await makeScopedStores({ workspace: store }), declining)({
       kind: 'collection',
       collection,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().collections.length, 1, 'declined confirmation must not delete');
@@ -1058,15 +1058,15 @@ suite('commands - collections', () => {
   });
 
   test('deleteCollection handler deletes the collection and ungroups its items after confirmation', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const confirming = makePrompter({ showWarningConfirm: async () => true });
 
-    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), confirming)({
+    await createDeleteCollectionHandler(await makeScopedStores({ workspace: store }), confirming)({
       kind: 'collection',
       collection,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     const data = store.getAll();
@@ -1079,7 +1079,7 @@ suite('commands - collections', () => {
   });
 
   test('deleteCollection handler ignores non-collection nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     let warningConfirmCalled = false;
     const confirming = makePrompter({
@@ -1089,10 +1089,10 @@ suite('commands - collections', () => {
       }
     });
 
-    await createDeleteCollectionHandler(makeScopedStores({ workspace: store }), confirming)({
+    await createDeleteCollectionHandler(await makeScopedStores({ workspace: store }), confirming)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().items.length, 1, 'non-collection nodes must be a no-op');
@@ -1106,7 +1106,7 @@ suite('commands - collections', () => {
   test('deleteCollection handler on a global-scoped node deletes only in the global store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceCollection = await workspace.addCollection('Notes'); // untouched control
     const globalCollection = await global.addCollection('Notes');
@@ -1118,7 +1118,7 @@ suite('commands - collections', () => {
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
     const confirming = makePrompter({ showWarningConfirm: async () => true });
 
-    await createDeleteCollectionHandler(makeScopedStores({ workspace, global }), confirming)({
+    await createDeleteCollectionHandler(await makeScopedStores({ workspace, global }), confirming)({
       kind: 'collection',
       collection: globalCollection,
       scope: 'global'
@@ -1141,7 +1141,7 @@ suite('commands - collections', () => {
     async () => {
       const workspaceMemento = new FakeMemento();
       const globalMemento = new FakeMemento();
-      const workspace = new BookmarkStore(workspaceMemento);
+      const workspace = await createSingleRootFixtureStore(workspaceMemento);
       const global = new BookmarkStore(globalMemento);
       // Same uri and collection name in both scopes (D6: same URI is allowed once per scope) —
       // this must not fool the handler into ungrouping across scopes.
@@ -1153,7 +1153,7 @@ suite('commands - collections', () => {
       const workspaceBefore = snapshotStore(workspace, workspaceMemento);
       const confirming = makePrompter({ showWarningConfirm: async () => true });
 
-      await createDeleteCollectionHandler(makeScopedStores({ workspace, global }), confirming)({
+      await createDeleteCollectionHandler(await makeScopedStores({ workspace, global }), confirming)({
         kind: 'collection',
         collection: globalCollection,
         scope: 'global'
@@ -1177,24 +1177,24 @@ suite('commands - collections', () => {
   );
 
   test('moveToCollection handler moves the item into the chosen collection', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const prompter = makePrompter({
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, collection.id);
   });
 
   test('moveToCollection handler reports a duplicate and leaves the item in its collection', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const uri = 'file:///a.txt';
     const item = await store.addItem({ type: 'file', uri });
@@ -1208,10 +1208,10 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.deepStrictEqual(messages, ['This item is already bookmarked.']);
@@ -1222,7 +1222,7 @@ suite('commands - collections', () => {
   });
 
   test('moveToCollection handler distinguishes collections with duplicate names by id', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await store.addCollection('Work');
     const secondCollection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
@@ -1234,10 +1234,10 @@ suite('commands - collections', () => {
         )
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(
@@ -1247,7 +1247,7 @@ suite('commands - collections', () => {
   });
 
   test('moveToCollection handler offers "Ungrouped" and moving to it clears collectionId', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     const prompter = makePrompter({
@@ -1255,28 +1255,28 @@ suite('commands - collections', () => {
         items.find((quickPickItem) => quickPickItem.label === 'Ungrouped')
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
 
   test('moveToCollection handler does nothing when the pick is cancelled', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), makePrompter())({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), makePrompter())({
       kind: 'item',
       item,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
     assert.strictEqual(store.getAll().items.find((i) => i.id === item.id)!.collectionId, null);
   });
 
   test('moveToCollection handler ignores non-item nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await store.addCollection('Work');
     const nonItemNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
     let quickPickCalled = false;
@@ -1287,7 +1287,7 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace: store }), prompter)(nonItemNode);
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace: store }), prompter)(nonItemNode);
 
     assert.strictEqual(quickPickCalled, false, 'must not prompt when there is no item to move');
   });
@@ -1295,7 +1295,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler offers only global collections (and Ungrouped) for a global-scoped node', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     // Deliberately colliding label so a label-based assertion could pass vacuously; the id set
     // is the only thing that actually proves scope isolation.
@@ -1311,7 +1311,7 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: globalItem,
       scope: 'global'
@@ -1327,7 +1327,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler offers only workspace collections (and Ungrouped) for a workspace-scoped node', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceCollection = await workspace.addCollection('Shared Name');
     await global.addCollection('Shared Name'); // deliberately colliding label, distinct store
@@ -1340,10 +1340,10 @@ suite('commands - collections', () => {
       }
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: workspaceItem,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.deepStrictEqual(
@@ -1356,7 +1356,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler computes the sibling count from the target scope store, not the other scope', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
 
     // The workspace collection of the same name has a different sibling count (3) than the
@@ -1374,7 +1374,7 @@ suite('commands - collections', () => {
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Personal')
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: globalItemToMove,
       scope: 'global'
@@ -1392,7 +1392,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler on a workspace-scoped node leaves the global store untouched', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceCollection = await workspace.addCollection('Work');
     const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
@@ -1402,10 +1402,10 @@ suite('commands - collections', () => {
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: workspaceItem,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(
@@ -1418,7 +1418,7 @@ suite('commands - collections', () => {
   test('moveToCollection handler on a global-scoped node leaves the workspace store untouched', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     await workspace.addCollection('Work'); // deliberately colliding name, distinct store
     const globalCollection = await global.addCollection('Work');
@@ -1428,7 +1428,7 @@ suite('commands - collections', () => {
       showQuickPick: async (items) => items.find((quickPickItem) => quickPickItem.label === 'Work')
     });
 
-    await createMoveToCollectionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createMoveToCollectionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: globalItem,
       scope: 'global'
@@ -1505,7 +1505,7 @@ async function withIsolatedCommandRegistry<T>(run: () => Promise<T>): Promise<T>
 suite('commands - view (toggleGroupByRepo / refresh)', () => {
   test('toggleGroupByRepo flips between default and byRepo', async () => {
     await withIsolatedCommandRegistry(async () => {
-      const store = new BookmarkStore(new FakeMemento());
+      const store = await createSingleRootFixtureStore();
       const cache = new FsGitCache(async () => ({ exists: true }));
       const provider = new BookmarksTreeDataProvider(store, cache);
       const subscriptions: vscode.Disposable[] = [];
@@ -1526,7 +1526,7 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
   test('refresh invalidates the cache so the next render re-resolves', async () => {
     await withIsolatedCommandRegistry(async () => {
       let resolveCalls = 0;
-      const store = new BookmarkStore(new FakeMemento());
+      const store = await createSingleRootFixtureStore();
       const cache = new FsGitCache(async () => {
         resolveCalls++;
         return { exists: true };
@@ -1537,11 +1537,11 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
 
       try {
         const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
         assert.strictEqual(resolveCalls, 1);
 
         await vscode.commands.executeCommand('bookmarks.refresh');
-        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+        await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
         assert.strictEqual(resolveCalls, 2);
       } finally {
         subscriptions.forEach((d) => d.dispose());
@@ -1559,7 +1559,7 @@ suite('commands - view (toggleGroupByRepo / refresh)', () => {
 suite('commands - view (toggleShowFullPath) (#115)', () => {
   test('toggleShowFullPath flips the full-path display flag, mirroring toggleGroupByRepo', async () => {
     await withIsolatedCommandRegistry(async () => {
-      const store = new BookmarkStore(new FakeMemento());
+      const store = await createSingleRootFixtureStore();
       const cache = new FsGitCache(async () => ({ exists: true }));
       const provider = new BookmarksTreeDataProvider(store, cache);
       const subscriptions: vscode.Disposable[] = [];
@@ -1579,7 +1579,7 @@ suite('commands - view (toggleShowFullPath) (#115)', () => {
 
   test('toggleShowFullPath triggers a tree refresh (onDidChangeTreeData), same as toggleGroupByRepo', async () => {
     await withIsolatedCommandRegistry(async () => {
-      const store = new BookmarkStore(new FakeMemento());
+      const store = await createSingleRootFixtureStore();
       const cache = new FsGitCache(async () => ({ exists: true }));
       const provider = new BookmarksTreeDataProvider(store, cache);
       const subscriptions: vscode.Disposable[] = [];
@@ -1601,24 +1601,24 @@ suite('commands - view (toggleShowFullPath) (#115)', () => {
 
 suite('commands - setDescription', () => {
   function itemNode(item: BookmarkItem): BookmarkNode {
-    return { kind: 'item', item, scope: 'workspace' };
+    return { kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
   }
 
   test('is a no-op when invoked without a tree node', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const prompter = new FakePrompter({ inputBoxResult: 'unused' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)();
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)();
 
     assert.strictEqual(prompter.inputBoxCallCount, 0);
   });
 
   test('sets a description on an item', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const prompter = new FakePrompter({ inputBoxResult: 'the entrypoint' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)(
       itemNode(store.getAll().items[0])
     );
 
@@ -1626,12 +1626,12 @@ suite('commands - setDescription', () => {
   });
 
   test('pre-fills the input box with the current description', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: 'updated' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)(
       itemNode(store.getAll().items[0])
     );
 
@@ -1639,12 +1639,12 @@ suite('commands - setDescription', () => {
   });
 
   test('submitting an empty input box clears the description', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: '' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)(
       itemNode(store.getAll().items[0])
     );
 
@@ -1652,12 +1652,12 @@ suite('commands - setDescription', () => {
   });
 
   test('dismissing the input box leaves the description unchanged', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.setItemDescription(item.id, 'existing');
     const prompter = new FakePrompter({ inputBoxResult: undefined });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)(
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)(
       itemNode(store.getAll().items[0])
     );
 
@@ -1665,24 +1665,24 @@ suite('commands - setDescription', () => {
   });
 
   test('sets a description on a collection', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await store.addCollection('Work');
     const prompter = new FakePrompter({ inputBoxResult: 'work-related bookmarks' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'collection',
       collection: store.getAll().collections[0],
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(store.getAll().collections[0].description, 'work-related bookmarks');
   });
 
   test('is a no-op on a repoGroup node', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const prompter = new FakePrompter({ inputBoxResult: 'nope' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace: store }), prompter)({
+    await createSetDescriptionHandler(await makeScopedStores({ workspace: store }), prompter)({
       kind: 'repoGroup',
       label: 'repo-a',
       repoKey: 'repo:repo-a'
@@ -1694,13 +1694,13 @@ suite('commands - setDescription', () => {
   test('sets a description on a global-scoped item without touching the workspace store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const globalItem = await global.addItem({ type: 'file', uri: 'file:///global-item.txt' });
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
     const prompter = new FakePrompter({ inputBoxResult: 'always available' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createSetDescriptionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: globalItem,
       scope: 'global'
@@ -1713,14 +1713,14 @@ suite('commands - setDescription', () => {
   test('sets a description on a global-scoped collection without touching the workspace store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     await workspace.addCollection('Work'); // deliberately colliding name, distinct store
     const globalCollection = await global.addCollection('Work');
     const workspaceBefore = snapshotStore(workspace, workspaceMemento);
     const prompter = new FakePrompter({ inputBoxResult: 'global collection note' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createSetDescriptionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'collection',
       collection: globalCollection,
       scope: 'global'
@@ -1733,16 +1733,16 @@ suite('commands - setDescription', () => {
   test('sets a description on a workspace-scoped item without touching the global store', async () => {
     const workspaceMemento = new FakeMemento();
     const globalMemento = new FakeMemento();
-    const workspace = new BookmarkStore(workspaceMemento);
+    const workspace = await createSingleRootFixtureStore(workspaceMemento);
     const global = new BookmarkStore(globalMemento);
     const workspaceItem = await workspace.addItem({ type: 'file', uri: 'file:///workspace-item.txt' });
     const globalBefore = snapshotStore(global, globalMemento);
     const prompter = new FakePrompter({ inputBoxResult: 'project-specific' });
 
-    await createSetDescriptionHandler(makeScopedStores({ workspace, global }), prompter)({
+    await createSetDescriptionHandler(await makeScopedStores({ workspace, global }), prompter)({
       kind: 'item',
       item: workspaceItem,
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
 
     assert.strictEqual(workspace.getAll().items[0].description, 'project-specific');
@@ -1846,7 +1846,7 @@ suite('commands - addToWorkspace', () => {
     await createAddToWorkspaceHandler(fakes.deps)({
       kind: 'item',
       item: folderItem(outsideUri),
-      scope: 'workspace'
+      scope: 'workspace', owner: SINGLE_ROOT_OWNER
     });
     assertNoSideEffects(fakes);
   });
@@ -2127,7 +2127,7 @@ suite('commands - reveal (out-of-workspace global folder prompt, #93)', () => {
     const fakes = makeRevealFakes({ folders: undefined });
     const item: BookmarkItem = { id: '1', type: 'file', uri: 'file:///a.txt', collectionId: null, order: 0 };
 
-    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace' });
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.deepStrictEqual(fakes.calls, ['reveal']);
     assert.deepStrictEqual(fakes.revealedUris, ['file:///a.txt']);
@@ -2150,7 +2150,7 @@ suite('commands - reveal (out-of-workspace global folder prompt, #93)', () => {
     const fakes = makeRevealFakes({ folders: undefined });
     const item: BookmarkItem = { id: '3', type: 'folder', uri: outsideUri.toString(), collectionId: null, order: 0 };
 
-    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace' });
+    await createRevealHandler(fakes.deps)({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.deepStrictEqual(fakes.calls, ['reveal']);
     assert.deepStrictEqual(fakes.revealedUris, [outsideUri.toString()]);
@@ -2272,7 +2272,7 @@ suite('commands - suggestion-kind regression guards (#95 R4)', () => {
   }
 
   test('remove handler ignores a suggestion node', async () => {
-    const stores = makeScopedStores();
+    const stores = await makeScopedStores();
     await stores.workspace.addItem({ type: 'file', uri: 'file:///a.txt' });
     const handler = createRemoveHandler(stores);
 
@@ -2313,7 +2313,7 @@ suite('commands - promoteSuggestion (#95 T6)', () => {
   }
 
   test('adds the suggested uri as a file bookmark to the workspace store', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = 'file:///suggested-a.txt';
 
     await createPromoteSuggestionHandler(store, makePrompter())(suggestionNode(uri));
@@ -2325,7 +2325,7 @@ suite('commands - promoteSuggestion (#95 T6)', () => {
   });
 
   test('shows the same "already bookmarked" info message as every other add path on a duplicate', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = 'file:///suggested-a.txt';
     await store.addItem({ type: 'file', uri });
     const messages: string[] = [];
@@ -2347,7 +2347,7 @@ suite('commands - promoteSuggestion (#95 T6)', () => {
   });
 
   test('ignores non-suggestion nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const nonSuggestionNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
 
     await createPromoteSuggestionHandler(store, makePrompter())(nonSuggestionNode);
@@ -2369,7 +2369,7 @@ suite('commands - promoteRecentItem (#108)', () => {
   }
 
   test('adds the recent uri as a file bookmark to the workspace store', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = 'file:///recent-a.txt';
 
     await createPromoteRecentItemHandler(store, makePrompter())(recentItemNode(uri));
@@ -2381,7 +2381,7 @@ suite('commands - promoteRecentItem (#108)', () => {
   });
 
   test('shows the same "already bookmarked" info message as every other add path on a duplicate', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const uri = 'file:///recent-a.txt';
     await store.addItem({ type: 'file', uri });
     const messages: string[] = [];
@@ -2403,7 +2403,7 @@ suite('commands - promoteRecentItem (#108)', () => {
   });
 
   test('ignores non-recentItem nodes', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const nonRecentItemNode: BookmarkNode = { kind: 'repoGroup', label: 'x', repoKey: 'x' };
 
     await createPromoteRecentItemHandler(store, makePrompter())(nonRecentItemNode);
@@ -2412,7 +2412,7 @@ suite('commands - promoteRecentItem (#108)', () => {
   });
 
   test('ignores a suggestion node too (only recentItem nodes are promoted by this handler)', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const suggestionNode: BookmarkNode = {
       kind: 'suggestion',
       recentItem: { uri: 'file:///suggested.txt', firstSeen: 1000, previewCount: 0, promoted: true }

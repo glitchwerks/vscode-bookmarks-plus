@@ -6,19 +6,12 @@ import {
   BookmarkItem,
   CURRENT_SCHEMA_VERSION,
   emptyBookmarkData,
-  isStrictBookmarkData,
   isValidBookmarkData,
   normalizeDescription
 } from './types';
 import { migrateBookmarkData } from './migrations';
-import { MirrorPort, hashContent, serializeBookmarkData, MIRROR_RELATIVE_PATH } from './bookmarkMirror';
-import { Delayer } from './delayer';
-import { normalizeBookmarkData } from './normalize';
 
 const STORAGE_KEY = 'bookmarks.data';
-const MIRROR_HASH_KEY = 'bookmarks.mirrorHash';
-const MIRROR_DIRTY_KEY = 'bookmarks.mirrorDirty';
-const DEFAULT_MIRROR_WRITE_DELAY_MS = 250;
 
 export interface OutputSink {
   appendLine(value: string): void;
@@ -30,12 +23,6 @@ export interface BookmarkContentReader {
   getAll(): BookmarkData;
 }
 
-export interface BookmarkStoreOptions {
-  /** Omit for a non-mirrored store; use null for a workspace whose mirror is disabled. */
-  mirror?: MirrorPort | null;
-  /** Debounce window for mirror writes. Defaults to 250 ms; tests use a short value. */
-  writeDelayMs?: number;
-}
 
 export interface AddItemInput {
   type: 'file' | 'folder';
@@ -55,33 +42,15 @@ export class DuplicateBookmarkError extends Error {
 
 const noopOutput: OutputSink = { appendLine: () => {} };
 
-interface MirrorBinding {
-  readonly generation: number;
-  readonly port: MirrorPort;
-}
 
 export class BookmarkStore implements BookmarkContentReader {
   private data: BookmarkData;
-  private dataRevision = 0;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
   readonly onBookmarksChanged: vscode.Event<void> = this._onBookmarksChanged.event;
-  private mirrorBinding?: MirrorBinding;
-  private nextMirrorGeneration = 1;
-  private readonly mirrorDelayer: Delayer;
-  private mirrorTemporarilyDetached: boolean;
-  private mirrorOperationTail: Promise<void> = Promise.resolve();
-  private mirrorWriteTail: Promise<void> = Promise.resolve();
-
   constructor(
     private readonly state: vscode.Memento,
-    private readonly output: OutputSink = noopOutput,
-    options: BookmarkStoreOptions = {}
+    private readonly output: OutputSink = noopOutput
   ) {
-    this.mirrorBinding = options.mirror
-      ? { generation: this.nextMirrorGeneration++, port: options.mirror }
-      : undefined;
-    this.mirrorTemporarilyDetached = options.mirror === null;
-    this.mirrorDelayer = new Delayer(options.writeDelayMs ?? DEFAULT_MIRROR_WRITE_DELAY_MS);
     this.data = this.load();
   }
 
@@ -112,13 +81,8 @@ export class BookmarkStore implements BookmarkContentReader {
   }
 
   private async persist(): Promise<void> {
-    this.dataRevision++;
     await this.state.update(STORAGE_KEY, this.data);
-    if (this.mirrorTemporarilyDetached) {
-      await this.state.update(MIRROR_DIRTY_KEY, true);
-    }
     this._onBookmarksChanged.fire();
-    this.scheduleMirrorWrite();
   }
 
   private renumber(list: { order: number }[]): void {
@@ -290,244 +254,8 @@ export class BookmarkStore implements BookmarkContentReader {
     await this.persist();
   }
 
-  /** Runs any pending mirror write immediately. Called from deactivate(). */
-  async flushMirrorWrites(): Promise<void> {
-    await this.mirrorDelayer.flush();
-    await this.mirrorWriteTail;
-  }
-
+  /** Releases content-change listeners when the Global store is retired. */
   dispose(): void {
-    this.mirrorDelayer.dispose();
-  }
-
-  detachMirror(): void {
-    this.mirrorBinding = undefined;
-    this.mirrorTemporarilyDetached = true;
-  }
-
-  async rebindMirror(mirror?: MirrorPort): Promise<void> {
-    // Fence off new writes synchronously. Any mutation while the old mirror drains marks
-    // workspaceState dirty and is reconciled into the replacement binding.
-    this.mirrorTemporarilyDetached = true;
-    await this.enqueueMirrorOperation(async () => {
-      await this.flushMirrorWrites();
-      this.mirrorBinding = mirror
-        ? { generation: this.nextMirrorGeneration++, port: mirror }
-        : undefined;
-      this.mirrorTemporarilyDetached = mirror === undefined;
-    });
-  }
-
-  /**
-   * Activation-time reconcile between workspaceState and the mirror file.
-   *
-   * A dirty flag makes workspaceState win after a failed write. Otherwise, workspaceState wins
-   * unless the file's hash differs from the last successful write, proving an external edit.
-   */
-  async syncWithMirror(): Promise<void> {
-    const binding = this.mirrorBinding;
-    if (!binding) {
-      return;
-    }
-    await this.enqueueMirrorOperation(() => this.syncWithMirrorNow(binding));
-  }
-
-  private async syncWithMirrorNow(binding: MirrorBinding): Promise<void> {
-    const revision = this.dataRevision;
-    await this.flushMirrorWrites();
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    if (this.state.get<boolean>(MIRROR_DIRTY_KEY) === true) {
-      await this.writeCurrentData(binding);
-      return;
-    }
-    let content: string | undefined;
-    try {
-      content = await binding.port.read();
-    } catch (error: unknown) {
-      this.logMirrorFailure('read', error);
-      return;
-    }
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    if (content === undefined) {
-      await this.writeCurrentData(binding);
-      return;
-    }
-    if (this.state.get<string>(MIRROR_HASH_KEY) === hashContent(content)) {
-      return;
-    }
-    await this.adoptMirrorContent(content, binding, revision);
-  }
-
-  /** Watcher-driven reload. Ignores events whose content is this process's own last write. */
-  async reloadFromMirror(): Promise<void> {
-    const binding = this.mirrorBinding;
-    if (!binding) {
-      return;
-    }
-    await this.enqueueMirrorOperation(() => this.reloadFromMirrorNow(binding));
-  }
-
-  private async reloadFromMirrorNow(binding: MirrorBinding): Promise<void> {
-    const revision = this.dataRevision;
-    await this.flushMirrorWrites();
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    if (this.state.get<boolean>(MIRROR_DIRTY_KEY) === true) {
-      await this.writeCurrentData(binding);
-      return;
-    }
-    let content: string | undefined;
-    try {
-      content = await binding.port.read();
-    } catch (error: unknown) {
-      this.logMirrorFailure('read', error);
-      return;
-    }
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    if (content === undefined) {
-      this.output.appendLine(
-        `BookmarkStore: ${MIRROR_RELATIVE_PATH} was deleted — keeping the current bookmarks; the file is recreated on the next change.`
-      );
-      return;
-    }
-    if (this.state.get<string>(MIRROR_HASH_KEY) === hashContent(content)) {
-      return; // Our own write, echoed back by the watcher.
-    }
-    await this.adoptMirrorContent(content, binding, revision);
-  }
-
-  private scheduleMirrorWrite(): void {
-    const binding = this.mirrorBinding;
-    if (!binding || this.mirrorTemporarilyDetached) {
-      return;
-    }
-    const content = serializeBookmarkData(this.data);
-    const revision = this.dataRevision;
-    this.mirrorDelayer.trigger(() => this.writeMirrorNow(binding, content, revision));
-  }
-
-  private writeCurrentData(binding: MirrorBinding): Promise<void> {
-    return this.writeMirrorNow(
-      binding,
-      serializeBookmarkData(this.data),
-      this.dataRevision
-    );
-  }
-
-  private writeMirrorNow(
-    binding: MirrorBinding,
-    content: string,
-    revision: number
-  ): Promise<void> {
-    const operation = this.mirrorWriteTail.then(
-      () => this.performMirrorWrite(binding, content, revision)
-    );
-    this.mirrorWriteTail = operation.catch(() => undefined);
-    return operation;
-  }
-
-  private async performMirrorWrite(
-    binding: MirrorBinding,
-    content: string,
-    revision: number
-  ): Promise<void> {
-    try {
-      await binding.port.write(content);
-    } catch (error: unknown) {
-      this.logMirrorFailure('write', error);
-      // Persist the fact that workspaceState is newer so a fresh activation retries
-      // this write instead of adopting the stale mirror file.
-      await this.state.update(MIRROR_DIRTY_KEY, true);
-      return;
-    }
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    // Recorded only after a confirmed successful write — never at schedule time.
-    await this.state.update(MIRROR_HASH_KEY, hashContent(content));
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    await this.state.update(MIRROR_DIRTY_KEY, undefined);
-  }
-
-  private async adoptMirrorContent(
-    content: string,
-    binding: MirrorBinding,
-    revision: number
-  ): Promise<void> {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      this.rejectMirrorContent('it is not valid JSON');
-      return;
-    }
-    if (!isStrictBookmarkData(parsed)) {
-      this.rejectMirrorContent('its shape does not match the bookmarks schema');
-      return;
-    }
-    let migrated;
-    try {
-      migrated = migrateBookmarkData(parsed);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.rejectMirrorContent(message);
-      return;
-    }
-
-    const { data, changed, notes } = normalizeBookmarkData(migrated);
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== revision) {
-      return;
-    }
-    this.data = data;
-    this.dataRevision++;
-    const adoptedRevision = this.dataRevision;
-    await this.state.update(STORAGE_KEY, this.data);
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== adoptedRevision) {
-      return;
-    }
-    await this.state.update(MIRROR_HASH_KEY, hashContent(content));
-    if (!this.isCurrentMirror(binding) || this.dataRevision !== adoptedRevision) {
-      return;
-    }
-    this._onBookmarksChanged.fire();
-
-    if (changed) {
-      for (const note of notes) {
-        this.output.appendLine(`BookmarkStore: ${note}`);
-      }
-      // The adopted data differs from what is on disk — converge the file.
-      this.scheduleMirrorWrite();
-    }
-  }
-
-  private enqueueMirrorOperation(operation: () => void | Promise<void>): Promise<void> {
-    const result = this.mirrorOperationTail.then(operation);
-    this.mirrorOperationTail = result.catch(() => undefined);
-    return result;
-  }
-
-  private isCurrentMirror(binding: MirrorBinding): boolean {
-    return !this.mirrorTemporarilyDetached &&
-      this.mirrorBinding?.generation === binding.generation;
-  }
-
-  private rejectMirrorContent(reason: string): void {
-    this.output.appendLine(
-      `BookmarkStore: ignoring ${MIRROR_RELATIVE_PATH} because ${reason} — keeping the last known good bookmarks. The file is overwritten on your next bookmark change.`
-    );
-  }
-
-  private logMirrorFailure(operation: 'read' | 'write', error: unknown): void {
-    const message = error instanceof Error ? error.message : String(error);
-    this.output.appendLine(`BookmarkStore: could not ${operation} ${MIRROR_RELATIVE_PATH} — ${message}`);
+    this._onBookmarksChanged.dispose();
   }
 }

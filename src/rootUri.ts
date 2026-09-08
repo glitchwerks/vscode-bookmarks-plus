@@ -51,7 +51,11 @@ function trimTrailingSeparators(path: string): string {
 
 /** Returns the structural components used for URI identity and containment. */
 function comparable(uri: vscode.Uri): ComparableUri {
-  const path = trimTrailingSeparators(normalizeEscapes(uri.path));
+  // VS Code serializes file drive letters in lowercase; keep persisted identities round-trip safe.
+  const uriPath = uri.scheme.toLowerCase() === 'file'
+    ? uri.path.replace(/^\/[A-Z]:(?=\/|$)/, drive => drive.toLowerCase())
+    : uri.path;
+  const path = trimTrailingSeparators(normalizeEscapes(uriPath));
   return {
     scheme: uri.scheme.toLowerCase(),
     authority: uri.authority.toLowerCase(),

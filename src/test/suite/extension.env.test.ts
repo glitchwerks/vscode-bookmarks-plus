@@ -25,11 +25,11 @@ function disposeAll(context: FakeExtensionContext): void {
 }
 
 suite('Extension - workspace env var wiring (T4)', () => {
-  test('activate() writes BOOKMARKS_PLUS_WORKSPACE onto context.environmentVariableCollection', () => {
+  test('activate() writes BOOKMARKS_PLUS_WORKSPACE onto context.environmentVariableCollection', async () => {
     const context = createFakeExtensionContext();
     try {
       try {
-        activate(context as unknown as vscode.ExtensionContext);
+        await activate(context as unknown as vscode.ExtensionContext);
       } catch (error) {
         assertKnownActivationCollision(error);
       }

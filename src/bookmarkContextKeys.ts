@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { BookmarkItem } from './types';
-import { BookmarkStore } from './bookmarkStore';
+import { BookmarkContentReader } from './bookmarkStore';
 
 /**
  * The `when`-clause context key name (issue #114) that reports which resources are currently
@@ -53,17 +53,13 @@ export interface BookmarkContextKeyDeps {
 }
 
 /**
- * Wires one or more `BookmarkStore`s to `BOOKMARKED_RESOURCE_CONTEXT_KEY` via an injected
+ * Wires one or more `BookmarkContentReader`s to `BOOKMARKED_RESOURCE_CONTEXT_KEY` via an injected
  * `setContext` dependency (mirroring the existing `AddToWorkspaceDeps` DI pattern in
  * commands.ts), so the Explorer/editor context menus can show "Remove Bookmark" instead of "Add
  * Bookmark" for an already-bookmarked resource.
  *
- * `wire()` publishes the full, recomputed union on every store change (bulk `reloadFromMirror()`
- * replacement included) — not a diff — since a context-key value has no notion of incremental
- * update, unlike the decoration provider's per-uri fire. An unchanged mirror echo never reaches
- * this class at all: `BookmarkStore.reloadFromMirror()` already suppresses `onBookmarksChanged`
- * for its own last write (see `bookmarkStore.ts`'s mirror-hash check), so no extra de-duplication
- * is needed here.
+ * `wire()` republishes the complete union after each committed content change. Workspace
+ * mirror echoes are suppressed by WorkspaceMirrorCoordinator before reaching this reader.
  *
  * package.json's `when` clauses compare this array against VS Code's built-in `resourcePath`
  * context key, not `resourceUri` — VS Code has no `resourceUri` when-clause key at all (that name
@@ -100,7 +96,7 @@ export class BookmarkContextKeyManager {
     return this.globalKeys;
   }
 
-  wire(stores: BookmarkStore[]): void {
+  wire(stores: BookmarkContentReader[]): void {
     const publish = (): void => {
       this.keys = buildBookmarkedResourceKeys(stores.map((store) => store.getAll().items));
       void this.deps.setContext(BOOKMARKED_RESOURCE_CONTEXT_KEY, this.keys);
@@ -118,7 +114,7 @@ export class BookmarkContextKeyManager {
    * This is additive to `wire()`, which callers keep using for the existing merged key (consumed by
    * `bookmarks.remove`'s `when` clause, where union semantics are still correct).
    */
-  wireScoped(stores: { workspace: BookmarkStore; global: BookmarkStore }): void {
+  wireScoped(stores: { workspace: BookmarkContentReader; global: BookmarkContentReader }): void {
     const publishWorkspace = (): void => {
       this.workspaceKeys = buildBookmarkedResourceKeys([stores.workspace.getAll().items]);
       void this.deps.setContext(WORKSPACE_BOOKMARKED_RESOURCE_CONTEXT_KEY, this.workspaceKeys);

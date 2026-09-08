@@ -19,6 +19,20 @@ suite('rootUri', () => {
     );
   });
 
+  test('normalizes only file drive-letter case across serialization and containment', () => {
+    const root = vscode.Uri.from({ scheme: 'file', path: '/C:/Work/Repo' });
+    const restored = vscode.Uri.parse(root.toString());
+    assert.strictEqual(canonicalizeRootUri(root), canonicalizeRootUri(restored));
+    assert.strictEqual(canonicalizeRootUri(root), 'file:///c:/Work/Repo');
+    assert.strictEqual(isUriInsideRoot(vscode.Uri.parse('file:///c:/Work/Repo/a.ts'), root), true);
+    assert.strictEqual(isUriInsideRoot(vscode.Uri.parse('file:///c:/work/Repo/a.ts'), root), false);
+    assert.notStrictEqual(canonicalizeRootUri(root), canonicalizeRootUri(vscode.Uri.parse('file:///c:/work/Repo')));
+    assert.notStrictEqual(
+      canonicalizeRootUri(vscode.Uri.parse('vscode-remote://host/C:/Work/Repo')),
+      canonicalizeRootUri(vscode.Uri.parse('vscode-remote://host/c:/Work/Repo'))
+    );
+  });
+
   test('rejects relative, query, and fragment root identities', () => {
     const relative = { scheme: '', authority: '', path: 'repo', query: '', fragment: '' } as vscode.Uri;
     assert.throws(() => canonicalizeRootUri(relative));

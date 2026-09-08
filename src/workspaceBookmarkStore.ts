@@ -443,7 +443,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
         .filter((candidate) => candidate.collectionId === collectionId && candidate.id !== item.id)
         .sort((left, right) => left.order - right.order);
       siblings.splice(Math.max(0, Math.min(index, siblings.length)), 0, item);
-      renumber(siblings);
+      siblings.forEach((sibling, position) => { sibling.order = position; });
       this.markOwnerMutation(draft, owner);
       return changed();
     });

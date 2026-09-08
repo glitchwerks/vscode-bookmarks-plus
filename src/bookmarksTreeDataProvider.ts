@@ -34,7 +34,6 @@ const SHOW_FULL_PATH_STATE_KEY = 'bookmarksPlus.showFullPath';
 export const DND_MIME_TYPE = 'application/vnd.code.tree.bookmarksview';
 export const UNKNOWN_REPO_LABEL = 'Unknown';
 const UNKNOWN_REPO_KEY = '\u0000unknown-repo\u0000';
-const LEGACY_OWNER: WorkspaceOwnerRef = { kind: 'partition', partitionId: 'legacy-workspace' };
 
 interface DragEnvelope { readonly scope: BookmarkScope; readonly owner?: WorkspaceOwnerRef; readonly ids: string[]; }
 type GlobalBookmarkStore = BookmarkContentReader & Pick<BookmarkStore, 'moveItem'>;
@@ -55,9 +54,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   private groupMode: GroupMode = 'default';
   private showFullPath: boolean;
 
-  /** BookmarkStore support is temporary compatibility until activation uses WorkspaceBookmarkStore. */
   constructor(
-    private readonly workspaceStore: WorkspaceBookmarkStore | BookmarkStore,
+    private readonly workspaceStore: WorkspaceBookmarkStore,
     private readonly cache: FsGitCache,
     private readonly globalStore?: GlobalBookmarkStore,
     private readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined = () => vscode.workspace.workspaceFolders,
@@ -79,14 +77,9 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (items.length === 0) return;
     const scope = items[0].scope;
     if (!items.every((item) => item.scope === scope)) return;
-    let owner = items[0].owner;
+    const owner = items[0].owner;
     if (scope === 'workspace') {
-      if (this.isPartitionedStore()) {
-        if (!owner || !items.every((item) => sameOwner(item.owner, owner))) return;
-      } else {
-        owner ??= LEGACY_OWNER;
-        if (!items.every((item) => !item.owner || sameOwner(item.owner, owner))) return;
-      }
+      if (!owner || !items.every((item) => sameOwner(item.owner, owner))) return;
     }
     dataTransfer.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope, owner, ids: items.map((item) => item.item.id) } satisfies DragEnvelope));
   }
@@ -96,9 +89,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     const transferItem = dataTransfer.get(DND_MIME_TYPE);
     if (!transferItem || !isDragEnvelope(transferItem.value)) return;
     const envelope = transferItem.value;
-    const partitionedStore = this.partitionedStore();
-    if (envelope.scope === 'workspace' && partitionedStore && !envelope.owner) return;
-    const sourceOwner = envelope.scope === 'workspace' ? (envelope.owner ?? LEGACY_OWNER) : undefined;
+    if (envelope.scope === 'workspace' && !envelope.owner) return;
+    const sourceOwner = envelope.scope === 'workspace' ? envelope.owner : undefined;
     const targetInfo = this.dropTarget(target, envelope.scope, sourceOwner);
     if (!targetInfo) return;
     if (envelope.scope === 'global') {
@@ -107,14 +99,9 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       for (const id of envelope.ids) await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data));
       return;
     }
-    if (partitionedStore) {
-      const data = this.workspaceDataForOwner(sourceOwner!);
-      if (!data) return;
-      for (const id of envelope.ids) await partitionedStore.moveItem(sourceOwner!, id, targetInfo.collectionId, targetInfo.index(data));
-      return;
-    }
-    const data = this.workspaceStore.getAll();
-    for (const id of envelope.ids) await (this.workspaceStore as BookmarkStore).moveItem(id, targetInfo.collectionId, targetInfo.index(data));
+    const data = this.workspaceDataForOwner(sourceOwner!);
+    if (!data) return;
+    for (const id of envelope.ids) await this.workspaceStore.moveItem(sourceOwner!, id, targetInfo.collectionId, targetInfo.index(data));
   }
 
   getGroupMode(): GroupMode { return this.groupMode; }
@@ -130,7 +117,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       case 'unassignedRoot': return rootItem('Unassigned', 'bookmarkUnassignedRoot', 'question');
       case 'detachedRoot': { const item = rootItem('Detached', 'bookmarkDetachedRoot', 'archive'); item.id = 'detachedRoot'; return item; }
       case 'detachedPartition': { const item = rootItem(node.label, 'bookmarkDetachedPartition', 'archive'); item.id = `detachedPartition:${node.partitionId}`; return item; }
-      case 'workspaceDiagnostic': { const item = new vscode.TreeItem(node.message, vscode.TreeItemCollapsibleState.None); item.contextValue = 'bookmarkWorkspaceDiagnostic'; item.iconPath = new vscode.ThemeIcon('warning'); return item; }
+      case 'workspaceDiagnostic': { const item = new vscode.TreeItem(node.message, vscode.TreeItemCollapsibleState.None); item.contextValue = 'bookmarkWorkspaceDiagnostic'; item.command = { command: 'bookmarks.showOutput', title: 'Open Bookmarks Plus output' }; item.iconPath = new vscode.ThemeIcon('warning'); return item; }
       case 'repoGroup': { const item = rootItem(node.label, 'bookmarkRepoGroup', 'repo'); item.id = `repo:${this.nodeOwnerPrefix(node)}:${node.repoKey}`; return item; }
       case 'suggestedRoot': return rootItem('Suggested', 'bookmarkSuggestedRoot', 'lightbulb');
       case 'recentRoot': return rootItem('Recent', 'bookmarkRecentRoot', 'history');
@@ -145,11 +132,11 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (node?.kind === 'suggestedRoot') return this.getSuggestedLeaves();
     if (node?.kind === 'recentRoot') return this.getRecentLeaves();
     if (node?.kind === 'globalRoot' || ((node?.kind === 'collection' || node?.kind === 'repoGroup') && node.scope === 'global')) return this.getGlobalChildren(node);
-    return this.partitionedStore() ? this.getPartitionedChildren(node) : this.getLegacyChildren(node);
+    return this.getPartitionedChildren(node);
   }
 
   private async getPartitionedChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
-    const view = this.partitionedStore()!.getView();
+    const view = this.workspaceStore.getView();
     if (!node) {
       const content = view.kind === 'unavailable' ? [{ kind: 'workspaceDiagnostic', message: 'Workspace data unavailable', scope: 'workspace', collection: undefined as unknown as BookmarkCollection } as BookmarkNode] : await this.partitionRoots(view);
       return this.withRoots(content);
@@ -172,12 +159,6 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     const data = this.workspaceDataForOwner(owner, view);
     if (!data) return [];
     return this.groupMode === 'byRepo' ? this.getChildrenByRepo(node, data.items, data.collections, 'workspace', owner) : this.getChildrenDefault(node, data.items, data.collections, 'workspace', owner);
-  }
-
-  private async getLegacyChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
-    const data = this.workspaceStore.getAll();
-    const children = this.groupMode === 'byRepo' ? await this.getChildrenByRepo(node, data.items, data.collections, 'workspace', LEGACY_OWNER) : this.getChildrenDefault(node, data.items, data.collections, 'workspace', LEGACY_OWNER);
-    return node ? children : this.withRoots(children);
   }
 
   private async getGlobalChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
@@ -223,15 +204,13 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
 
   private dropTarget(target: BookmarkNode | undefined, scope: BookmarkScope, owner: WorkspaceOwnerRef | undefined): { collectionId: string | null; index: (data: BookmarkData) => number } | undefined {
     if (!target) {
-      const partitioned = this.partitionedStore();
-      if (!partitioned) return scope === 'workspace' ? rootTarget() : undefined;
-      const view = partitioned.getView();
+      const view = this.workspaceStore.getView();
       return scope === 'workspace' && owner?.kind === 'partition' && view.kind === 'ready' && view.attached.length === 1 && sameOwner(owner, ownerForPartition(view.attached[0].partitionId)) ? rootTarget() : undefined;
     }
     if (target.kind === 'globalRoot') return scope === 'global' ? rootTarget() : undefined;
     if (target.kind === 'workspaceRoot') return scope === 'workspace' && sameOwner(owner, ownerForPartition(target.partitionId)) && this.isAttachedOwner(ownerForPartition(target.partitionId)) ? rootTarget() : undefined;
-    if (target.kind === 'collection') { if (target.scope !== scope || (scope === 'workspace' && (this.partitionedStore() ? !sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner) : target.owner !== undefined && !sameOwner(owner, target.owner)))) return undefined; return { collectionId: target.collection.id, index: (data) => data.items.filter((item) => item.collectionId === target.collection.id).length }; }
-    if (target.kind === 'item') { if (target.scope !== scope || (scope === 'workspace' && (this.partitionedStore() ? !sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner) : target.owner !== undefined && !sameOwner(owner, target.owner)))) return undefined; return { collectionId: target.item.collectionId, index: () => target.item.order }; }
+    if (target.kind === 'collection') { if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined; return { collectionId: target.collection.id, index: (data) => data.items.filter((item) => item.collectionId === target.collection.id).length }; }
+    if (target.kind === 'item') { if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined; return { collectionId: target.item.collectionId, index: () => target.item.order }; }
     return undefined;
   }
 
@@ -245,15 +224,13 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   private workspaceDataForOwner(owner: WorkspaceOwnerRef, view?: WorkspaceStoreView): BookmarkData | undefined {
-    const current = view ?? this.partitionedStore()!.getView(); if (current.kind === 'unavailable') return undefined; if (owner.kind === 'unassigned') return current.unassigned;
+    const current = view ?? this.workspaceStore.getView(); if (current.kind === 'unavailable') return undefined; if (owner.kind === 'unassigned') return current.unassigned;
     return current.attached.find((partition) => partition.partitionId === owner.partitionId)?.data ?? current.detached.find((partition) => partition.partitionId === owner.partitionId)?.data;
   }
-  private nodeOwnerPrefix(node: { scope?: BookmarkScope; owner?: WorkspaceOwnerRef }): string { return node.scope === 'global' ? 'global' : node.owner ? ownerKey(node.owner) : 'legacy-workspace'; }
-  private isPartitionedStore(): boolean { return this.partitionedStore() !== undefined; }
-  private partitionedStore(): WorkspaceBookmarkStore | undefined { return 'getView' in this.workspaceStore ? this.workspaceStore as WorkspaceBookmarkStore : undefined; }
+  private nodeOwnerPrefix(node: { scope?: BookmarkScope; owner?: WorkspaceOwnerRef }): string { return node.scope === 'global' ? 'global' : node.owner ? ownerKey(node.owner) : 'workspace'; }
   private isAttachedOwner(owner: WorkspaceOwnerRef | undefined): boolean {
     if (!owner || owner.kind !== 'partition') return false;
-    const view = this.partitionedStore()?.getView();
+    const view = this.workspaceStore.getView();
     return view?.kind === 'ready' && view.attached.some((partition) => partition.partitionId === owner.partitionId);
   }
   private refreshFromStore(): void { this.cache.invalidateAll(); this._onDidChangeTreeData.fire(); }

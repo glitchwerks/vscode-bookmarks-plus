@@ -150,7 +150,7 @@ Canonicalization:
    hexadecimal digits in escapes that remain encoded. Encoded path separators remain encoded and
    never become structural separators.
 4. Remove trailing path separators except when the path is the URI root.
-5. Preserve the case of every path component. Do not lowercase paths.
+5. Preserve path-component case: normalize only Windows file-URI drive-letter case to survive VS Code URI parse/serialization round trips; all remaining path components retain their case. (`src/test/suite/rootUri.test.ts:L22-L34`; `src/test/suite/workspaceFolders.test.ts:L85-L102`)
 6. Serialize the normalized structural components into the canonical identity string.
 
 Containment compares scheme and authority identity first, then complete path components. Raw string
@@ -160,7 +160,7 @@ extends the existing segment-boundary and deepest-root behavior while removing i
 path lowercasing. (`src/workspaceFolders.ts:L3-L20`; `src/workspaceFolders.ts:L30-L49`;
 `src/workspaceFolders.ts:L69-L94`; #62)
 
-Because path case is preserved, roots whose paths differ only by case remain distinct identities.
+Except for the file-URI drive letter, roots whose paths differ only by case remain distinct identities.
 On a case-insensitive filesystem, a case-only folder move can therefore require explicit recovery.
 This avoids silently collapsing distinct paths used by case-sensitive local or remote providers.
 (#62)

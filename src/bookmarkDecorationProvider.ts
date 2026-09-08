@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { BookmarkItem } from './types';
-import { BookmarkStore } from './bookmarkStore';
+import { BookmarkContentReader } from './bookmarkStore';
 
 /**
  * Canonicalizes a Uri into a stable map key for decoration lookups.
@@ -96,9 +96,8 @@ export class BookmarkDecorationProvider implements vscode.FileDecorationProvider
   }
 
   /**
-   * Subscribes to each store's `onBookmarksChanged` (the persist fire site,
-   * `src/bookmarkStore.ts:L96-L97`, and the mirror-reload fire site, `:L391-L393`) and keeps the
-   * decorated-key set current (C4, plan §6 T2).
+   * Subscribes to each content reader's committed change events and keeps the decorated-key
+   * set current. Global and partitioned workspace stores share this reader contract.
    *
    * Establishes a silent baseline snapshot of the wired stores' current items first — this is
    * what lets a later removal fire with the *removed* uri even though that uri is no longer in
@@ -109,19 +108,19 @@ export class BookmarkDecorationProvider implements vscode.FileDecorationProvider
    * pattern) — fires exactly one `onDidChangeFileDecorations` event with the union of added and
    * removed uris.
    */
-  wire(stores: BookmarkStore[]): vscode.Disposable {
+  wire(stores: BookmarkContentReader[]): vscode.Disposable {
     this.resync(stores);
     const subscriptions = stores.map((store) => store.onBookmarksChanged(() => this.resyncAndNotify(stores)));
     return vscode.Disposable.from(...subscriptions);
   }
 
-  private resync(stores: BookmarkStore[]): void {
+  private resync(stores: BookmarkContentReader[]): void {
     const { keys, uriByKey } = this.computeCurrentState(stores);
     this.decoratedUriKeys = keys;
     this.uriByKey = uriByKey;
   }
 
-  private resyncAndNotify(stores: BookmarkStore[]): void {
+  private resyncAndNotify(stores: BookmarkContentReader[]): void {
     const previousKeys = this.decoratedUriKeys;
     const previousUriByKey = this.uriByKey;
     const { keys: nextKeys, uriByKey: nextUriByKey } = this.computeCurrentState(stores);
@@ -146,7 +145,7 @@ export class BookmarkDecorationProvider implements vscode.FileDecorationProvider
     }
   }
 
-  private computeCurrentState(stores: BookmarkStore[]): {
+  private computeCurrentState(stores: BookmarkContentReader[]): {
     keys: Set<string>;
     uriByKey: Map<string, vscode.Uri>;
   } {
