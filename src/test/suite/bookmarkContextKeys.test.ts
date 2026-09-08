@@ -1,3 +1,8 @@
+import { createSingleRootFixtureStore, SINGLE_ROOT_OWNER } from './singleRootFixture';
+import { WorkspaceMirrorCoordinator } from '../../workspaceMirrorCoordinator';
+import { FakePartitionMirrorResources } from './fixtures';
+const mirrorCoordinators: WorkspaceMirrorCoordinator[] = [];
+teardown(() => { mirrorCoordinators.splice(0).forEach(coordinator => coordinator.dispose()); });
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
@@ -277,9 +282,14 @@ suite('BookmarkContextKeyManager (#114)', () => {
   test('a mirror-driven reload republishes the full, recomputed key set (bulk reload, not a diff)', async () => {
     const mirror = new FakeMirror();
     const memento = new FakeMemento();
-    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+    const store = await createSingleRootFixtureStore(memento);
+    const coordinator = new WorkspaceMirrorCoordinator({
+      store, output: new FakeOutput(), createResources: () => new FakePartitionMirrorResources(mirror)
+    });
+    mirrorCoordinators.push(coordinator);
+    await coordinator.reconcileBindings();
     await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
-    await store.flushMirrorWrites();
+    await coordinator.flushAll();
 
     const { deps, calls } = makeDeps();
     const manager = new BookmarkContextKeyManager(deps);
@@ -299,7 +309,7 @@ suite('BookmarkContextKeyManager (#114)', () => {
       2
     )}\n`;
 
-    await store.reloadFromMirror();
+    await coordinator.reloadPartition(SINGLE_ROOT_OWNER.partitionId);
 
     assert.deepStrictEqual(manager.getBookmarkedResourceKeys(), [decorationUriKey(externalUri)]);
     assert.ok(calls.length > callsBefore, 'a mirror-adopted change must republish the context value');
@@ -314,9 +324,14 @@ suite('BookmarkContextKeyManager (#114)', () => {
   test('an unchanged mirror echo does not republish the context value', async () => {
     const mirror = new FakeMirror();
     const memento = new FakeMemento();
-    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+    const store = await createSingleRootFixtureStore(memento);
+    const coordinator = new WorkspaceMirrorCoordinator({
+      store, output: new FakeOutput(), createResources: () => new FakePartitionMirrorResources(mirror)
+    });
+    mirrorCoordinators.push(coordinator);
+    await coordinator.reconcileBindings();
     await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
-    await store.flushMirrorWrites();
+    await coordinator.flushAll();
 
     const { deps, calls } = makeDeps();
     const manager = new BookmarkContextKeyManager(deps);
@@ -324,7 +339,7 @@ suite('BookmarkContextKeyManager (#114)', () => {
     const callsBefore = calls.length;
 
     // No external edit — content is unchanged, so this models the watcher firing on our own write.
-    await store.reloadFromMirror();
+    await coordinator.reloadPartition(SINGLE_ROOT_OWNER.partitionId);
 
     assert.strictEqual(
       calls.length,
@@ -616,5 +631,24 @@ suite('BookmarkContextKeyManager — per-scope context keys (#120)', () => {
       globalPublishesBefore,
       'removing a workspace bookmark must not trigger a redundant re-publish of the global-scope key'
     );
+  });
+});
+suite('BookmarkContextKeyManager - shared content reader (#62)', () => {
+  test('publishes independent scope keys for a workspace reader and a real Global store', async () => {
+    const changes = new vscode.EventEmitter<void>();
+    let items = [{ id: 'workspace', type: 'file' as const, uri: 'file:///reader', collectionId: null, order: 0 }];
+    const reader = { getAll: () => ({ version: 2, items, collections: [] }), onBookmarksChanged: changes.event };
+    const global = new BookmarkStore(new FakeMemento());
+    await global.addItem({ type: 'file', uri: 'file:///global-reader' });
+    const manager = new BookmarkContextKeyManager({ setContext: () => {} });
+    manager.wire([reader, global]);
+    manager.wireScoped({ workspace: reader, global });
+    assert.deepStrictEqual(manager.getWorkspaceBookmarkedResourceKeys(), [vscode.Uri.parse('file:///reader').fsPath]);
+    items = [];
+    changes.fire();
+    assert.deepStrictEqual(manager.getWorkspaceBookmarkedResourceKeys(), []);
+    assert.deepStrictEqual(manager.getGlobalBookmarkedResourceKeys(), [vscode.Uri.parse('file:///global-reader').fsPath]);
+    assert.deepStrictEqual(manager.getBookmarkedResourceKeys(), [vscode.Uri.parse('file:///global-reader').fsPath]);
+    changes.dispose(); global.dispose();
   });
 });

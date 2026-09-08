@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { activate } from '../../extension';
+import { activate, deactivate } from '../../extension';
+import { WorkspaceMirrorCoordinator } from '../../workspaceMirrorCoordinator';
 import { DISABLED_PREFIX, NO_FOLDER_SLUG, WORKSPACE_ENV_VAR } from '../../workspaceEnv';
 import { createFakeExtensionContext, FakeExtensionContext } from './fixtures';
 
@@ -25,11 +26,20 @@ function disposeAll(context: FakeExtensionContext): void {
 }
 
 suite('Extension - workspace env var wiring (T4)', () => {
-  test('activate() writes BOOKMARKS_PLUS_WORKSPACE onto context.environmentVariableCollection', () => {
+  test('activate() writes BOOKMARKS_PLUS_WORKSPACE onto context.environmentVariableCollection', async () => {
     const context = createFakeExtensionContext();
+    const originalDrain = WorkspaceMirrorCoordinator.prototype.drainAndFlush;
+    let drained = false;
+    WorkspaceMirrorCoordinator.prototype.drainAndFlush = async function () {
+      await originalDrain.call(this);
+      drained = true;
+    };
+    context.subscriptions.push(new vscode.Disposable(() => {
+      assert.strictEqual(drained, true, 'deactivation must finish draining before context subscriptions are disposed');
+    }));
     try {
       try {
-        activate(context as unknown as vscode.ExtensionContext);
+        await activate(context as unknown as vscode.ExtensionContext);
       } catch (error) {
         assertKnownActivationCollision(error);
       }
@@ -65,7 +75,13 @@ suite('Extension - workspace env var wiring (T4)', () => {
       );
       assert.strictEqual(call.optionsPassed, false, 'replace() must be called with no options argument');
     } finally {
-      disposeAll(context);
+      try {
+        await deactivate();
+        disposeAll(context);
+      }
+      finally {
+        WorkspaceMirrorCoordinator.prototype.drainAndFlush = originalDrain;
+      }
     }
   });
 });

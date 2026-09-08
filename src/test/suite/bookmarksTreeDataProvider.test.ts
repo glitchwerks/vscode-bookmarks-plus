@@ -1,13 +1,23 @@
+import { createSingleRootFixtureStore, SINGLE_ROOT_OWNER } from './singleRootFixture';
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { FsGitCache } from '../../fsGitCache';
-import { BookmarksTreeDataProvider, BookmarkNode, DND_MIME_TYPE } from '../../bookmarksTreeDataProvider';
+import {
+  BookmarksTreeDataProvider,
+  BookmarkNode,
+  DND_MIME_TYPE,
+  RecentlyViewedSource,
+  SuggestionsSource
+} from '../../bookmarksTreeDataProvider';
 import { RecentItem } from '../../recentItems';
-import { FakeMemento } from './fixtures';
+import { BookmarkData, BookmarkItem } from '../../types';
+import { WorkspaceBookmarkStore, WorkspaceStoreView } from '../../workspaceBookmarkStore';
+import { WORKSPACE_PARTITION_STORAGE_KEY, WorkspaceOwnerRef } from '../../workspacePartitionTypes';
+import { FakeMemento, FakeOutput } from './fixtures';
 
-function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })) {
-  const store = new BookmarkStore(new FakeMemento());
+async function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })) {
+  const store = await createSingleRootFixtureStore();
   const cache = new FsGitCache(resolve);
   const provider = new BookmarksTreeDataProvider(store, cache);
   return { store, cache, provider };
@@ -15,13 +25,13 @@ function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoN
 
 suite('BookmarksTreeDataProvider - default mode', () => {
   test('empty store yields no root children', async () => {
-    const { provider } = makeProvider();
+    const { provider } = await makeProvider();
     const children = await provider.getChildren();
     assert.deepStrictEqual(children, []);
   });
 
   test('root shows collections before ungrouped items, each sorted by order', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     await store.addCollection('Work');
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.addItem({ type: 'file', uri: 'file:///b.txt' });
@@ -34,12 +44,12 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   });
 
   test('a collection node lists only its own items', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const collection = await store.addCollection('Work');
     await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: collection.id });
     await store.addItem({ type: 'file', uri: 'file:///b.txt' }); // root item — must not appear
 
-    const node: BookmarkNode = { kind: 'collection', collection, scope: 'workspace' };
+    const node: BookmarkNode = { kind: 'collection', collection, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
     const children = await provider.getChildren(node);
 
     assert.strictEqual(children.length, 1);
@@ -47,9 +57,9 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   });
 
   test('a folder bookmark tree item is always a leaf (collapsibleState None) and has no children', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const folder = await store.addItem({ type: 'folder', uri: 'file:///dir' });
-    const node: BookmarkNode = { kind: 'item', item: folder, scope: 'workspace' };
+    const node: BookmarkNode = { kind: 'item', item: folder, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
 
     const treeItem = await provider.getTreeItem(node);
     assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.None);
@@ -59,9 +69,9 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   });
 
   test('a broken bookmark renders with a warning icon and does not throw', async () => {
-    const { store, provider } = makeProvider(async () => ({ exists: false }));
+    const { store, provider } = await makeProvider(async () => ({ exists: false }));
     const item = await store.addItem({ type: 'file', uri: 'file:///missing.txt' });
-    const node: BookmarkNode = { kind: 'item', item, scope: 'workspace' };
+    const node: BookmarkNode = { kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
 
     const treeItem = await provider.getTreeItem(node);
     assert.ok(treeItem.iconPath instanceof vscode.ThemeIcon);
@@ -69,32 +79,32 @@ suite('BookmarksTreeDataProvider - default mode', () => {
   });
 
   test('a valid bookmark with a resolved repo shows the repo name as its description', async () => {
-    const { store, provider } = makeProvider(async () => ({ exists: true, repoName: 'my-repo' }));
+    const { store, provider } = await makeProvider(async () => ({ exists: true, repoName: 'my-repo' }));
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(treeItem.description, 'my-repo');
   });
 
   test('file bookmark tree item opens the file directly, bypassing bookmarks.reveal', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(treeItem.command?.command, 'vscode.open');
   });
 
   test('folder bookmark tree item triggers bookmarks.reveal (its only possible click target)', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'folder', uri: 'file:///dir' });
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(treeItem.command?.command, 'bookmarks.reveal');
   });
 
   test('re-fires onDidChangeTreeData and invalidates the cache when the store changes', async () => {
     let resolveCalls = 0;
-    const { store, provider } = makeProvider(async () => { resolveCalls++; return { exists: true }; });
+    const { store, provider } = await makeProvider(async () => { resolveCalls++; return { exists: true }; });
 
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
-    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(resolveCalls, 1);
 
     let redraws = 0;
@@ -102,14 +112,14 @@ suite('BookmarksTreeDataProvider - default mode', () => {
     await store.addItem({ type: 'file', uri: 'file:///b.txt' });
     assert.strictEqual(redraws, 1);
 
-    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(resolveCalls, 2, 'the cache must be invalidated on onBookmarksChanged');
   });
 });
 
 suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   test('an item with no resolvable repo falls into the Unknown group without throwing', async () => {
-    const { store, provider } = makeProvider(async () => ({ exists: true, repoName: undefined }));
+    const { store, provider } = await makeProvider(async () => ({ exists: true, repoName: undefined }));
     provider.setGroupMode('byRepo');
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
@@ -120,7 +130,7 @@ suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   });
 
   test('a broken item also falls into the Unknown group in group-by-repo mode', async () => {
-    const { store, provider } = makeProvider(async () => ({ exists: false }));
+    const { store, provider } = await makeProvider(async () => ({ exists: false }));
     provider.setGroupMode('byRepo');
     await store.addItem({ type: 'file', uri: 'file:///missing.txt' });
 
@@ -130,7 +140,7 @@ suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   });
 
   test('degrades to an all-Unknown render (no throw) when no active git repository is found', async () => {
-    const { store, provider } = makeProvider(async () => ({ exists: true })); // simulates vscode.git unavailable
+    const { store, provider } = await makeProvider(async () => ({ exists: true })); // simulates vscode.git unavailable
     provider.setGroupMode('byRepo');
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.addItem({ type: 'file', uri: 'file:///b.txt' });
@@ -141,7 +151,7 @@ suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   });
 
   test('groups items under their resolved repo, nested by collection, and each repo only sees its own items', async () => {
-    const { store, provider } = makeProvider(async (uri) => ({
+    const { store, provider } = await makeProvider(async (uri) => ({
       exists: true,
       repoName: uri.includes('repo-a') ? 'repo-a' : 'repo-b'
     }));
@@ -167,7 +177,7 @@ suite('BookmarksTreeDataProvider - group-by-repo mode', () => {
   });
 
   test('a real repository literally named "Unknown" does not merge with the unresolved fallback bucket', async () => {
-    const { store, provider } = makeProvider(async (uri) =>
+    const { store, provider } = await makeProvider(async (uri) =>
       uri.includes('real-repo') ? { exists: true, repoName: 'Unknown' } : { exists: true, repoName: undefined }
     );
     provider.setGroupMode('byRepo');
@@ -197,7 +207,7 @@ interface DragEnvelope {
 
 function makeDropTransfer(scope: DragScope, ids: string[]): vscode.DataTransfer {
   const dt = new vscode.DataTransfer();
-  dt.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope, ids }));
+  dt.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope, ...(scope === 'workspace' ? { owner: SINGLE_ROOT_OWNER } : {}), ids }));
   return dt;
 }
 
@@ -207,8 +217,155 @@ function getTransferEnvelope(dt: vscode.DataTransfer): DragEnvelope | undefined 
 }
 
 suite('BookmarksTreeDataProvider - drag and drop', () => {
+  test('workspace becoming unavailable after one move stops later attempts and warns once', async () => {
+    const state = new FakeMemento();
+    const workspace = await createSingleRootFixtureStore(state);
+    const source = await workspace.addCollection('Source');
+    const destination = await workspace.addCollection('Destination');
+    const items: BookmarkItem[] = [];
+    for (const name of ['first', 'second', 'third']) {
+      items.push(await workspace.addItem({ type: 'file', uri: `file:///${name}.txt`, collectionId: source.id }));
+    }
+    const unavailable = await WorkspaceBookmarkStore.create({
+      state: new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: { version: 999 } }),
+      roots: [], output: new FakeOutput()
+    });
+    assert.strictEqual(unavailable.getView().kind, 'unavailable');
+    let viewStore: WorkspaceBookmarkStore = workspace;
+    const attempts: string[] = [];
+    // Model a reload between selected moves using real ready/unavailable stores and real writes.
+    const transitioning = new Proxy(workspace, {
+      get(target, property) {
+        if (property === 'getView') return () => viewStore.getView();
+        if (property === 'moveItem') return async (owner: WorkspaceOwnerRef, id: string, collectionId: string | null, index: number) => {
+          attempts.push(id);
+          await target.moveItem(owner, id, collectionId, index);
+          viewStore = unavailable;
+        };
+        return Reflect.get(target, property);
+      }
+    });
+    const warnings: string[] = [];
+    const provider = new BookmarksTreeDataProvider(transitioning,
+      new FsGitCache(async () => ({ exists: true })), undefined, undefined, undefined, undefined, undefined,
+      message => { warnings.push(message); });
+    const token = new vscode.CancellationTokenSource();
+    const writesBefore = state.updateCallCount;
+    try {
+      await provider.handleDrop({ kind: 'collection', collection: destination, scope: 'workspace', owner: SINGLE_ROOT_OWNER },
+        makeDropTransfer('workspace', items.map(item => item.id)), token.token);
+      assert.deepStrictEqual(attempts, [items[0].id], 'later IDs must not be attempted against unavailable workspace data');
+      assert.strictEqual(state.updateCallCount, writesBefore + 1);
+      const data = workspace.getAll();
+      assert.deepStrictEqual(data.items.filter(item => item.collectionId === destination.id).map(item => item.id), [items[0].id]);
+      assert.deepStrictEqual(data.items.filter(item => item.collectionId === source.id)
+        .sort((left, right) => left.order - right.order).map(item => ({ id: item.id, order: item.order })),
+      [{ id: items[1].id, order: 0 }, { id: items[2].id, order: 1 }]);
+      assert.strictEqual(warnings.length, 1, 'an interrupted partial drop must report one warning');
+      assert.match(warnings[0], /some bookmarks could not be moved/i);
+    } finally { token.dispose(); workspace.dispose(); unavailable.dispose(); }
+  });
+
+  for (const [scope, targetKind] of [
+    ['workspace', 'collection'], ['workspace', 'item'], ['global', 'collection'], ['global', 'item']
+  ] as const) {
+    test(`${scope} ${targetKind} drop preserves successful selection order around multiple failures and warns once`, async () => {
+      const workspace = await createSingleRootFixtureStore();
+      const global = new BookmarkStore(new FakeMemento());
+      const store = scope === 'workspace' ? workspace : global;
+      const source = await store.addCollection('Source');
+      const destination = await store.addCollection('Destination');
+      const add = (name: string, collectionId: string) => store.addItem({ type: 'file', uri: `file:///${name}.txt`, collectionId });
+      const first = await add('first', source.id);
+      const blockedA = await add('blocked-a', source.id);
+      const blockedB = await add('blocked-b', source.id);
+      const last = await add('last', source.id);
+      const existingA = await add('blocked-a', destination.id);
+      const existingB = await add('blocked-b', destination.id);
+      const warnings: string[] = [];
+      // Supply the warning boundary without replacing VS Code's read-only window API.
+      const provider = new BookmarksTreeDataProvider(workspace,
+        new FsGitCache(async () => ({ exists: true })), global, undefined, undefined, undefined, undefined,
+        (message: string) => { warnings.push(message); });
+      const token = new vscode.CancellationTokenSource();
+      let changes = 0;
+      const subscription = store.onBookmarksChanged(() => changes++);
+      try {
+        const target: BookmarkNode = { ...(targetKind === 'collection'
+          ? { kind: 'collection' as const, collection: destination }
+          : { kind: 'item' as const, item: existingA }), scope,
+          ...(scope === 'workspace' ? { owner: SINGLE_ROOT_OWNER } : {}) };
+        await provider.handleDrop(target, makeDropTransfer(scope, [first.id, blockedA.id, blockedB.id, last.id]), token.token);
+        const inCollection = (id: string) => store.getAll().items.filter(item => item.collectionId === id)
+          .sort((a, b) => a.order - b.order).map(item => ({ id: item.id, order: item.order }));
+        assert.deepStrictEqual(inCollection(source.id), [{ id: blockedA.id, order: 0 }, { id: blockedB.id, order: 1 }]);
+        const destinationIds = targetKind === 'collection'
+          ? [existingA.id, existingB.id, first.id, last.id]
+          : [first.id, last.id, existingA.id, existingB.id];
+        assert.deepStrictEqual(inCollection(destination.id), destinationIds
+          .map((id, order) => ({ id, order })));
+        assert.strictEqual(changes, 2, 'only successful item moves publish changes');
+        assert.strictEqual(warnings.length, 1, 'multiple item failures produce one drop warning');
+        assert.match(warnings[0], /some bookmarks could not be moved/i);
+        assert.deepStrictEqual((scope === 'workspace' ? global : workspace).getAll().items, []);
+        await provider.handleDrop(target, makeDropTransfer(scope, [last.id]), token.token);
+        assert.strictEqual(warnings.length, 1, 'a subsequent successful drop produces no warning');
+      } finally { subscription.dispose(); token.dispose(); workspace.dispose(); global.dispose(); }
+    });
+  }
+
+  for (const targetKind of ['collection', 'item', 'root'] as const) {
+    test(`workspace ${targetKind} drop inserts multiple items in envelope order`, async () => {
+      const { store, provider } = await makeProvider();
+      const source = await store.addCollection('Source');
+      const destination = targetKind === 'root' ? undefined : await store.addCollection('Destination');
+      const a = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: source.id });
+      const b = await store.addItem({ type: 'file', uri: 'file:///b.txt', collectionId: source.id });
+      const c = await store.addItem({ type: 'file', uri: 'file:///c.txt', collectionId: source.id });
+      const existingA = await store.addItem({ type: 'file', uri: 'file:///existing-a.txt', collectionId: destination?.id });
+      const existingB = await store.addItem({ type: 'file', uri: 'file:///existing-b.txt', collectionId: destination?.id });
+      const target: BookmarkNode | undefined = targetKind === 'root' ? undefined : targetKind === 'collection'
+        ? { kind: 'collection', collection: destination!, scope: 'workspace', owner: SINGLE_ROOT_OWNER }
+        : { kind: 'item', item: existingB, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
+      const token = new vscode.CancellationTokenSource();
+      try {
+        await provider.handleDrop(target, makeDropTransfer('workspace', [c.id, a.id, b.id]), token.token);
+        const data = store.getAll();
+        assert.deepStrictEqual(data.items.filter(item => item.collectionId === source.id), []);
+        const expected = targetKind === 'item'
+          ? [existingA.id, c.id, a.id, b.id, existingB.id]
+          : [existingA.id, existingB.id, c.id, a.id, b.id];
+        assert.deepStrictEqual(data.items.filter(item => item.collectionId === (destination?.id ?? null))
+          .sort((left, right) => left.order - right.order).map(item => ({ id: item.id, order: item.order })),
+        expected.map((id, order) => ({ id, order })));
+      } finally { token.dispose(); store.dispose(); }
+    });
+  }
+
+  for (const [position, selected, expected] of [
+    ['before', ['b', 'a'], ['b', 'a', 'target', 'c', 'd', 'e']],
+    ['after', ['e', 'c'], ['a', 'b', 'e', 'c', 'target', 'd']],
+    ['around', ['a', 'e', 'b'], ['a', 'e', 'b', 'target', 'c', 'd']]
+  ] as const) {
+    test(`workspace item drop preserves selection order from ${position} a same-parent target`, async () => {
+      const { store, provider } = await makeProvider();
+      const items = new Map<string, BookmarkItem>();
+      for (const name of ['a', 'b', 'target', 'c', 'd', 'e']) {
+        items.set(name, await store.addItem({ type: 'file', uri: `file:///${name}.txt` }));
+      }
+      const target: BookmarkNode = { kind: 'item', item: items.get('target')!, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
+      const token = new vscode.CancellationTokenSource();
+      try {
+        await provider.handleDrop(target, makeDropTransfer('workspace', selected.map(name => items.get(name)!.id)), token.token);
+        assert.deepStrictEqual(store.getAll().items.sort((left, right) => left.order - right.order)
+          .map(item => ({ uri: item.uri, order: item.order })),
+        expected.map((name, order) => ({ uri: `file:///${name}.txt`, order })));
+      } finally { token.dispose(); store.dispose(); }
+    });
+  }
+
   test('dropping with no target appends the item to the root, at the end', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const a = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
 
@@ -223,12 +380,12 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('dropping on a collection node moves the item into it', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const collection = await store.addCollection('Work');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const other = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
 
-    const targetNode: BookmarkNode = { kind: 'collection', collection, scope: 'workspace' };
+    const targetNode: BookmarkNode = { kind: 'collection', collection, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrop(targetNode, makeDropTransfer('workspace', [item.id]), token);
 
@@ -243,12 +400,12 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('dropping on a sibling item reorders within the same parent', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const a = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
     const c = await store.addItem({ type: 'file', uri: 'file:///c.txt' });
 
-    const targetNode: BookmarkNode = { kind: 'item', item: a, scope: 'workspace' }; // drop c onto a's position
+    const targetNode: BookmarkNode = { kind: 'item', item: a, scope: 'workspace', owner: SINGLE_ROOT_OWNER }; // drop c onto a's position
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrop(targetNode, makeDropTransfer('workspace', [c.id]), token);
 
@@ -260,7 +417,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('drag and drop are disabled in group-by-repo mode', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     provider.setGroupMode('byRepo');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
@@ -273,19 +430,19 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('handleDrag is disabled in group-by-repo mode and sets no transfer data', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     provider.setGroupMode('byRepo');
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const dt = new vscode.DataTransfer();
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace' }], dt, token);
+    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER }], dt, token);
 
     assert.strictEqual(dt.get(DND_MIME_TYPE), undefined);
   });
 
   test('handleDrag on an all-workspace-scope selection sets a workspace-scoped transfer envelope', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const a = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const b = await store.addItem({ type: 'file', uri: 'file:///b.txt' });
 
@@ -293,8 +450,8 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrag(
       [
-        { kind: 'item', item: a, scope: 'workspace' },
-        { kind: 'item', item: b, scope: 'workspace' }
+        { kind: 'item', item: a, scope: 'workspace', owner: SINGLE_ROOT_OWNER },
+        { kind: 'item', item: b, scope: 'workspace', owner: SINGLE_ROOT_OWNER }
       ],
       dt,
       token
@@ -307,7 +464,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('handleDrag on an all-global-scope selection sets a global-scoped transfer envelope', async () => {
-    const { globalStore, provider } = makeProviderWithGlobal();
+    const { globalStore, provider } = await makeProviderWithGlobal();
     const a = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
     const b = await globalStore.addItem({ type: 'file', uri: 'file:///global-b.txt' });
 
@@ -329,7 +486,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('handleDrag with a mixed-scope selection sets no transfer data', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
     const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
 
@@ -337,7 +494,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrag(
       [
-        { kind: 'item', item: workspaceItem, scope: 'workspace' },
+        { kind: 'item', item: workspaceItem, scope: 'workspace', owner: SINGLE_ROOT_OWNER },
         { kind: 'item', item: globalItem, scope: 'global' }
       ],
       dt,
@@ -352,11 +509,11 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a global-scope envelope dropped on a workspace collection is a no-op in both stores', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const workspaceCollection = await store.addCollection('WorkCol');
     const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
 
-    const targetNode: BookmarkNode = { kind: 'collection', collection: workspaceCollection, scope: 'workspace' };
+    const targetNode: BookmarkNode = { kind: 'collection', collection: workspaceCollection, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrop(targetNode, makeDropTransfer('global', [globalItem.id]), token);
 
@@ -370,7 +527,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a global-scope envelope dropped on a global collection moves within the global store, workspace store untouched', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const globalCollection = await globalStore.addCollection('GlobalCol');
     const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global-a.txt' });
     await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
@@ -390,7 +547,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a global-scope envelope dropped on the Global row ungroups within the global store', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const globalCollection = await globalStore.addCollection('GlobalCol');
     const globalItem = await globalStore.addItem({
       type: 'file',
@@ -413,7 +570,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a global-scope envelope dropped with no target is a no-op (refused per D5)', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const globalCollection = await globalStore.addCollection('GlobalCol');
     const globalItem = await globalStore.addItem({
       type: 'file',
@@ -435,7 +592,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a workspace-scope envelope dropped on a global collection is a no-op in both stores', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const globalCollection = await globalStore.addCollection('GlobalCol');
     const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
 
@@ -453,7 +610,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a workspace-scope envelope dropped on the Global row is a no-op in both stores', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
     const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
 
     const rootChildren = await provider.getChildren();
@@ -470,7 +627,7 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
   });
 
   test('a global-scope envelope is a no-op when the provider has no globalStore (defensive)', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const workspaceItem = await store.addItem({ type: 'file', uri: 'file:///workspace-a.txt' });
 
     const token = new vscode.CancellationTokenSource().token;
@@ -487,12 +644,12 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
 
 suite('BookmarksTreeDataProvider - descriptions', () => {
   test('an item with a description gets a tooltip containing both the path and the description', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.setItemDescription(item.id, 'the entrypoint');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(typeof treeItem.tooltip, 'string');
     assert.ok((treeItem.tooltip as string).includes('the entrypoint'));
@@ -500,17 +657,17 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
   });
 
   test('an item without a description leaves the tooltip undefined (default path hover survives)', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.tooltip, undefined);
   });
 
   test('a description never displaces the repo-name badge in TreeItem.description', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.setItemDescription(item.id, 'the entrypoint');
     const provider = new BookmarksTreeDataProvider(
@@ -518,33 +675,33 @@ suite('BookmarksTreeDataProvider - descriptions', () => {
       new FsGitCache(async () => ({ exists: true, repoName: 'repo-a' }))
     );
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.description, 'repo-a');
   });
 
   test('a description never displaces the "missing" badge on a broken bookmark', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const item = await store.addItem({ type: 'file', uri: 'file:///gone.txt' });
     await store.setItemDescription(item.id, 'was here');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: false })));
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item: store.getAll().items[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.description, 'missing');
     assert.ok((treeItem.tooltip as string).includes('was here'));
   });
 
   test('a collection with a description gets it as the tooltip; without one the tooltip is undefined', async () => {
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const collection = await store.addCollection('Work');
     const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
 
-    const before = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace' });
+    const before = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(before.tooltip, undefined);
 
     await store.setCollectionDescription(collection.id, 'work-related bookmarks');
-    const after = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace' });
+    const after = await provider.getTreeItem({ kind: 'collection', collection: store.getAll().collections[0], scope: 'workspace', owner: SINGLE_ROOT_OWNER });
     assert.strictEqual(after.tooltip, 'work-related bookmarks');
   });
 });
@@ -560,11 +717,11 @@ function excludeGlobalRoot(nodes: BookmarkNode[]): BookmarkNode[] {
   return nodes.filter((n) => n.kind !== 'globalRoot');
 }
 
-function makeProviderWithGlobal(
+async function makeProviderWithGlobal(
   resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true }),
   getWorkspaceFolders?: () => readonly vscode.WorkspaceFolder[] | undefined
 ) {
-  const store = new BookmarkStore(new FakeMemento());
+  const store = await createSingleRootFixtureStore();
   const globalStore = new BookmarkStore(new FakeMemento());
   const cache = new FsGitCache(resolve);
   const provider = getWorkspaceFolders
@@ -575,7 +732,7 @@ function makeProviderWithGlobal(
 
 suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   test('omitting globalStore leaves root children unaffected — no Global row is synthesized (regression guard)', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     await store.addCollection('Work');
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     await store.addItem({ type: 'file', uri: 'file:///b.txt' });
@@ -591,7 +748,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test('a globalStore constructor argument produces a Global row, positioned first among root children, even when both stores are empty', async () => {
-    const { provider } = makeProviderWithGlobal();
+    const { provider } = await makeProviderWithGlobal();
 
     const children = await provider.getChildren();
 
@@ -602,7 +759,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test('the Global row tree item carries contextValue "bookmarkGlobalRoot"', async () => {
-    const { provider } = makeProviderWithGlobal();
+    const { provider } = await makeProviderWithGlobal();
 
     const children = await provider.getChildren();
     const globalRootNode = findGlobalRoot(children);
@@ -613,7 +770,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test('the Global row is still present and first even when the workspace store already has content', async () => {
-    const { store, provider } = makeProviderWithGlobal();
+    const { store, provider } = await makeProviderWithGlobal();
     await store.addCollection('Work');
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
@@ -622,7 +779,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test('global collections and items render only under the Global row, tagged scope "global"', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
 
     await store.addCollection('WorkCol');
     await store.addItem({ type: 'file', uri: 'file:///workspace-root.txt' });
@@ -670,7 +827,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test("workspace collections and items never leak into the Global row's children", async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal();
+    const { store, globalStore, provider } = await makeProviderWithGlobal();
 
     const workspaceCollection = await store.addCollection('WorkCol');
     const workspaceCollectionItem = await store.addItem({
@@ -707,7 +864,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
 
   test("changes to the global store fire onDidChangeTreeData and invalidate the cache, independent of the workspace store's subscription", async () => {
     let resolveCalls = 0;
-    const { store, globalStore, provider } = makeProviderWithGlobal(async () => {
+    const { store, globalStore, provider } = await makeProviderWithGlobal(async () => {
       resolveCalls++;
       return { exists: true };
     });
@@ -739,7 +896,7 @@ suite('BookmarksTreeDataProvider - Global row (T3)', () => {
   });
 
   test('in byRepo mode, the workspace section groups by repo while the Global row stays flat and ungrouped', async () => {
-    const { store, globalStore, provider } = makeProviderWithGlobal(async (uri) => ({
+    const { store, globalStore, provider } = await makeProviderWithGlobal(async (uri) => ({
       exists: true,
       repoName: uri.includes('repo-a') ? 'repo-a' : uri.includes('repo-b') ? 'repo-b' : undefined
     }));
@@ -822,7 +979,7 @@ function workspaceFolder(uri: vscode.Uri, name = 'workspace-folder', index = 0):
 suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)', () => {
   test('a global folder bookmark outside every workspace folder gets the addable contextValue', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
     const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
 
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
@@ -832,7 +989,7 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
 
   test('a global folder bookmark already inside a workspace folder keeps the plain contextValue', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/global/some-repo'))];
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
     const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
 
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
@@ -842,7 +999,7 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
 
   test('a global file bookmark outside every workspace folder never gets the addable contextValue', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
     const item = await globalStore.addItem({ type: 'file', uri: 'file:///global/some-file.txt' });
 
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
@@ -852,10 +1009,10 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
 
   test('a workspace-scoped folder bookmark outside every current workspace folder is still never addable', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/other-project'))];
-    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { store, provider } = await makeProviderWithGlobal(undefined, () => folders);
     const item = await store.addItem({ type: 'folder', uri: 'file:///workspace/some-repo' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(
       treeItem.contextValue,
@@ -865,7 +1022,7 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
   });
 
   test('a global folder bookmark gets the addable contextValue when no workspace is open at all (folders undefined)', async () => {
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => undefined);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => undefined);
     const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
 
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
@@ -874,7 +1031,7 @@ suite('BookmarksTreeDataProvider - addable contextValue for global folders (T9)'
   });
 
   test('a global folder bookmark gets the addable contextValue when the workspace folder list is empty', async () => {
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => []);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => []);
     const item = await globalStore.addItem({ type: 'folder', uri: 'file:///global/some-repo' });
 
     const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
@@ -907,7 +1064,7 @@ function recentItem(overrides: Partial<RecentItem> = {}): RecentItem {
   };
 }
 
-function makeProviderWithSuggestions(
+async function makeProviderWithSuggestions(
   recentItems: RecentItem[],
   maxItems = 10,
   options: {
@@ -915,7 +1072,7 @@ function makeProviderWithSuggestions(
     globalStore?: BookmarkStore;
   } = {}
 ) {
-  const store = new BookmarkStore(new FakeMemento());
+  const store = await createSingleRootFixtureStore();
   const cache = new FsGitCache(options.resolve ?? (async () => ({ exists: true })));
   const provider = new BookmarksTreeDataProvider(store, cache, options.globalStore, undefined, {
     getRecentItems: () => recentItems,
@@ -930,13 +1087,13 @@ function findSuggestedRoot(nodes: BookmarkNode[]): BookmarkNode | undefined {
 
 suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   test('omitting the suggestions option leaves root children unaffected — no Suggested row is synthesized (regression guard)', async () => {
-    const { provider } = makeProvider(); // the pre-#95 constructor call shape, unchanged
+    const { provider } = await makeProvider(); // the pre-#95 constructor call shape, unchanged
     const children = await provider.getChildren();
     assert.ok(children.every((n) => n.kind !== 'suggestedRoot'));
   });
 
   test('the Suggested row is absent when there are zero promoted recent items', async () => {
-    const { provider } = makeProviderWithSuggestions([recentItem({ promoted: false, previewCount: 1 })]);
+    const { provider } = await makeProviderWithSuggestions([recentItem({ promoted: false, previewCount: 1 })]);
     const children = await provider.getChildren();
     assert.strictEqual(
       findSuggestedRoot(children),
@@ -946,21 +1103,21 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 
   test('the Suggested row appears, positioned last, when at least one promoted suggestion exists (D8)', async () => {
-    const { provider } = makeProviderWithSuggestions([recentItem()]);
+    const { provider } = await makeProviderWithSuggestions([recentItem()]);
     const children = await provider.getChildren();
     assert.strictEqual(children[children.length - 1].kind, 'suggestedRoot');
   });
 
   test('the Suggested row sits below the Global row when both are present (D8)', async () => {
     const globalStore = new BookmarkStore(new FakeMemento());
-    const { provider } = makeProviderWithSuggestions([recentItem()], 10, { globalStore });
+    const { provider } = await makeProviderWithSuggestions([recentItem()], 10, { globalStore });
     const children = await provider.getChildren();
     assert.strictEqual(children[0].kind, 'globalRoot');
     assert.strictEqual(children[children.length - 1].kind, 'suggestedRoot');
   });
 
   test('the Suggested row still appears last in byRepo mode (D8: present in both group modes)', async () => {
-    const { store, provider } = makeProviderWithSuggestions([recentItem()]);
+    const { store, provider } = await makeProviderWithSuggestions([recentItem()]);
     provider.setGroupMode('byRepo');
     await store.addItem({ type: 'file', uri: 'file:///bookmarked.txt' });
 
@@ -969,7 +1126,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 
   test('the Suggested row tree item defaults to collapsed (D8)', async () => {
-    const { provider } = makeProviderWithSuggestions([recentItem()]);
+    const { provider } = await makeProviderWithSuggestions([recentItem()]);
     const children = await provider.getChildren();
     const node = findSuggestedRoot(children)!;
     const treeItem = await provider.getTreeItem(node);
@@ -978,7 +1135,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
 
   test('a suggestion leaf tree item opens the file directly and carries the bookmarkSuggestion contextValue (T5)', async () => {
     const uri = 'file:///suggested-a.txt';
-    const { provider } = makeProviderWithSuggestions([recentItem({ uri })]);
+    const { provider } = await makeProviderWithSuggestions([recentItem({ uri })]);
     const rootChildren = await provider.getChildren();
     const suggestedRoot = findSuggestedRoot(rootChildren)!;
     const leaves = await provider.getChildren(suggestedRoot);
@@ -995,7 +1152,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   test('getChildren for the Suggested row excludes a uri already bookmarked in the workspace store (C7/D9)', async () => {
     const bookmarkedUri = 'file:///already.txt';
     const otherUri = 'file:///still-suggested.txt';
-    const { store, provider } = makeProviderWithSuggestions([
+    const { store, provider } = await makeProviderWithSuggestions([
       recentItem({ uri: bookmarkedUri, firstSeen: 100 }),
       recentItem({ uri: otherUri, firstSeen: 200 })
     ]);
@@ -1015,7 +1172,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
     const globalStore = new BookmarkStore(new FakeMemento());
     await globalStore.addItem({ type: 'file', uri: bookmarkedUri });
 
-    const { provider } = makeProviderWithSuggestions(
+    const { provider } = await makeProviderWithSuggestions(
       [recentItem({ uri: bookmarkedUri, firstSeen: 100 }), recentItem({ uri: otherUri, firstSeen: 200 })],
       10,
       { globalStore }
@@ -1030,7 +1187,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 
   test('getChildren for the Suggested row never includes a non-promoted (preview-only) entry', async () => {
-    const { provider } = makeProviderWithSuggestions([
+    const { provider } = await makeProviderWithSuggestions([
       recentItem({ uri: 'file:///promoted.txt', promoted: true, firstSeen: 100 }),
       recentItem({ uri: 'file:///preview-only.txt', promoted: false, previewCount: 1, firstSeen: 200 })
     ]);
@@ -1044,7 +1201,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 
   test('getChildren for the Suggested row is capped by maxItems, keeping the most-recently-first-seen entries (D3/D6)', async () => {
-    const { provider } = makeProviderWithSuggestions(
+    const { provider } = await makeProviderWithSuggestions(
       [
         recentItem({ uri: 'file:///oldest.txt', firstSeen: 100 }),
         recentItem({ uri: 'file:///middle.txt', firstSeen: 200 }),
@@ -1062,13 +1219,13 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
   });
 
   test('a maxItems of 0 hides the Suggested row entirely, even with promoted entries present (D3)', async () => {
-    const { provider } = makeProviderWithSuggestions([recentItem()], 0);
+    const { provider } = await makeProviderWithSuggestions([recentItem()], 0);
     const children = await provider.getChildren();
     assert.strictEqual(findSuggestedRoot(children), undefined);
   });
 
   test('suggestion leaves render most-recently-first-seen first (D6 sort)', async () => {
-    const { provider } = makeProviderWithSuggestions([
+    const { provider } = await makeProviderWithSuggestions([
       recentItem({ uri: 'file:///older.txt', firstSeen: 100 }),
       recentItem({ uri: 'file:///newer.txt', firstSeen: 200 })
     ]);
@@ -1124,33 +1281,33 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
 
 suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
   test('defaults to off', async () => {
-    const { provider } = makeProvider();
+    const { provider } = await makeProvider();
     assert.strictEqual(provider.getShowFullPath(), false);
   });
 
   test('sanity: toggle off keeps the pre-#115 filename-only label unchanged', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'index.ts');
   });
 
   test('toggle on: label becomes the path relative to the workspace root, using "/" separators', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { store, provider } = await makeProviderWithGlobal(undefined, () => folders);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'src/index.ts');
   });
 
   test('toggle on + Group by Repo: relative-path label has no duplicated repo-name prefix (AC-2)', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
+    const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
     provider.setGroupMode('byRepo');
     provider.setShowFullPath(true);
     await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
@@ -1171,11 +1328,11 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
 
   test('toggle on does not displace the repo-name description badge', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
+    const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'src/index.ts');
     assert.strictEqual(treeItem.description, 'repo-a', 'the repo-name description badge must survive the full-path toggle');
@@ -1183,38 +1340,38 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
 
   test('toggle on does not displace the "missing" description badge', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = makeProviderWithGlobal(async () => ({ exists: false }), () => folders);
+    const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: false }), () => folders);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/gone.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.description, 'missing', 'the "missing" badge must survive the full-path toggle');
   });
 
   test('toggle on, no workspace root available (folders undefined): falls back to filename-only (D-115.3)', async () => {
-    const { store, provider } = makeProviderWithGlobal(undefined, () => undefined);
+    const { store, provider } = await makeProviderWithGlobal(undefined, () => undefined);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///anywhere/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'index.ts');
   });
 
   test('toggle on, empty workspace folder list: falls back to filename-only', async () => {
-    const { store, provider } = makeProviderWithGlobal(undefined, () => []);
+    const { store, provider } = await makeProviderWithGlobal(undefined, () => []);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///anywhere/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'index.ts');
   });
 
   test('toggle on: a global-scoped bookmark inside a current workspace folder still gets a relative-path label (fallback is per-URI, not per-scope)', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { globalStore, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
     provider.setShowFullPath(true);
     const item = await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/util.ts' });
 
@@ -1225,18 +1382,18 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
 
   test('toggle on: a workspace-scoped bookmark outside every workspace folder falls back to filename-only', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = makeProviderWithGlobal(undefined, () => folders);
+    const { store, provider } = await makeProviderWithGlobal(undefined, () => folders);
     provider.setShowFullPath(true);
     const item = await store.addItem({ type: 'file', uri: 'file:///elsewhere/outside.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace' });
+    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
 
     assert.strictEqual(treeItem.label, 'outside.ts');
   });
 
   test('setShowFullPath persists through an optional viewState memento, read back by a freshly constructed provider (simulated reload)', async () => {
     const viewState = new FakeMemento();
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const cache = new FsGitCache(async () => ({ exists: true }));
 
     const provider1 = new BookmarksTreeDataProvider(store, cache, undefined, undefined, undefined, undefined, viewState);
@@ -1255,7 +1412,7 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
   });
 
   test('omitting viewState leaves the toggle in-memory only — no persistence, no throw (regression guard)', async () => {
-    const { provider } = makeProvider(); // the pre-#115 constructor call shape, unchanged
+    const { provider } = await makeProvider(); // the pre-#115 constructor call shape, unchanged
     provider.setShowFullPath(true);
     assert.strictEqual(provider.getShowFullPath(), true, 'in-memory toggling must still work with no viewState supplied');
   });
@@ -1299,7 +1456,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks staleness filtering (Code
   test('a persisted suggestion whose file no longer exists on disk is filtered out of the Suggested leaves', async () => {
     const staleUri = 'file:///deleted.txt';
     const validUri = 'file:///still-there.txt';
-    const { provider } = makeProviderWithSuggestions(
+    const { provider } = await makeProviderWithSuggestions(
       [recentItem({ uri: staleUri, firstSeen: 100 }), recentItem({ uri: validUri, firstSeen: 200 })],
       10,
       { resolve: async (uri) => ({ exists: uri !== staleUri }) }
@@ -1315,7 +1472,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks staleness filtering (Code
 
   test('when every persisted suggestion is stale, the Suggested row does not appear at all (D8: hidden when empty)', async () => {
     const staleUri = 'file:///deleted-only.txt';
-    const { provider } = makeProviderWithSuggestions([recentItem({ uri: staleUri })], 10, {
+    const { provider } = await makeProviderWithSuggestions([recentItem({ uri: staleUri })], 10, {
       resolve: async () => ({ exists: false })
     });
 
@@ -1332,7 +1489,7 @@ suite('BookmarksTreeDataProvider - suggested bookmarks staleness filtering (Code
     const staleUri = 'file:///stale-cap.txt';
     const validA = 'file:///valid-a.txt';
     const validB = 'file:///valid-b.txt';
-    const { provider } = makeProviderWithSuggestions(
+    const { provider } = await makeProviderWithSuggestions(
       [
         // Most recently first-seen, so a cap-then-filter (wrong order) would keep the stale entry
         // and evict a valid one; filter-then-cap (required) must not.
@@ -1372,12 +1529,12 @@ suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', 
   }
 
   test('handleDrag ignores a suggestion node mixed into an otherwise-draggable selection', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const dt = new vscode.DataTransfer();
     const token = new vscode.CancellationTokenSource().token;
-    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace' }, suggestionNode()], dt, token);
+    await provider.handleDrag([{ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER }, suggestionNode()], dt, token);
 
     const envelope = getTransferEnvelope(dt);
     assert.ok(envelope, 'the real item must still be draggable despite the mixed-in suggestion node');
@@ -1385,7 +1542,7 @@ suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', 
   });
 
   test('handleDrag on an all-suggestion selection sets no transfer data', async () => {
-    const { provider } = makeProvider();
+    const { provider } = await makeProvider();
     const dt = new vscode.DataTransfer();
     const token = new vscode.CancellationTokenSource().token;
     await provider.handleDrag([suggestionNode('file:///a.txt'), suggestionNode('file:///b.txt')], dt, token);
@@ -1393,7 +1550,7 @@ suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', 
   });
 
   test('handleDrop on a suggestion node target is a no-op', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const token = new vscode.CancellationTokenSource().token;
@@ -1405,7 +1562,7 @@ suite('BookmarksTreeDataProvider - suggestion-kind regression guards (#95 R4)', 
   });
 
   test('handleDrop on a suggestedRoot node target is a no-op', async () => {
-    const { store, provider } = makeProvider();
+    const { store, provider } = await makeProvider();
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });
 
     const token = new vscode.CancellationTokenSource().token;
@@ -1434,7 +1591,7 @@ function findRecentRoot(nodes: BookmarkNode[]): BookmarkNode | undefined {
   return nodes.find((n) => n.kind === 'recentRoot');
 }
 
-function makeProviderWithRecentlyViewed(
+async function makeProviderWithRecentlyViewed(
   uris: string[],
   options: {
     resolve?: (uri: string) => Promise<{ exists: boolean; repoName?: string }>;
@@ -1442,7 +1599,7 @@ function makeProviderWithRecentlyViewed(
     suggestions?: { getRecentItems: () => RecentItem[]; maxItems: number };
   } = {}
 ) {
-  const store = new BookmarkStore(new FakeMemento());
+  const store = await createSingleRootFixtureStore();
   const cache = new FsGitCache(options.resolve ?? (async () => ({ exists: true })));
   const provider = new BookmarksTreeDataProvider(
     store,
@@ -1457,26 +1614,26 @@ function makeProviderWithRecentlyViewed(
 
 suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
   test('omitting the recentlyViewed option leaves root children unaffected — no Recent row is synthesized (regression guard)', async () => {
-    const { provider } = makeProvider(); // the pre-#108 constructor call shape, unchanged
+    const { provider } = await makeProvider(); // the pre-#108 constructor call shape, unchanged
     const children = await provider.getChildren();
     assert.ok(children.every((n) => n.kind !== 'recentRoot'));
   });
 
   test('the Recent row is absent when recentlyViewed.getUris() returns an empty list', async () => {
-    const { provider } = makeProviderWithRecentlyViewed([]);
+    const { provider } = await makeProviderWithRecentlyViewed([]);
     const children = await provider.getChildren();
     assert.strictEqual(findRecentRoot(children), undefined);
   });
 
   test('the Recent row appears when recentlyViewed.getUris() returns at least one uri', async () => {
-    const { provider } = makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
+    const { provider } = await makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
     const children = await provider.getChildren();
     assert.ok(findRecentRoot(children), 'expected a recentRoot node among root children');
   });
 
   test('the Recent row is positioned after the Suggested row: Global, ...normal children, Suggested, Recent', async () => {
     const globalStore = new BookmarkStore(new FakeMemento());
-    const store = new BookmarkStore(new FakeMemento());
+    const store = await createSingleRootFixtureStore();
     const cache = new FsGitCache(async () => ({ exists: true }));
     const provider = new BookmarksTreeDataProvider(
       store,
@@ -1505,7 +1662,7 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
   });
 
   test('the Recent row tree item: label "Recent", collapsed, contextValue bookmarkRecentRoot, ThemeIcon set', async () => {
-    const { provider } = makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
+    const { provider } = await makeProviderWithRecentlyViewed(['file:///recent-a.txt']);
     const children = await provider.getChildren();
     const node = findRecentRoot(children)!;
 
@@ -1518,7 +1675,7 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
 
   test('a recentItem tree item: label is the uri basename, no children, contextValue bookmarkRecentItem, resourceUri set, opens via vscode.open', async () => {
     const uri = 'file:///workspace/recent-file.txt';
-    const { provider } = makeProviderWithRecentlyViewed([uri]);
+    const { provider } = await makeProviderWithRecentlyViewed([uri]);
     const rootChildren = await provider.getChildren();
     const recentRoot = findRecentRoot(rootChildren)!;
     const leaves = await provider.getChildren(recentRoot);
@@ -1537,7 +1694,7 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
 
   test('getChildren(recentRoot) returns one recentItem per uri, in the same order the source returns them (source owns MRU ordering, provider does not re-sort)', async () => {
     const uris = ['file:///c.txt', 'file:///a.txt', 'file:///b.txt'];
-    const { provider } = makeProviderWithRecentlyViewed(uris);
+    const { provider } = await makeProviderWithRecentlyViewed(uris);
 
     const rootChildren = await provider.getChildren();
     const recentRoot = findRecentRoot(rootChildren)!;
@@ -1552,7 +1709,7 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
 
   test('a uri that is already bookmarked in the store still appears as a recentItem — Recent does NOT filter out already-bookmarked items, unlike Suggested', async () => {
     const uri = 'file:///already-bookmarked.txt';
-    const { store, provider } = makeProviderWithRecentlyViewed([uri]);
+    const { store, provider } = await makeProviderWithRecentlyViewed([uri]);
     await store.addItem({ type: 'file', uri });
 
     const rootChildren = await provider.getChildren();
@@ -1570,7 +1727,7 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
 
   test('a uri that no longer exists on disk still appears as a recentItem — Recent is not filtered for filesystem existence/staleness, unlike Suggested', async () => {
     const uri = 'file:///stale-recent.txt';
-    const { provider } = makeProviderWithRecentlyViewed([uri], {
+    const { provider } = await makeProviderWithRecentlyViewed([uri], {
       resolve: async () => ({ exists: false })
     });
 
@@ -1584,5 +1741,337 @@ suite('BookmarksTreeDataProvider - Recent row (#108)', () => {
       'a stale (non-existent) recent uri must still render as a clickable node under Recent'
     );
     assert.strictEqual((leaves[0] as unknown as { uri: string }).uri, uri);
+  });
+});
+
+// --- #62: partition-aware workspace topology -----------------------------------------------
+
+const OWNER_A: WorkspaceOwnerRef = { kind: 'partition', partitionId: 'partition-a' };
+const OWNER_B: WorkspaceOwnerRef = { kind: 'partition', partitionId: 'partition-b' };
+
+function partitionItem(id: string, uri = `file:///workspace/${id}.ts`, collectionId: string | null = null): BookmarkItem {
+  return { id, type: 'file', uri, collectionId, order: 0 };
+}
+
+function partitionData(items: BookmarkItem[] = [], collections: BookmarkData['collections'] = []): BookmarkData {
+  return { version: 2, items, collections };
+}
+
+function readyWorkspaceView(options: {
+  attached?: Array<{ partitionId: string; label: string; data?: BookmarkData }>;
+  unassigned?: BookmarkData;
+  detached?: Array<{ partitionId: string; label?: string; data?: BookmarkData }>;
+} = {}): WorkspaceStoreView {
+  return {
+    kind: 'ready',
+    attached: (options.attached ?? []).map((entry) => ({
+      partitionId: entry.partitionId,
+      label: entry.label,
+      rootUri: `file:///workspace/${entry.partitionId}`,
+      canonicalRootUri: `file:///workspace/${entry.partitionId}`,
+      replacementEligible: false,
+      data: entry.data ?? partitionData()
+    })),
+    unassigned: options.unassigned ?? partitionData(),
+    detached: (options.detached ?? []).map((entry) => ({
+      partitionId: entry.partitionId,
+      lastKnownRootUri: entry.label ?? `file:///old/${entry.partitionId}`,
+      canonicalLastKnownRootUri: entry.label ?? `file:///old/${entry.partitionId}`,
+      replacementEligible: false,
+      data: entry.data ?? partitionData()
+    })),
+    unavailableRoots: []
+  };
+}
+
+function unavailableWorkspaceView(): WorkspaceStoreView {
+  return { kind: 'unavailable', attached: [], detached: [], unassigned: partitionData(), unavailableRoots: [], reason: 'bad data' };
+}
+
+function providerForWorkspaceView(
+  view: WorkspaceStoreView,
+  options: {
+    globalStore?: BookmarkStore;
+    repoForUri?: (uri: string) => string | undefined;
+    suggestions?: SuggestionsSource;
+    recentlyViewed?: RecentlyViewedSource;
+  } = {}
+) {
+  const changes = new vscode.EventEmitter<void>();
+  const moves: Array<{ owner: WorkspaceOwnerRef; id: string; collectionId: string | null; index: number }> = [];
+  const aggregate = (): BookmarkData => ({
+    version: 2,
+    items: [
+      ...view.attached.flatMap((partition) => partition.data.items),
+      ...view.detached.flatMap((partition) => partition.data.items),
+      ...view.unassigned.items
+    ],
+    collections: [
+      ...view.attached.flatMap((partition) => partition.data.collections),
+      ...view.detached.flatMap((partition) => partition.data.collections),
+      ...view.unassigned.collections
+    ]
+  });
+  const workspaceStore = {
+    onBookmarksChanged: changes.event,
+    getAll: aggregate,
+    getView: () => view,
+    moveItem: async (owner: WorkspaceOwnerRef, id: string, collectionId: string | null, index: number) => {
+      moves.push({ owner, id, collectionId, index });
+    }
+  } as unknown as WorkspaceBookmarkStore;
+  const provider = new BookmarksTreeDataProvider(
+    workspaceStore,
+    new FsGitCache(async (uri) => ({ exists: true, repoName: options.repoForUri?.(uri) })),
+    options.globalStore,
+    undefined,
+    options.suggestions,
+    options.recentlyViewed
+  );
+  return { provider, moves, changes };
+}
+
+function partitionEnvelope(owner: WorkspaceOwnerRef | undefined, ids: string[]): vscode.DataTransfer {
+  const transfer = new vscode.DataTransfer();
+  transfer.set(DND_MIME_TYPE, new vscode.DataTransferItem({ scope: 'workspace', owner, ids }));
+  return transfer;
+}
+
+suite('BookmarksTreeDataProvider - workspace partitions (#62)', () => {
+  test('unavailable workspace suppresses Suggested including stale expansion while retaining Global and Recent', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const globalItem = await globalStore.addItem({ type: 'file', uri: 'file:///global.ts' });
+    const { provider, changes } = providerForWorkspaceView(unavailableWorkspaceView(), {
+      globalStore,
+      suggestions: { getRecentItems: () => [{ uri: 'file:///preserved.ts', firstSeen: 1, previewCount: 0, promoted: true }], maxItems: 1 },
+      recentlyViewed: { getUris: () => ['file:///recent.ts'] }
+    });
+    try {
+      assert.deepStrictEqual((await provider.getChildren()).map(node => node.kind), ['globalRoot', 'workspaceDiagnostic', 'recentRoot']);
+      assert.deepStrictEqual(await provider.getChildren({ kind: 'suggestedRoot' }), []);
+      const globalChildren = await provider.getChildren({ kind: 'globalRoot' });
+      assert.strictEqual(globalChildren[0].kind === 'item' && globalChildren[0].item.id, globalItem.id);
+      assert.deepStrictEqual(await provider.getChildren({ kind: 'recentRoot' }), [{ kind: 'recentItem', uri: 'file:///recent.ts' }]);
+    } finally { changes.dispose(); globalStore.dispose(); }
+  });
+
+  test('keeps one attached root flat and carries its partition owner', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'workspaceRoot'), false);
+    const item = roots.find((node) => node.kind === 'item');
+    assert.deepStrictEqual(item && (item as Extract<BookmarkNode, { kind: 'item' }>).owner, OWNER_A);
+  });
+
+  test('wraps every attached root in a multi-root workspace in current workspace order', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_B.partitionId, label: 'Root B' },
+        { partitionId: OWNER_A.partitionId, label: 'Root A' }
+      ]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.deepStrictEqual(
+      roots.filter((node) => node.kind === 'workspaceRoot').map((node) => (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId),
+      [OWNER_B.partitionId, OWNER_A.partitionId]
+    );
+  });
+
+  test('shows preservation sections only when their owner data is populated', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      unassigned: partitionData([partitionItem('unassigned')]),
+      detached: [
+        { partitionId: 'detached-a', data: partitionData([partitionItem('detached-a')]) },
+        { partitionId: 'detached-empty' }
+      ]
+    }));
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'unassignedRoot'), true);
+    assert.strictEqual(roots.some((node) => node.kind === 'detachedRoot'), true);
+    const detachedRoot = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedPartitions = await provider.getChildren(detachedRoot);
+    assert.deepStrictEqual(
+      detachedPartitions.map((node) => (node as Extract<BookmarkNode, { kind: 'detachedPartition' }>).partitionId),
+      ['detached-a', 'detached-empty']
+    );
+  });
+
+  test('shows a workspace diagnostic instead of unavailable workspace content', async () => {
+    const { provider } = providerForWorkspaceView(unavailableWorkspaceView());
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.filter((node) => node.kind === 'workspaceDiagnostic').length, 1);
+  });
+
+  test('keeps equal repo names isolated inside each owner', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a', 'file:///workspace/a/a.ts')]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([partitionItem('b', 'file:///workspace/b/b.ts')]) }
+      ]
+    }), { repoForUri: () => 'shared-repo' });
+    provider.setGroupMode('byRepo');
+
+    const roots = await provider.getChildren();
+    const rootA = roots.find((node) => node.kind === 'workspaceRoot' && (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId === OWNER_A.partitionId)!;
+    const groups = await provider.getChildren(rootA);
+    assert.strictEqual(groups.length, 1);
+    const items = await provider.getChildren(groups[0]);
+    assert.deepStrictEqual(items.map((node) => (node as Extract<BookmarkNode, { kind: 'item' }>).item.id), ['a']);
+  });
+
+  test('prefixes tree item identities with their owner to prevent collisions', async () => {
+    const shared = partitionItem('same-id');
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([shared]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([{ ...shared, uri: 'file:///workspace/b/same-id.ts' }]) }
+      ]
+    }));
+    const roots = await provider.getChildren();
+    const first = (await provider.getChildren(roots[0]))[0];
+    const second = (await provider.getChildren(roots[1]))[0];
+    assert.notStrictEqual((await provider.getTreeItem(first)).id, (await provider.getTreeItem(second)).id);
+  });
+
+  test('orders Global, workspace, preservation, Suggested, and Recent deterministically', async () => {
+    const globalStore = new BookmarkStore(new FakeMemento());
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }],
+      unassigned: partitionData([partitionItem('u')]),
+      detached: [{ partitionId: 'detached-a', data: partitionData([partitionItem('d')]) }]
+    }), {
+      globalStore,
+      suggestions: { getRecentItems: () => [{ uri: 'file:///suggested.ts', firstSeen: 1, previewCount: 0, promoted: true }], maxItems: 1 },
+      recentlyViewed: { getUris: () => ['file:///recent.ts'] }
+    });
+    assert.deepStrictEqual((await provider.getChildren()).map((node) => node.kind), [
+      'globalRoot', 'item', 'unassignedRoot', 'detachedRoot', 'suggestedRoot', 'recentRoot'
+    ]);
+  });
+
+  test('does not re-suggest bookmarks preserved in Detached or Unassigned while Recent stays unfiltered', async () => {
+    const detachedUri = 'file:///old/detached.ts';
+    const unassignedUri = 'file:///outside/unassigned.ts';
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      unassigned: partitionData([partitionItem('u', unassignedUri)]),
+      detached: [{ partitionId: 'old', data: partitionData([partitionItem('d', detachedUri)]) }]
+    }), {
+      suggestions: {
+        getRecentItems: () => [
+          { uri: detachedUri, firstSeen: 2, previewCount: 0, promoted: true },
+          { uri: unassignedUri, firstSeen: 1, previewCount: 0, promoted: true }
+        ], maxItems: 2
+      },
+      recentlyViewed: { getUris: () => [detachedUri] }
+    });
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.some((node) => node.kind === 'suggestedRoot'), false);
+    assert.strictEqual(roots.some((node) => node.kind === 'recentRoot'), true);
+  });
+
+  test('permits same-owner workspace drops and rejects missing or cross-owner envelopes without mutation', async () => {
+    const collection = { id: 'collection-a', name: 'A', order: 0 };
+    const { provider, moves } = providerForWorkspaceView(readyWorkspaceView({
+      attached: [
+        { partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')], [collection]) },
+        { partitionId: OWNER_B.partitionId, label: 'Root B', data: partitionData([partitionItem('b')]) }
+      ]
+    }));
+    const token = new vscode.CancellationTokenSource().token;
+    const roots = await provider.getChildren();
+    const rootA = roots.find((node) => node.kind === 'workspaceRoot' && (node as Extract<BookmarkNode, { kind: 'workspaceRoot' }>).partitionId === OWNER_A.partitionId)!;
+    const target = (await provider.getChildren(rootA)).find((node) => node.kind === 'collection')!;
+
+    await provider.handleDrop(target, partitionEnvelope(undefined, ['a']), token);
+    await provider.handleDrop(target, partitionEnvelope(OWNER_B, ['b']), token);
+    assert.deepStrictEqual(moves, []);
+
+    await provider.handleDrop(target, partitionEnvelope(OWNER_A, ['a']), token);
+    assert.deepStrictEqual(moves, [{ owner: OWNER_A, id: 'a', collectionId: 'collection-a', index: 0 }]);
+  });
+
+  test('rejects a multi-selection drag that mixes workspace owners', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView());
+    const transfer = new vscode.DataTransfer();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.handleDrag([
+      { kind: 'item', item: partitionItem('a'), scope: 'workspace', owner: OWNER_A },
+      { kind: 'item', item: partitionItem('b'), scope: 'workspace', owner: OWNER_B }
+    ], transfer, token);
+    assert.strictEqual(transfer.get(DND_MIME_TYPE), undefined);
+  });
+
+  test('allows an untargeted drop to the attached owner in a flat single-root tree', async () => {
+    const store = await createSingleRootFixtureStore();
+    const collection = await store.addCollection('Only collection');
+    const item = await store.addItem({ type: 'file', uri: 'file:///a', collectionId: collection.id });
+    assert.strictEqual(store.getOwnerData(SINGLE_ROOT_OWNER)!.items[0].collectionId, collection.id);
+    const provider = new BookmarksTreeDataProvider(store, new FsGitCache(async () => ({ exists: true })));
+    await provider.handleDrop(undefined, partitionEnvelope(SINGLE_ROOT_OWNER, [item.id]), new vscode.CancellationTokenSource().token);
+    assert.strictEqual(store.getOwnerData(SINGLE_ROOT_OWNER)!.items[0].collectionId, null);
+    assert.strictEqual(store.getOwnerData(SINGLE_ROOT_OWNER)!.items[0].order, 0);
+    store.dispose();
+  });
+
+  test('keeps Detached visible and lists empty detached partitions for recovery', async () => {
+    const { provider } = providerForWorkspaceView(readyWorkspaceView({
+      detached: [{ partitionId: 'empty-a' }, { partitionId: 'empty-b' }]
+    }));
+    const roots = await provider.getChildren();
+    const detached = roots.find((node) => node.kind === 'detachedRoot')!;
+    assert.ok(detached);
+    assert.deepStrictEqual(
+      (await provider.getChildren(detached)).map((node) => (node as Extract<BookmarkNode, { kind: 'detachedPartition' }>).partitionId),
+      ['empty-a', 'empty-b']
+    );
+  });
+
+  test('rejects Unassigned, Detached, and no-longer-attached workspace drop targets', async () => {
+    const unassignedCollection = { id: 'unassigned-collection', name: 'Unassigned', order: 0 };
+    const detachedCollection = { id: 'detached-collection', name: 'Detached', order: 0 };
+    const view = readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Root A', data: partitionData([partitionItem('a')]) }],
+      unassigned: partitionData([partitionItem('u')], [unassignedCollection]),
+      detached: [{ partitionId: 'detached-a', data: partitionData([partitionItem('d')], [detachedCollection]) }]
+    });
+    const { provider, moves } = providerForWorkspaceView(view);
+    const token = new vscode.CancellationTokenSource().token;
+    const roots = await provider.getChildren();
+    const unassignedTarget = (await provider.getChildren(roots.find((node) => node.kind === 'unassignedRoot')!)).find((node) => node.kind === 'collection')!;
+    const detachedRoot = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedTarget = (await provider.getChildren((await provider.getChildren(detachedRoot))[0])).find((node) => node.kind === 'item')!;
+    await provider.handleDrop(unassignedTarget, partitionEnvelope({ kind: 'unassigned' }, ['u']), token);
+    await provider.handleDrop(detachedTarget, partitionEnvelope({ kind: 'partition', partitionId: 'detached-a' }, ['d']), token);
+
+    const attachedTarget = (await provider.getChildren()).find((node) => node.kind === 'item')!;
+    (view as unknown as { attached: unknown[] }).attached = [];
+    (view as unknown as { detached: unknown[] }).detached = [{
+      partitionId: OWNER_A.partitionId, lastKnownRootUri: 'file:///old/a', canonicalLastKnownRootUri: 'file:///old/a', replacementEligible: false,
+      data: partitionData([partitionItem('a')])
+    }];
+    await provider.handleDrop(attachedTarget, partitionEnvelope(OWNER_A, ['a']), token);
+    assert.deepStrictEqual(moves, []);
+  });
+
+  test('gives equal-label workspace and detached wrappers stable partition identities', async () => {
+    const view = readyWorkspaceView({
+      attached: [{ partitionId: OWNER_A.partitionId, label: 'Same' }, { partitionId: OWNER_B.partitionId, label: 'Same' }],
+      detached: [{ partitionId: 'old-a', label: 'Same' }, { partitionId: 'old-b', label: 'Same' }]
+    });
+    const { provider } = providerForWorkspaceView(view);
+    const roots = await provider.getChildren();
+    const attachedIds = await Promise.all(roots.filter((node) => node.kind === 'workspaceRoot').map((node) => provider.getTreeItem(node)));
+    assert.strictEqual(new Set(attachedIds.map((item) => item.id)).size, 2);
+    const detached = roots.find((node) => node.kind === 'detachedRoot')!;
+    const detachedIds = await Promise.all((await provider.getChildren(detached)).map((node) => provider.getTreeItem(node)));
+    assert.strictEqual(new Set(detachedIds.map((item) => item.id)).size, 2);
+    (view.attached[0] as { label: string }).label = 'Renamed';
+    const renamed = await provider.getChildren();
+    assert.strictEqual((await provider.getTreeItem(renamed.find((node) => node.kind === 'workspaceRoot')!)).id, attachedIds[0].id);
   });
 });

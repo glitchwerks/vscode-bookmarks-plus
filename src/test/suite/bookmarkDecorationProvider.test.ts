@@ -1,3 +1,8 @@
+import { createSingleRootFixtureStore, SINGLE_ROOT_OWNER } from './singleRootFixture';
+import { WorkspaceMirrorCoordinator } from '../../workspaceMirrorCoordinator';
+import { FakePartitionMirrorResources } from './fixtures';
+const mirrorCoordinators: WorkspaceMirrorCoordinator[] = [];
+teardown(() => { mirrorCoordinators.splice(0).forEach(coordinator => coordinator.dispose()); });
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
@@ -264,12 +269,17 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
   test('mirror-reload fire site: adopting an externally-added bookmark fires onDidChangeFileDecorations exactly once, including the added uri', async () => {
     const mirror = new FakeMirror();
     const memento = new FakeMemento();
-    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+    const store = await createSingleRootFixtureStore(memento);
+    const coordinator = new WorkspaceMirrorCoordinator({
+      store, output: new FakeOutput(), createResources: () => new FakePartitionMirrorResources(mirror)
+    });
+    mirrorCoordinators.push(coordinator);
+    await coordinator.reconcileBindings();
 
     // Establish the mirror hash via a normal, internally-originated write first — matching the
     // existing "BookmarkStore - reloadFromMirror" fixture pattern in bookmarkStore.test.ts.
     await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
-    await store.flushMirrorWrites();
+    await coordinator.flushAll();
 
     const provider = new BookmarkDecorationProvider(buildDecoratedUriKeys([store.getAll().items]));
     provider.wire([store]);
@@ -296,7 +306,7 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
       2
     )}\n`;
 
-    await store.reloadFromMirror();
+    await coordinator.reloadPartition(SINGLE_ROOT_OWNER.partitionId);
 
     assert.strictEqual(
       fired.length,
@@ -324,9 +334,14 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
   test('mirror-reload fire site: a watcher echo of our own last write does not fire an invalidation event', async () => {
     const mirror = new FakeMirror();
     const memento = new FakeMemento();
-    const store = new BookmarkStore(memento, new FakeOutput(), { mirror, writeDelayMs: 5 });
+    const store = await createSingleRootFixtureStore(memento);
+    const coordinator = new WorkspaceMirrorCoordinator({
+      store, output: new FakeOutput(), createResources: () => new FakePartitionMirrorResources(mirror)
+    });
+    mirrorCoordinators.push(coordinator);
+    await coordinator.reconcileBindings();
     await store.addItem({ type: 'file', uri: 'file:///workspace/a.txt' });
-    await store.flushMirrorWrites();
+    await coordinator.flushAll();
 
     const provider = new BookmarkDecorationProvider(buildDecoratedUriKeys([store.getAll().items]));
     provider.wire([store]);
@@ -335,7 +350,7 @@ suite('BookmarkDecorationProvider - change-event wiring (T2, C4)', () => {
     provider.onDidChangeFileDecorations((event) => fired.push(event));
 
     // No external edit — content is unchanged, so this models the watcher firing on our own write.
-    await store.reloadFromMirror();
+    await coordinator.reloadPartition(SINGLE_ROOT_OWNER.partitionId);
 
     assert.strictEqual(
       fired.length,
@@ -501,5 +516,23 @@ suite('BookmarkDecorationProvider - enabled state (T3)', () => {
       0,
       'setEnabled(false) must be a no-op when the provider is already disabled'
     );
+  });
+});
+suite('BookmarkDecorationProvider - shared content reader (#62)', () => {
+  test('combines a workspace reader with Global and refreshes after replacement', async () => {
+    const changes = new vscode.EventEmitter<void>();
+    let items = [{ id: 'workspace', type: 'file' as const, uri: 'file:///reader', collectionId: null, order: 0 }];
+    const reader = { getAll: () => ({ version: 2, items, collections: [] }), onBookmarksChanged: changes.event };
+    const global = new BookmarkStore(new FakeMemento());
+    await global.addItem({ type: 'file', uri: 'file:///global-reader' });
+    const provider = new BookmarkDecorationProvider(new Set());
+    const subscription = provider.wire([reader, global]);
+    assert.ok(provider.provideFileDecoration(vscode.Uri.parse('file:///reader'), NO_CANCELLATION));
+    assert.ok(provider.provideFileDecoration(vscode.Uri.parse('file:///global-reader'), NO_CANCELLATION));
+    items = [];
+    changes.fire();
+    assert.strictEqual(provider.provideFileDecoration(vscode.Uri.parse('file:///reader'), NO_CANCELLATION), undefined);
+    assert.ok(provider.provideFileDecoration(vscode.Uri.parse('file:///global-reader'), NO_CANCELLATION));
+    subscription.dispose(); changes.dispose(); global.dispose(); provider.dispose();
   });
 });

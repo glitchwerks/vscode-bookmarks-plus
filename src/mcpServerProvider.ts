@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { OutputSink } from './bookmarkStore';
+import { canonicalizeRootUri } from './rootUri';
 
 export const MCP_SERVER_PROVIDER_ID = 'bookmarks-plus.mcp';
 
@@ -8,7 +9,7 @@ export type BookmarksMcpProvider = vscode.McpServerDefinitionProvider<
 >;
 
 interface McpProviderDependencies {
-  getWorkspaceFolders: () => readonly { uri: vscode.Uri }[] | undefined;
+  getAttachedRoots: () => readonly { uri: vscode.Uri; name?: string }[] | undefined;
   extensionUri: vscode.Uri;
   extensionVersion: string;
   output: OutputSink;
@@ -16,25 +17,18 @@ interface McpProviderDependencies {
     id: string,
     provider: vscode.McpServerDefinitionProvider
   ) => vscode.Disposable;
-  onDidChangeWorkspaceFolders: (listener: () => void) => vscode.Disposable;
+  onDidChangePartitions: (listener: () => void) => vscode.Disposable;
 }
 
 export function buildMcpServerDefinitions(
-  folders: readonly { uri: vscode.Uri }[] | undefined,
+  folders: readonly { uri: vscode.Uri; name?: string }[] | undefined,
   extensionUri: vscode.Uri,
   extensionVersion: string,
   output: OutputSink
 ): vscode.McpStdioServerDefinition[] {
   if (!folders || folders.length === 0) {
     output.appendLine(
-      'Bookmarks Plus: native MCP server is unavailable — no workspace folder is open.'
-    );
-    return [];
-  }
-
-  if (folders.length > 1) {
-    output.appendLine(
-      'Bookmarks Plus: native MCP server is unavailable — multiple workspace folders are open.'
+      'Bookmarks Plus: native MCP server is unavailable — no attached workspace roots are available.'
     );
     return [];
   }
@@ -45,15 +39,16 @@ export function buildMcpServerDefinitions(
     'bookmarks-plus-mcp.mjs'
   ).fsPath;
 
-  return [
+  const labels = folders.map(folder => folder.name ?? folder.uri.path.split('/').at(-1) ?? '');
+  return folders.map((folder, index) =>
     new vscode.McpStdioServerDefinition(
-      'Bookmarks Plus',
+      folders.length === 1 ? 'Bookmarks Plus' : `Bookmarks Plus (${labels[index]}${labels.filter(label => label === labels[index]).length > 1 ? ` — ${canonicalizeRootUri(folder.uri)}` : ''})`,
       process.execPath,
-      [serverPath, folders[0].uri.fsPath],
+      [serverPath, folder.uri.fsPath],
       { ELECTRON_RUN_AS_NODE: '1' },
       extensionVersion
     )
-  ];
+  );
 }
 
 export function registerBookmarksMcpProvider(
@@ -66,7 +61,7 @@ export function registerBookmarksMcpProvider(
     onDidChangeMcpServerDefinitions: changeEmitter.event,
     provideMcpServerDefinitions: () =>
       buildMcpServerDefinitions(
-        deps.getWorkspaceFolders(),
+        deps.getAttachedRoots(),
         deps.extensionUri,
         deps.extensionVersion,
         deps.output
@@ -75,7 +70,7 @@ export function registerBookmarksMcpProvider(
 
   try {
     resources.push(deps.registerProvider(MCP_SERVER_PROVIDER_ID, provider));
-    resources.push(deps.onDidChangeWorkspaceFolders(() => changeEmitter.fire()));
+    resources.push(deps.onDidChangePartitions(() => changeEmitter.fire()));
     subscriptions.push(...resources);
     return provider;
   } catch (error: unknown) {

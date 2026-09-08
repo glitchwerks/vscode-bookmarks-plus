@@ -11,7 +11,7 @@ See `docs/superpowers/specs/` for the design spec.
   workspace, with the same collection, reorder, and drag-and-drop support as workspace bookmarks.
   Moves and reordering stay within whichever scope you're in — dragging a bookmark across scopes
   is refused.
-- Organize bookmarks into collections; drag and drop to reorder or move between collections.
+- Organize bookmarks into collections; drag and drop to reorder or move between collections in the same root or Global scope.
 - Group the view by git repository, with a dedicated "Unknown" group for anything unresolved.
 - **Toggle Show Full Path:** a view-title-bar button switches each bookmark's label between
   filename-only (the default) and its path relative to the workspace root, using `/` separators.
@@ -21,25 +21,22 @@ See `docs/superpowers/specs/` for the design spec.
   window reloads.
 - Broken bookmarks (moved/deleted targets) show a warning icon instead of erroring.
 - Add an optional description to any bookmark or collection — shown on hover.
-- Workspace bookmarks are mirrored to `.vscode/bookmarks.json` so external tools can read and edit
-  them. Global bookmarks are never mirrored — see "The `.vscode/bookmarks.json` mirror" below.
+- Each attached workspace root has its own `.vscode/bookmarks.json` mirror. Global, Detached, and
+  Unassigned bookmarks are never mirrored — see "The `.vscode/bookmarks.json` mirror" below.
 - Bookmarked files and folders show a `★` badge and a "Bookmarked" tooltip directly in VS Code's
   built-in Explorer tree, so you can spot what's bookmarked without opening the Bookmarks Plus
   panel. Covers both workspace and global bookmarks, and updates live as bookmarks change. On by
   default; turn it off with the `bookmarksPlus.explorerDecoration.enabled` setting.
 - Right-clicking an already-bookmarked file — in the Explorer or the editor tab/title context
   menu — shows **Remove Bookmark** instead of **Add Bookmark**, and removes the bookmark directly
-  from whichever scope (workspace or global) it's bookmarked in. A non-bookmarked file still shows
+  from its workspace owner, or from Global if no workspace bookmark matches. When several workspace
+  owners contain the resource, select which owner to remove it from. A non-bookmarked file still shows
   **Add Bookmark** as before. Folders keep the existing **Add Bookmark** behavior either way.
 - **Add to Workspace:** a global folder bookmark that isn't already inside the current workspace
   gets an inline "Add to Workspace" action, which adds it as a new workspace root. This is VS
   Code's own `updateWorkspaceFolders`, so it may restart the extension host — most likely when
-  adding to an empty window, but also when a single-folder workspace becomes multi-folder. You're
-  asked to confirm only for the single-folder → multi-folder case, since that's also when it
-  disables the `.vscode/bookmarks.json` mirror (see "The `.vscode/bookmarks.json` mirror" below);
-  adding to an empty window or an already multi-folder workspace proceeds without a prompt. Full
-  caveats, including a command-palette gap tracked as a follow-up, are in
-  [the design spec](docs/superpowers/specs/2026-07-22-vscode-bookmarks-plus-design.md#5-commands).
+  adding to an empty window, but also when a single-folder workspace becomes multi-folder. Pending
+  mirror writes are flushed before adding the folder. Each attached root keeps its own mirror.
 - **Suggested bookmarks:** a "Suggested" row at the bottom of the tree lists recently opened files
   that aren't bookmarked yet, most-recently-promoted first. Reopening a file that's already a
   suggestion does not move it — its position is set once, when it's first promoted into the list.
@@ -60,11 +57,27 @@ clear the input box, and submit an empty value.
 
 ## The `.vscode/bookmarks.json` mirror
 
-Bookmarks live in VS Code's per-workspace storage. The extension also mirrors them to
-`.vscode/bookmarks.json` in your workspace so that other tools — scripts, editors, or an MCP
-server — can read and change them.
+Workspace bookmarks live in a versioned partition snapshot in VS Code's per-workspace storage.
+Each bookmark and collection has a stable root owner. In a multi-root workspace, each attached
+folder has its own `.vscode/bookmarks.json`, containing only that folder's bookmarks. Adding,
+nesting, or reordering workspace folders does not move existing bookmarks between roots; new
+bookmarks use the deepest attached root containing their URI. New collections belong to the
+selected root, and creating one from the Command Palette prompts for a root when needed.
 
-- **Location:** `.vscode/bookmarks.json`, relative to the workspace folder.
+Bookmarks whose original root is no longer open appear under **Detached**. Reopening the exact
+same root reattaches them automatically when its identity is unambiguous. After a folder move,
+use **Bookmarks Plus: Recover Detached Workspace** from the Command Palette or a detached
+partition's context menu. Choose **Reattach only** to keep paths unchanged, or **Reattach and
+salvage** to preview rebased paths. Only rebased targets that resolve are rewritten; missing and
+incompatible entries remain unchanged. Recovery cannot replace an established destination.
+
+Legacy items that cannot be assigned safely, and empty legacy collections, appear under
+**Unassigned**. Detached and Unassigned contents remain editable and removable, but cannot receive
+new bookmarks or collections. Detached, Unassigned, and Global bookmarks are never written to a
+root mirror. A malformed workspace snapshot remains untouched and displays **Workspace data
+unavailable**; select that row to open the output channel. Global remains usable.
+
+- **Location:** `.vscode/bookmarks.json`, relative to each attached workspace folder.
 - **When it is written:** shortly after any bookmark change (writes are batched, so a burst of
   drag-and-drop reordering produces one write).
 - **External edits are picked up live.** Edit the file in any editor and the Bookmarks view
@@ -77,13 +90,9 @@ server — can read and change them.
   write at the same moment, the later write survives. Malformed or unreadable content is never
   adopted — the extension keeps the bookmarks it already had, logs a line to the
   "Bookmarks Plus" output channel, and leaves your file untouched until your next bookmark change.
-- **Single-folder workspaces only.** In a multi-root workspace there is no unambiguous place to
-  put the file (the folder order is user-changeable), so the mirror is disabled and a line is
-  logged to the output channel. Bookmarks and descriptions work normally.
-- **Global bookmarks are never mirrored.** The mirror only ever reflects the workspace-scoped
-  store — there is no unambiguous single-workspace location to write a global bookmark's mirror
-  entry to. Global bookmarks are invisible to `.vscode/bookmarks.json` and, by extension, to
-  anything that only reads that file (see "Using bookmarks from Claude (MCP server)" below).
+- **Root isolation:** an external payload with new or changed bookmark URIs outside its owning
+  root is rejected as a whole. Existing unchanged bookmarks retain their owner when a nested root
+  is added. A failed mirror write affects only that root and is retried from workspace storage.
 - **Source control is your choice.** The extension neither commits nor ignores the file. Commit
   it to share a bookmark set with your team, or add `.vscode/bookmarks.json` to `.gitignore` to
   keep it private — bookmarks were private-per-user before this file existed.
@@ -94,12 +103,14 @@ With VS Code 1.101.0 or later, installing Bookmarks Plus also makes its bundled 
 available to VS Code automatically. You also need VS Code Chat with Agent mode enabled and an
 account and organization policy that permit AI agents and MCP tools. You do not need an
 `mcp.json` file, a separate npm package, or a server command: the extension registers a server
-named **Bookmarks Plus** for the current window.
+named **Bookmarks Plus** for one attached root, or **Bookmarks Plus (<folder name>)** for each
+attached root in a multi-root workspace. Repeated folder names include their canonical root URIs.
 
 To find and use it:
 
-1. Open exactly one workspace folder in VS Code.
-2. Run **MCP: List Servers** from the Command Palette and select **Bookmarks Plus**. In VS Code
+1. Open one or more workspace folders in VS Code.
+2. Run **MCP: List Servers** from the Command Palette and select **Bookmarks Plus**, or the server
+   labeled for your intended root. In VS Code
    1.102 or later, the server also appears under **MCP SERVERS - INSTALLED** in the Extensions
    view.
 3. Open Chat in Agent mode, select the tools button, and search for **Bookmarks Plus**. Its
@@ -108,10 +119,10 @@ To find and use it:
 The native server uses the same `.vscode/bookmarks.json` mirror described above. Its initial
 scope is intentionally limited:
 
-- It is available only when exactly one workspace folder is open. A no-folder window has no
-  workspace mirror to expose; multi-root support is tracked in
-  [#62](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/62).
-- It exposes workspace bookmarks only. Global-bookmark support requires the live bridge tracked
+- Each attached root exposes one server with an explicit root path. Removing a root retires its
+  definition; unavailable or colliding roots expose no server. A no-folder window has no attached
+  mirror to expose.
+- It exposes only that root's mirrored bookmarks. Global-bookmark support requires the live bridge tracked
   in [#129](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/129).
 - It has the same last-write-wins behavior as the mirror and provides the same two tools as the
   standalone server described below.
@@ -151,9 +162,12 @@ order, stopping at the first one present:
 
    | Window state | `BOOKMARKS_PLUS_WORKSPACE` value |
    | --- | --- |
-   | Single folder open (mirror enabled) | the folder's absolute OS path |
+   | Single folder open | the folder's absolute OS path |
    | Two or more folders open | `disabled:multi-root` |
    | No folder open | `disabled:no-folder` |
+
+   The multi-root sentinel remains because a window-wide terminal environment has no selected
+   root. Use an explicit workspace argument to serve one root; it takes precedence over the sentinel.
 
    A terminal opened before the extension activated, or before the workspace folders last
    changed, keeps its original value — reopen the terminal to pick up a change. A `disabled:`
@@ -206,7 +220,8 @@ the old one — otherwise the CLI and the Code tab will silently point at differ
 #### Explicit workspace path
 
 To pin a specific workspace regardless of auto-detection, pass it as the `args` positional
-argument (tier 1, highest precedence — this is unchanged from before):
+argument (tier 1, highest precedence). In a multi-root workspace, pass the path of the root whose
+mirror you want to serve:
 
 ```json
 {
@@ -255,14 +270,10 @@ way to pin a workspace under Claude Code.
   MCP server, one change is lost. `add_bookmark` verifies its own write after a short delay
   (`BOOKMARKS_MCP_VERIFY_DELAY_MS`, default 400ms) and reports when it did not survive — it
   cannot prevent the loss, only detect it.
-- **Single-folder workspaces only.** In a multi-root workspace, or in a window with no folder
-  open, the extension does not maintain the `.vscode/bookmarks.json` mirror. If the extension is
-  installed and active in that window, it also reports the state to the MCP server via
-  `BOOKMARKS_PLUS_WORKSPACE` (see "Configure" above), so every tool call — `list_bookmarks`,
-  `add_bookmark` — refuses individually with a message explaining why. If the extension is not
-  installed or not active, nothing sets that variable, resolution falls through to
-  `CLAUDE_PROJECT_DIR` or the legacy variable, and the server has no way to know the mirror is
-  unavailable — `add_bookmark` writes still succeed, but the extension never picks them up.
+- **One selected root per standalone server.** In a multi-root terminal, the automatic environment
+  value is `disabled:multi-root`; pass an explicit workspace argument to select a root. Without that
+  argument, tools refuse the sentinel individually. A no-folder window has no attached mirror.
+  Detached, Unassigned, and Global bookmarks are not exposed by this file-based server.
 - **Claude Desktop chat has no automatic workspace resolution.** It must use the explicit `args`
   path form described above — see "Explicit workspace path".
 - **No push notifications.** The server re-reads the mirror file fresh on every tool call; it
@@ -279,7 +290,8 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
 ## Development
 
 - `npm install` — install dependencies
-- `npm run compile` — bundle `src/extension.ts` to `dist/extension.js` via esbuild
+- `npm run compile` — bundle the extension to `dist/extension.js` and the MCP server to
+  `dist/bookmarks-plus-mcp.mjs` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
 - `npm run test:mcp-bundle` — verify the bundled MCP server and packaged VSIX contents
 - `npm run test:packaged-mcp` — package a real VSIX and exercise its bundled MCP server in a VS Code Extension Host

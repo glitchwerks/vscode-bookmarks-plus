@@ -6,6 +6,9 @@ import {
   BookmarksTreeDataProvider
 } from './bookmarksTreeDataProvider';
 import { isInsideWorkspace } from './workspaceFolders';
+import { RecoveryConflictError, WorkspaceBookmarkStore } from './workspaceBookmarkStore';
+import { RecoveryFileSystem, RecoveryMode, WorkspaceOwnerRef, ownerKey } from './workspacePartitionTypes';
+import { RootCandidate, canonicalizeRootUri, toRootCandidates } from './rootUri';
 
 export interface Prompter {
   showInputBox(options: vscode.InputBoxOptions): Thenable<string | undefined>;
@@ -21,10 +24,103 @@ export interface Prompter {
 /** User-visible labels for the out-of-workspace global folder reveal prompt (issue #93). */
 export const ADD_TO_WORKSPACE_LABEL = 'Add to Workspace';
 export const OPEN_IN_NEW_WINDOW_LABEL = 'Open in New Window';
+export const REATTACH_ONLY_LABEL = 'Reattach only';
+export const REATTACH_AND_SALVAGE_LABEL = 'Reattach and salvage';
+export const RECOVER_CONFIRM_LABEL = 'Recover';
 
-export interface ScopedStores {
-  workspace: BookmarkStore;
+export interface RecoveryCommandDeps {
+  readonly store: WorkspaceBookmarkStore;
+  readonly prompter: Prompter;
+  readonly getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined;
+  readonly fs: RecoveryFileSystem;
+}
+
+/** Preview recovery without writes, and commit only the user's confirmed token. */
+export function createRecoverPartitionHandler(deps: RecoveryCommandDeps): (node?: BookmarkNode) => Promise<void> {
+  return async node => {
+    if (node && node.kind !== 'detachedPartition') return;
+    const { store, prompter } = deps;
+    try {
+      const detached = store.getView().detached;
+      const selected = node?.kind === 'detachedPartition'
+        ? detached.find(p => p.partitionId === node.partitionId)
+        : detached.length === 1 ? detached[0]
+          : detached.length === 0 ? undefined : await prompter.showQuickPick(
+            detached.map(p => ({ ...p, label: p.lastKnownRootUri, description: `${p.data.items.length} bookmarks` })),
+            { placeHolder: 'Select detached workspace partition' });
+      if (!selected) {
+        if (node || detached.length === 0) await prompter.showInfo('No detached workspace partition is available for recovery.');
+        return;
+      }
+      await prompter.showInfo(`Recover ${selected.lastKnownRootUri}: ${selected.data.items.length} bookmarks.`);
+      const folders = deps.getWorkspaceFolders() ?? [];
+      if (folders.length === 0) {
+        await prompter.showInfo('No current workspace root is available for recovery.');
+        return;
+      }
+      const destination = await prompter.showQuickPick(
+        toRootCandidates(folders).map(root => ({ ...root, description: root.uri.toString() })),
+        { placeHolder: 'Select recovery destination root' });
+      if (!destination) return;
+      const mode = await prompter.showQuickPick<vscode.QuickPickItem & { mode: RecoveryMode }>([
+        { label: REATTACH_ONLY_LABEL, mode: 'reattach-only' },
+        { label: REATTACH_AND_SALVAGE_LABEL, mode: 'salvage' }
+      ], { placeHolder: 'Select recovery mode' });
+      if (!mode) return;
+      const requireCurrentDestination = (): RootCandidate => {
+        const identity = canonicalizeRootUri(destination.uri);
+        const current = toRootCandidates(deps.getWorkspaceFolders()).filter(root => canonicalizeRootUri(root.uri) === identity);
+        if (current.length !== 1) {
+          throw new RecoveryConflictError('Recovery destination is not a current workspace root.');
+        }
+        return current[0];
+      };
+      const preview = await store.previewRecovery(selected.partitionId, requireCurrentDestination(), mode.mode, deps.fs);
+      const summary = preview.mode === 'salvage'
+        ? `${preview.resolving} recovered, ${preview.missing} still missing, ${preview.incompatible} incompatible`
+        : `${selected.data.items.length} bookmarks unchanged`;
+      const confirmed = await prompter.showWarningConfirm(
+        `Recover ${selected.lastKnownRootUri} to ${preview.destinationRootUri}? ${summary}.`, RECOVER_CONFIRM_LABEL);
+      if (!confirmed) return;
+      requireCurrentDestination();
+      await store.commitRecovery(preview.token);
+    } catch (error: unknown) {
+      if (!(error instanceof RecoveryConflictError)) throw error;
+      await prompter.showInfo(error.message);
+    }
+  };
+}
+
+/** Registers recovery with dependencies supplied by partitioned activation. */
+export function registerRecoveryCommand(context: vscode.ExtensionContext, deps: RecoveryCommandDeps): void {
+  context.subscriptions.push(vscode.commands.registerCommand('bookmarks.recoverPartition', createRecoverPartitionHandler(deps)));
+}
+
+/** Workspace commands always receive a partition store; Global remains independent. */
+export interface ScopedStores<W extends WorkspaceBookmarkStore = WorkspaceBookmarkStore> {
+  workspace: W;
   global: BookmarkStore;
+}
+
+type CommandStore = BookmarkStore | WorkspaceBookmarkStore;
+type ContentCommands = Pick<BookmarkStore, 'getAll' | 'removeItem' | 'renameCollection' |
+  'setItemDescription' | 'setCollectionDescription' | 'deleteCollection' | 'moveItem'>;
+
+/** Bind every workspace operation to the owner carried by its content node. */
+function storeForNode(stores: ScopedStores, node: Extract<BookmarkNode, { kind: 'item' | 'collection' }>): ContentCommands | undefined {
+  if (node.scope === 'global') return stores.global;
+  const store = stores.workspace;
+  const owner = node.owner;
+  if (!owner || !store.getOwnerData(owner)) return undefined;
+  return {
+    getAll: () => store.getOwnerData(owner)!,
+    removeItem: id => store.removeItem(owner, id),
+    renameCollection: (id, name) => store.renameCollection(owner, id, name),
+    setItemDescription: (id, description) => store.setItemDescription(owner, id, description),
+    setCollectionDescription: (id, description) => store.setCollectionDescription(owner, id, description),
+    deleteCollection: id => store.deleteCollection(owner, id),
+    moveItem: (id, collectionId, index) => store.moveItem(owner, id, collectionId, index)
+  };
 }
 
 export function createPrompter(): Prompter {
@@ -46,13 +142,22 @@ export function createPrompter(): Prompter {
 }
 
 async function addBookmark(
-  store: BookmarkStore,
+  store: CommandStore,
   prompter: Pick<Prompter, 'showInfo'>,
   type: 'file' | 'folder',
   uri: vscode.Uri
 ): Promise<void> {
   try {
-    await store.addItem({ type, uri: uri.toString() });
+    if (store instanceof WorkspaceBookmarkStore) {
+      const owner = store.resolveAttachedOwner(uri);
+      if (!owner) {
+        await prompter.showInfo('No attached workspace root owns this item.');
+        return;
+      }
+      await store.addItem(owner, { type, uri: uri.toString() });
+    } else {
+      await store.addItem({ type, uri: uri.toString() });
+    }
   } catch (error: unknown) {
     if (!(error instanceof DuplicateBookmarkError)) {
       throw error;
@@ -62,7 +167,7 @@ async function addBookmark(
 }
 
 export function createAddFileHandler(
-  store: BookmarkStore,
+  store: CommandStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (uri: vscode.Uri) => Promise<void> {
   return async (uri: vscode.Uri): Promise<void> => {
@@ -71,7 +176,7 @@ export function createAddFileHandler(
 }
 
 export function createAddFolderHandler(
-  store: BookmarkStore,
+  store: CommandStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (uri: vscode.Uri) => Promise<void> {
   return async (uri: vscode.Uri): Promise<void> => {
@@ -87,7 +192,7 @@ export function createAddFolderHandler(
  * a `ScopedStores` bag.
  */
 export function createPromoteSuggestionHandler(
-  store: BookmarkStore,
+  store: WorkspaceBookmarkStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
@@ -106,7 +211,7 @@ export function createPromoteSuggestionHandler(
  * node kind) is correctly ignored by this handler.
  */
 export function createPromoteRecentItemHandler(
-  store: BookmarkStore,
+  store: WorkspaceBookmarkStore,
   prompter: Pick<Prompter, 'showInfo'>
 ): (node: BookmarkNode) => Promise<void> {
   return async (node: BookmarkNode): Promise<void> => {
@@ -120,15 +225,30 @@ export function createPromoteRecentItemHandler(
 /**
  * Removes the bookmark matching `uri` (issue #114: Explorer/editor-title context menu invokes
  * `bookmarks.remove` with the right-clicked resource's `Uri`, which carries no explicit scope).
- * Searches the workspace store before the global store and removes from whichever scope holds a
- * match; a no-op if the resource isn't bookmarked in either. If the same resource happens to be
- * bookmarked in both scopes at once, only the workspace copy is removed — that tie-break is
- * intentionally unspecified by the issue, and this is a reasonable, simple default rather than a
- * deliberately designed behavior.
+ * Prompts for an owner when multiple workspace owners match. Global is consulted only when no
+ * workspace match exists; canceling an owner selection must never remove the Global copy.
  */
-async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri): Promise<void> {
+async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri, prompter: Pick<Prompter, 'showQuickPick'>): Promise<void> {
+  {
+    const matches = stores.workspace.findItemsByUri(uri);
+    const owners = [...new Map(matches.map(match => [ownerKey(match.owner), match.owner])).values()];
+    if (owners.length > 0) {
+      const view = stores.workspace.getView();
+      const options = owners.map(owner => {
+        const attached = owner.kind === 'partition' ? view.attached.find(p => p.partitionId === owner.partitionId) : undefined;
+        const detached = owner.kind === 'partition' ? view.detached.find(p => p.partitionId === owner.partitionId) : undefined;
+        return { owner, label: attached?.label ?? detached?.lastKnownRootUri ?? 'Unassigned',
+          description: attached?.rootUri ?? (detached ? `Detached: ${detached.lastKnownRootUri}` : 'Unassigned workspace bookmarks') };
+      });
+      const pick = options.length === 1 ? options[0] : await prompter.showQuickPick(options, { placeHolder: 'Select bookmark owner to remove from' });
+      if (!pick) return;
+      const match = matches.find(entry => ownerKey(entry.owner) === ownerKey(pick.owner));
+      if (match) await stores.workspace.removeItem(match.owner, match.item.id);
+      return;
+    }
+  }
   const targetKey = decorationUriKey(uri);
-  for (const store of [stores.workspace, stores.global]) {
+  for (const store of [stores.global]) {
     const match = store.getAll().items.find((item) => {
       try {
         return decorationUriKey(vscode.Uri.parse(item.uri, true)) === targetKey;
@@ -144,17 +264,19 @@ async function removeByResourceUri(stores: ScopedStores, uri: vscode.Uri): Promi
 }
 
 export function createRemoveHandler(
-  stores: ScopedStores
+  stores: ScopedStores,
+  prompter: Pick<Prompter, 'showQuickPick'> = createPrompter()
 ): (node: BookmarkNode | vscode.Uri) => Promise<void> {
   return async (node: BookmarkNode | vscode.Uri): Promise<void> => {
     if (node instanceof vscode.Uri) {
-      await removeByResourceUri(stores, node);
+      await removeByResourceUri(stores, node, prompter);
       return;
     }
     if (node.kind !== 'item') {
       return;
     }
-    const store = stores[node.scope];
+    const store = storeForNode(stores, node);
+    if (!store) return;
     await store.removeItem(node.item.id);
   };
 }
@@ -205,15 +327,42 @@ export function createRevealHandler(
 }
 
 export function createNewCollectionHandler(
-  store: BookmarkStore,
+  store: CommandStore,
   prompter: Prompter
-): () => Promise<void> {
-  return async (): Promise<void> => {
+): (node?: BookmarkNode) => Promise<void> {
+  return async (node?: BookmarkNode): Promise<void> => {
+    let owner: WorkspaceOwnerRef | undefined;
+    if (store instanceof WorkspaceBookmarkStore) {
+      const roots = store.getView().attached;
+      const contextOwner = node?.kind === 'workspaceRoot' ? { kind: 'partition' as const, partitionId: node.partitionId }
+        : node && 'owner' in node ? node.owner : undefined;
+      if (node && (!contextOwner || contextOwner.kind !== 'partition'
+        || !roots.some(root => root.partitionId === contextOwner.partitionId))) {
+        await prompter.showInfo('New collections require an attached workspace root.');
+        return;
+      }
+      if (roots.length === 0) {
+        await prompter.showInfo('New collections require an attached workspace root.');
+        return;
+      }
+      const selected = contextOwner?.kind === 'partition' ? roots.find(root => root.partitionId === contextOwner.partitionId)
+        : roots.length === 1 ? roots[0] : await prompter.showQuickPick(
+          roots.map(root => ({ label: root.label, description: root.rootUri, partitionId: root.partitionId })),
+          { placeHolder: 'Select workspace root for the collection' });
+      if (!selected) return;
+      owner = { kind: 'partition', partitionId: selected.partitionId };
+    }
     const name = await prompter.showInputBox({ prompt: 'New collection name' });
     if (!name) {
       return;
     }
-    await store.addCollection(name);
+    if (store instanceof WorkspaceBookmarkStore) {
+      if (owner?.kind !== 'partition' || !store.getView().attached.some(root => root.partitionId === owner.partitionId)) {
+        await prompter.showInfo('New collections require an attached workspace root.');
+        return;
+      }
+      await store.addCollection(owner, name);
+    } else await store.addCollection(name);
   };
 }
 
@@ -225,7 +374,8 @@ export function createRenameCollectionHandler(
     if (node.kind !== 'collection') {
       return;
     }
-    const store = stores[node.scope];
+    const store = storeForNode(stores, node);
+    if (!store) return;
     const name = await prompter.showInputBox({
       prompt: 'Rename collection',
       value: node.collection.name
@@ -242,18 +392,11 @@ export function createSetDescriptionHandler(
   prompter: Pick<Prompter, 'showInputBox'>
 ): (node?: BookmarkNode) => Promise<void> {
   return async (node?: BookmarkNode): Promise<void> => {
-    if (
-      node === undefined ||
-      node.kind === 'repoGroup' ||
-      node.kind === 'globalRoot' ||
-      node.kind === 'suggestedRoot' ||
-      node.kind === 'suggestion' ||
-      node.kind === 'recentRoot' ||
-      node.kind === 'recentItem'
-    ) {
+    if (!node || (node.kind !== 'item' && node.kind !== 'collection')) {
       return;
     }
-    const store = stores[node.scope];
+    const store = storeForNode(stores, node);
+    if (!store) return;
     const current = node.kind === 'item'
       ? node.item.description
       : node.collection.description;
@@ -280,7 +423,8 @@ export function createDeleteCollectionHandler(
     if (node.kind !== 'collection') {
       return;
     }
-    const store = stores[node.scope];
+    const store = storeForNode(stores, node);
+    if (!store) return;
     const confirmed = await prompter.showWarningConfirm(
       `Delete collection "${node.collection.name}"? Its bookmarks will be ungrouped, not deleted.`,
       'Delete'
@@ -300,13 +444,15 @@ export function createMoveToCollectionHandler(
     if (node.kind !== 'item') {
       return;
     }
-    const store = stores[node.scope];
+    const store = storeForNode(stores, node);
+    if (!store) return;
     const data = store.getAll();
-    const options: Array<vscode.QuickPickItem & { id: string | null }> = [
-      { label: 'Ungrouped', id: null },
+    const options: Array<vscode.QuickPickItem & { id: string | null; owner?: WorkspaceOwnerRef }> = [
+      { label: 'Ungrouped', id: null, owner: node.owner },
       ...data.collections.map((collection) => ({
         label: collection.name,
-        id: collection.id
+        id: collection.id,
+        owner: node.owner
       }))
     ];
     const pick = await prompter.showQuickPick(
@@ -314,6 +460,12 @@ export function createMoveToCollectionHandler(
       { placeHolder: 'Move bookmark to collection' }
     );
     if (pick === undefined) {
+      return;
+    }
+    if (node.scope === 'workspace'
+      && ((pick.owner && ownerKey(pick.owner) !== ownerKey(node.owner!))
+        || (pick.id !== null && !data.collections.some(collection => collection.id === pick.id)))) {
+      await prompter.showInfo('Bookmarks cannot be moved between workspace roots.');
       return;
     }
     const siblingCount = data.items.filter(
@@ -361,18 +513,6 @@ export function createAddToWorkspaceHandler(
     }
 
     const start = folders?.length ?? 0;
-    if (start === 1) {
-      const confirmed = await deps.prompter.showWarningConfirm(
-        'Adding this folder will add a second root to the workspace. This disables the ' +
-          '.vscode/bookmarks.json mirror for the workspace and may restart or reload the ' +
-          'extension host.',
-        'Add Folder'
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
-
     await deps.flushMirrorWrites();
     const succeeded = deps.updateWorkspaceFolders(start, null, { uri });
     if (!succeeded) {
@@ -410,14 +550,14 @@ export function registerAddCommands(
 
 export function registerAddToWorkspaceCommand(
   context: vscode.ExtensionContext,
-  workspaceStore: BookmarkStore
+  flushMirrors: () => Promise<void>
 ): void {
   const deps: AddToWorkspaceDeps = {
     prompter: createPrompter(),
     getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
     updateWorkspaceFolders: (start, deleteCount, ...foldersToAdd) =>
       vscode.workspace.updateWorkspaceFolders(start, deleteCount, ...foldersToAdd),
-    flushMirrorWrites: () => workspaceStore.flushMirrorWrites()
+    flushMirrorWrites: flushMirrors
   };
   context.subscriptions.push(
     vscode.commands.registerCommand(

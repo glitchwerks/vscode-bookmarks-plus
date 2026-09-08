@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import { Prompter } from '../../commands';
 import { MirrorPort } from '../../bookmarkMirror';
+import type { PartitionMirrorResources } from '../../workspaceMirrorCoordinator';
 
 export class FakeMemento implements vscode.Memento {
   private store = new Map<string, unknown>();
   updateCallCount = 0;
+  failUpdateForKey: string | undefined;
   /**
    * Counts every call to `get()`, regardless of key. Used by tests that need to prove a
    * `Memento` was actually read from (e.g. that a store was constructed against it) without
@@ -28,6 +30,10 @@ export class FakeMemento implements vscode.Memento {
   }
 
   update(key: string, value: unknown): Thenable<void> {
+    if (this.failUpdateForKey === key) {
+      this.failUpdateForKey = undefined;
+      return Promise.reject(new Error(`simulated update failure: ${key}`));
+    }
     if (value === undefined) {
       this.store.delete(key);
     } else {
@@ -147,6 +153,24 @@ export class FakeMirror implements MirrorPort {
   }
 }
 
+/** Mirror port plus independently fireable watcher events and disposal evidence. */
+export class FakePartitionMirrorResources implements PartitionMirrorResources {
+  readonly change = new vscode.EventEmitter<void>();
+  readonly create = new vscode.EventEmitter<void>();
+  readonly delete = new vscode.EventEmitter<void>();
+  readonly onDidChange = this.change.event;
+  readonly onDidCreate = this.create.event;
+  readonly onDidDelete = this.delete.event;
+  disposed = false;
+  constructor(readonly port: FakeMirror = new FakeMirror()) {}
+  dispose(): void {
+    this.disposed = true;
+    this.change.dispose();
+    this.create.dispose();
+    this.delete.dispose();
+  }
+}
+
 /**
  * A minimal `vscode.Tab`-shaped fixture for #95 (suggested bookmarks from recently opened items).
  * `vscode.Tab` is an interface, not a constructible class, so this is a plain object literal cast
@@ -188,6 +212,8 @@ export interface FakePrompterOptions {
  * `value`) and whether the box was opened at all.
  */
 export class FakePrompter implements Prompter {
+  lastInfoMessage: string | undefined;
+  lastWarningMessage: string | undefined;
   lastInputBoxOptions: vscode.InputBoxOptions | undefined;
   inputBoxCallCount = 0;
   lastActionPromptArgs: { message: string; actions: string[] } | undefined;
@@ -217,11 +243,13 @@ export class FakePrompter implements Prompter {
     return Promise.resolve(this.quickPickResult as T | undefined);
   }
 
-  showWarningConfirm(): Thenable<boolean> {
+  showWarningConfirm(message: string): Thenable<boolean> {
+    this.lastWarningMessage = message;
     return Promise.resolve(this.warningConfirmResult);
   }
 
-  showInfo(): Thenable<unknown> {
+  showInfo(message: string): Thenable<unknown> {
+    this.lastInfoMessage = message;
     return Promise.resolve(this.infoResult);
   }
 

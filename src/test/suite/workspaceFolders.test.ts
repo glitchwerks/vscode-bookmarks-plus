@@ -74,21 +74,15 @@ suite('workspaceFolders.isInsideWorkspace', () => {
     assert.strictEqual(isInsideWorkspace(vscode.Uri.file('/workspace/repo-b/src/file.ts'), folders), true);
   });
 
-  // --- 7. Windows drive-letter / path case-insensitivity -----------------------------------------
+  // --- 7. Path case preservation ------------------------------------------------------------------
   // Uri.from() is used (rather than Uri.file()) so the raw `scheme`/`path` components are under
   // the test's direct control and are not silently normalized by Uri.file()'s own platform-specific
   // path handling — this is the only way to deterministically reproduce the "c:" vs "C:" case
-  // difference decision D8 (issue #56) calls out, independent of whatever normalization
+  // difference behavior, independent of whatever normalization
   // Uri.file() may or may not already do.
   //
-  // isInsideWorkspace is a pure function of its (uri, folders) arguments (issue #56, T8: "pure, no
-  // vscode.workspace access") — the same pair must yield the same answer regardless of the host
-  // OS running the test. CI runs these tests on ubuntu-latest (.github/workflows/ci.yml:15,32)
-  // while local development here is on win32, so the Windows-flavored case-insensitivity below
-  // must be keyed off the drive-letter path *shape* (a leading `/X:/...` segment), never off
-  // `process.platform`— an implementation gated on `process.platform === 'win32'` would pass
-  // locally and fail in CI.
-  test('Windows: a descendant differing only in drive-letter casing is inside', () => {
+  // File drive letters follow VS Code serialization; remaining path components preserve case.
+  test('a descendant differing only in file drive-letter casing is inside', () => {
     const root = vscode.Uri.from({ scheme: 'file', authority: '', path: '/c:/Users/dev/project' });
     const descendant = vscode.Uri.from({
       scheme: 'file',
@@ -98,24 +92,24 @@ suite('workspaceFolders.isInsideWorkspace', () => {
     assert.strictEqual(isInsideWorkspace(descendant, [folder(root)]), true);
   });
 
-  test('Windows: a descendant differing in a non-drive path segment\'s casing is inside', () => {
+  test('a descendant differing in a non-drive path segment\'s casing is outside', () => {
     const root = vscode.Uri.from({ scheme: 'file', authority: '', path: '/c:/Users/Dev/Project' });
     const descendant = vscode.Uri.from({
       scheme: 'file',
       authority: '',
       path: '/c:/users/dev/project/src/file.ts'
     });
-    assert.strictEqual(isInsideWorkspace(descendant, [folder(root)]), true);
+    assert.strictEqual(isInsideWorkspace(descendant, [folder(root)]), false);
   });
 
-  test('Windows: the workspace folder\'s own uri with different casing is inside', () => {
+  test('the workspace folder\'s own uri with different casing is outside', () => {
     const root = vscode.Uri.from({ scheme: 'file', authority: '', path: '/c:/Users/dev/project' });
     const sameFolderDifferentCase = vscode.Uri.from({
       scheme: 'file',
       authority: '',
       path: '/C:/USERS/DEV/PROJECT'
     });
-    assert.strictEqual(isInsideWorkspace(sameFolderDifferentCase, [folder(root)]), true);
+    assert.strictEqual(isInsideWorkspace(sameFolderDifferentCase, [folder(root)]), false);
   });
 
   // --- 8. Non-file schemes: scheme and authority compared before path -----------------------------
