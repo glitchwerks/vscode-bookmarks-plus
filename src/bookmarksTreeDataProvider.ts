@@ -105,7 +105,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     } else {
       for (const id of envelope.ids) {
         const data = this.workspaceDataForOwner(sourceOwner!);
-        if (!data) break;
+        if (!data) { moveFailed = true; break; }
         const movingItem = data.items.find(item => item.id === id);
         let index = targetInfo.index(data);
         // moveItem removes the source before inserting it, shifting a later sibling target left.

@@ -13,8 +13,8 @@ import {
 import { RecentItem } from '../../recentItems';
 import { BookmarkData, BookmarkItem } from '../../types';
 import { WorkspaceBookmarkStore, WorkspaceStoreView } from '../../workspaceBookmarkStore';
-import { WorkspaceOwnerRef } from '../../workspacePartitionTypes';
-import { FakeMemento } from './fixtures';
+import { WORKSPACE_PARTITION_STORAGE_KEY, WorkspaceOwnerRef } from '../../workspacePartitionTypes';
+import { FakeMemento, FakeOutput } from './fixtures';
 
 async function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean; repoName?: string }> = async () => ({ exists: true })) {
   const store = await createSingleRootFixtureStore();
@@ -217,6 +217,55 @@ function getTransferEnvelope(dt: vscode.DataTransfer): DragEnvelope | undefined 
 }
 
 suite('BookmarksTreeDataProvider - drag and drop', () => {
+  test('workspace becoming unavailable after one move stops later attempts and warns once', async () => {
+    const state = new FakeMemento();
+    const workspace = await createSingleRootFixtureStore(state);
+    const source = await workspace.addCollection('Source');
+    const destination = await workspace.addCollection('Destination');
+    const items: BookmarkItem[] = [];
+    for (const name of ['first', 'second', 'third']) {
+      items.push(await workspace.addItem({ type: 'file', uri: `file:///${name}.txt`, collectionId: source.id }));
+    }
+    const unavailable = await WorkspaceBookmarkStore.create({
+      state: new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: { version: 999 } }),
+      roots: [], output: new FakeOutput()
+    });
+    assert.strictEqual(unavailable.getView().kind, 'unavailable');
+    let viewStore: WorkspaceBookmarkStore = workspace;
+    const attempts: string[] = [];
+    // Model a reload between selected moves using real ready/unavailable stores and real writes.
+    const transitioning = new Proxy(workspace, {
+      get(target, property) {
+        if (property === 'getView') return () => viewStore.getView();
+        if (property === 'moveItem') return async (owner: WorkspaceOwnerRef, id: string, collectionId: string | null, index: number) => {
+          attempts.push(id);
+          await target.moveItem(owner, id, collectionId, index);
+          viewStore = unavailable;
+        };
+        return Reflect.get(target, property);
+      }
+    });
+    const warnings: string[] = [];
+    const provider = new BookmarksTreeDataProvider(transitioning,
+      new FsGitCache(async () => ({ exists: true })), undefined, undefined, undefined, undefined, undefined,
+      message => { warnings.push(message); });
+    const token = new vscode.CancellationTokenSource();
+    const writesBefore = state.updateCallCount;
+    try {
+      await provider.handleDrop({ kind: 'collection', collection: destination, scope: 'workspace', owner: SINGLE_ROOT_OWNER },
+        makeDropTransfer('workspace', items.map(item => item.id)), token.token);
+      assert.deepStrictEqual(attempts, [items[0].id], 'later IDs must not be attempted against unavailable workspace data');
+      assert.strictEqual(state.updateCallCount, writesBefore + 1);
+      const data = workspace.getAll();
+      assert.deepStrictEqual(data.items.filter(item => item.collectionId === destination.id).map(item => item.id), [items[0].id]);
+      assert.deepStrictEqual(data.items.filter(item => item.collectionId === source.id)
+        .sort((left, right) => left.order - right.order).map(item => ({ id: item.id, order: item.order })),
+      [{ id: items[1].id, order: 0 }, { id: items[2].id, order: 1 }]);
+      assert.strictEqual(warnings.length, 1, 'an interrupted partial drop must report one warning');
+      assert.match(warnings[0], /some bookmarks could not be moved/i);
+    } finally { token.dispose(); workspace.dispose(); unavailable.dispose(); }
+  });
+
   for (const [scope, targetKind] of [
     ['workspace', 'collection'], ['workspace', 'item'], ['global', 'collection'], ['global', 'item']
   ] as const) {
