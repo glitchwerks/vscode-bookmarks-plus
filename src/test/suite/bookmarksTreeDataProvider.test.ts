@@ -217,8 +217,10 @@ function getTransferEnvelope(dt: vscode.DataTransfer): DragEnvelope | undefined 
 }
 
 suite('BookmarksTreeDataProvider - drag and drop', () => {
-  for (const scope of ['workspace', 'global'] as const) {
-    test(`${scope} drop retains successful moves around multiple failures and warns once`, async () => {
+  for (const [scope, targetKind] of [
+    ['workspace', 'collection'], ['workspace', 'item'], ['global', 'collection'], ['global', 'item']
+  ] as const) {
+    test(`${scope} ${targetKind} drop preserves successful selection order around multiple failures and warns once`, async () => {
       const workspace = await createSingleRootFixtureStore();
       const global = new BookmarkStore(new FakeMemento());
       const store = scope === 'workspace' ? workspace : global;
@@ -240,16 +242,17 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
       let changes = 0;
       const subscription = store.onBookmarksChanged(() => changes++);
       try {
-        const target: BookmarkNode = { kind: 'item', item: existingA, scope,
+        const target: BookmarkNode = { ...(targetKind === 'collection'
+          ? { kind: 'collection' as const, collection: destination }
+          : { kind: 'item' as const, item: existingA }), scope,
           ...(scope === 'workspace' ? { owner: SINGLE_ROOT_OWNER } : {}) };
         await provider.handleDrop(target, makeDropTransfer(scope, [first.id, blockedA.id, blockedB.id, last.id]), token.token);
         const inCollection = (id: string) => store.getAll().items.filter(item => item.collectionId === id)
           .sort((a, b) => a.order - b.order).map(item => ({ id: item.id, order: item.order }));
         assert.deepStrictEqual(inCollection(source.id), [{ id: blockedA.id, order: 0 }, { id: blockedB.id, order: 1 }]);
-        // Global nodes retain their live item reference; workspace nodes are snapshots.
-        const destinationIds = scope === 'global'
-          ? [first.id, last.id, existingA.id, existingB.id]
-          : [last.id, first.id, existingA.id, existingB.id];
+        const destinationIds = targetKind === 'collection'
+          ? [existingA.id, existingB.id, first.id, last.id]
+          : [first.id, last.id, existingA.id, existingB.id];
         assert.deepStrictEqual(inCollection(destination.id), destinationIds
           .map((id, order) => ({ id, order })));
         assert.strictEqual(changes, 2, 'only successful item moves publish changes');
@@ -259,6 +262,56 @@ suite('BookmarksTreeDataProvider - drag and drop', () => {
         await provider.handleDrop(target, makeDropTransfer(scope, [last.id]), token.token);
         assert.strictEqual(warnings.length, 1, 'a subsequent successful drop produces no warning');
       } finally { subscription.dispose(); token.dispose(); workspace.dispose(); global.dispose(); }
+    });
+  }
+
+  for (const targetKind of ['collection', 'item', 'root'] as const) {
+    test(`workspace ${targetKind} drop inserts multiple items in envelope order`, async () => {
+      const { store, provider } = await makeProvider();
+      const source = await store.addCollection('Source');
+      const destination = targetKind === 'root' ? undefined : await store.addCollection('Destination');
+      const a = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId: source.id });
+      const b = await store.addItem({ type: 'file', uri: 'file:///b.txt', collectionId: source.id });
+      const c = await store.addItem({ type: 'file', uri: 'file:///c.txt', collectionId: source.id });
+      const existingA = await store.addItem({ type: 'file', uri: 'file:///existing-a.txt', collectionId: destination?.id });
+      const existingB = await store.addItem({ type: 'file', uri: 'file:///existing-b.txt', collectionId: destination?.id });
+      const target: BookmarkNode | undefined = targetKind === 'root' ? undefined : targetKind === 'collection'
+        ? { kind: 'collection', collection: destination!, scope: 'workspace', owner: SINGLE_ROOT_OWNER }
+        : { kind: 'item', item: existingB, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
+      const token = new vscode.CancellationTokenSource();
+      try {
+        await provider.handleDrop(target, makeDropTransfer('workspace', [c.id, a.id, b.id]), token.token);
+        const data = store.getAll();
+        assert.deepStrictEqual(data.items.filter(item => item.collectionId === source.id), []);
+        const expected = targetKind === 'item'
+          ? [existingA.id, c.id, a.id, b.id, existingB.id]
+          : [existingA.id, existingB.id, c.id, a.id, b.id];
+        assert.deepStrictEqual(data.items.filter(item => item.collectionId === (destination?.id ?? null))
+          .sort((left, right) => left.order - right.order).map(item => ({ id: item.id, order: item.order })),
+        expected.map((id, order) => ({ id, order })));
+      } finally { token.dispose(); store.dispose(); }
+    });
+  }
+
+  for (const [position, selected, expected] of [
+    ['before', ['b', 'a'], ['b', 'a', 'target', 'c', 'd', 'e']],
+    ['after', ['e', 'c'], ['a', 'b', 'e', 'c', 'target', 'd']],
+    ['around', ['a', 'e', 'b'], ['a', 'e', 'b', 'target', 'c', 'd']]
+  ] as const) {
+    test(`workspace item drop preserves selection order from ${position} a same-parent target`, async () => {
+      const { store, provider } = await makeProvider();
+      const items = new Map<string, BookmarkItem>();
+      for (const name of ['a', 'b', 'target', 'c', 'd', 'e']) {
+        items.set(name, await store.addItem({ type: 'file', uri: `file:///${name}.txt` }));
+      }
+      const target: BookmarkNode = { kind: 'item', item: items.get('target')!, scope: 'workspace', owner: SINGLE_ROOT_OWNER };
+      const token = new vscode.CancellationTokenSource();
+      try {
+        await provider.handleDrop(target, makeDropTransfer('workspace', selected.map(name => items.get(name)!.id)), token.token);
+        assert.deepStrictEqual(store.getAll().items.sort((left, right) => left.order - right.order)
+          .map(item => ({ uri: item.uri, order: item.order })),
+        expected.map((name, order) => ({ uri: `file:///${name}.txt`, order })));
+      } finally { token.dispose(); store.dispose(); }
     });
   }
 

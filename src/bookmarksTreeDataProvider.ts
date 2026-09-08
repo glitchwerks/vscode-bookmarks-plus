@@ -103,10 +103,14 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
         catch { moveFailed = true; }
       }
     } else {
-      const data = this.workspaceDataForOwner(sourceOwner!);
-      if (!data) return;
       for (const id of envelope.ids) {
-        try { await this.workspaceStore.moveItem(sourceOwner!, id, targetInfo.collectionId, targetInfo.index(data)); }
+        const data = this.workspaceDataForOwner(sourceOwner!);
+        if (!data) break;
+        const movingItem = data.items.find(item => item.id === id);
+        let index = targetInfo.index(data);
+        // moveItem removes the source before inserting it, shifting a later sibling target left.
+        if (target?.kind === 'item' && movingItem?.collectionId === targetInfo.collectionId && movingItem.order < index) index--;
+        try { await this.workspaceStore.moveItem(sourceOwner!, id, targetInfo.collectionId, index); }
         catch { moveFailed = true; }
       }
     }
@@ -219,7 +223,15 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     if (target.kind === 'globalRoot') return scope === 'global' ? rootTarget() : undefined;
     if (target.kind === 'workspaceRoot') return scope === 'workspace' && sameOwner(owner, ownerForPartition(target.partitionId)) && this.isAttachedOwner(ownerForPartition(target.partitionId)) ? rootTarget() : undefined;
     if (target.kind === 'collection') { if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined; return { collectionId: target.collection.id, index: (data) => data.items.filter((item) => item.collectionId === target.collection.id).length }; }
-    if (target.kind === 'item') { if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined; return { collectionId: target.item.collectionId, index: () => target.item.order }; }
+    if (target.kind === 'item') {
+      if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined;
+      return {
+        collectionId: target.item.collectionId,
+        index: (data) => scope === 'workspace'
+          ? data.items.find(item => item.id === target.item.id)?.order ?? target.item.order
+          : target.item.order
+      };
+    }
     return undefined;
   }
 
