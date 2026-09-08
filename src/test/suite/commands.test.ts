@@ -1,5 +1,10 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import { RecoveryConflictError, StaleRecoveryPreviewError, WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
+import { WorkspaceOwnerRef, WorkspacePartitionSnapshot, WORKSPACE_PARTITION_STORAGE_KEY } from '../../workspacePartitionTypes';
+import { toRootCandidates } from '../../rootUri';
 import { BookmarkStore } from '../../bookmarkStore';
 import { BookmarkNode, BookmarksTreeDataProvider } from '../../bookmarksTreeDataProvider';
 import { FsGitCache } from '../../fsGitCache';
@@ -27,7 +32,484 @@ import {
   registerViewCommands,
   registerAddCommands
 } from '../../commands';
-import { FakeMemento, FakePrompter } from './fixtures';
+import { createRecoverPartitionHandler, registerRecoveryCommand, REATTACH_ONLY_LABEL, REATTACH_AND_SALVAGE_LABEL, RECOVER_CONFIRM_LABEL } from '../../commands';
+import { FakeMemento, FakePrompter, FakeOutput } from './fixtures';
+
+/** Real stores expose writes to the wrong owner without relying on permissive spies. */
+async function partitionCommandFixture(rootUris = ['file:///a', 'file:///b']) {
+  const state = new FakeMemento();
+  const roots = rootUris.map((uri, index) => ({ id: String(index), label: `Root ${index}`, uri: vscode.Uri.parse(uri) }));
+  const workspace = await WorkspaceBookmarkStore.create({ state, roots, output: new FakeOutput() });
+  const global = new BookmarkStore(new FakeMemento());
+  const owners = workspace.getView().attached.map(({ partitionId }) => ({ kind: 'partition' as const, partitionId }));
+  return { workspace, global, state, roots, owners, stores: { workspace, global } };
+}
+
+function ownedItem(owner: WorkspaceOwnerRef, item: BookmarkItem): BookmarkNode {
+  return { kind: 'item', scope: 'workspace', owner, item };
+}
+
+function ownedCollection(owner: WorkspaceOwnerRef, collection: BookmarkCollection): BookmarkNode {
+  return { kind: 'collection', scope: 'workspace', owner, collection };
+}
+
+function partitionNode(partitionId: string, kind: 'workspaceRoot' | 'detachedPartition' = 'workspaceRoot'): BookmarkNode {
+  return { kind, partitionId, label: 'Root', scope: 'workspace', collection: { id: '', name: '', order: 0 } };
+}
+
+/** A detached snapshot includes resolving, missing and incompatible salvage inputs. */
+async function recoveryFixture(options: { mode?: string; confirmed?: boolean; cancelPick?: number; twoDetached?: boolean } = {}) {
+  const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const snapshot: WorkspacePartitionSnapshot = {
+    version: 1, unassigned: { version: 2, items: [], collections: [] },
+    partitions: [{ id: id(1), attachment: null, lastKnownRootUri: 'file:///old', canonicalLastKnownRootUri: 'file:///old',
+      replacementEligible: false, mirror: { dirty: false }, data: { version: 2, collections: [],
+        items: ['file:///old/ok', 'file:///old/missing1', 'file:///old/missing2', 'file:///outside'].map((uri, i) =>
+          ({ id: id(i + 2), type: 'file' as const, uri, collectionId: null, order: i })) } }]
+  };
+  if (options.twoDetached) snapshot.partitions.push({ ...snapshot.partitions[0], id: id(9), lastKnownRootUri: 'file:///other',
+    canonicalLastKnownRootUri: 'file:///other', data: { version: 2, items: [], collections: [] } });
+  const state = new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot });
+  const roots = toRootCandidates([{ name: 'New root', index: 0, uri: vscode.Uri.parse('file:///new') }]);
+  const store = await WorkspaceBookmarkStore.create({ state, roots, output: new FakeOutput() });
+  await store.reconcileRoots(roots);
+  let folders: readonly vscode.WorkspaceFolder[] = roots.map((r, index) => ({ uri: r.uri, name: r.label, index }));
+  const messages: string[] = [];
+  const warnings: string[] = [];
+  const picks: vscode.QuickPickItem[][] = [];
+  const before = state.updateCallCount;
+  const prompter = makePrompter({
+    showInfo: async message => { messages.push(message); },
+    showQuickPick: async items => {
+      picks.push(items);
+      if (options.cancelPick === picks.length) return undefined;
+      return items.find(i => i.label === (options.mode ?? 'Reattach and salvage')) ?? items[0];
+    },
+    showWarningConfirm: async (message, label) => {
+      warnings.push(message);
+      assert.strictEqual(label, 'Recover');
+      assert.strictEqual(state.updateCallCount, before, 'preview must not persist');
+      return options.confirmed ?? true;
+    }
+  });
+  return { store, state, before, messages, warnings, picks, roots, prompter,
+    node: partitionNode(id(1), 'detachedPartition'),
+    setFolders: (next: readonly vscode.WorkspaceFolder[]) => { folders = next; },
+    deps: { store, prompter, getWorkspaceFolders: () => folders, fs: { stat: async (uri: vscode.Uri) => {
+      if (uri.toString() !== 'file:///new/ok') throw vscode.FileSystemError.FileNotFound();
+      return { type: vscode.FileType.File, size: 0, ctime: 0, mtime: 0 };
+    } } } };
+}
+
+suite('commands - partition recovery (#62)', () => {
+  test('registered recovery command uses the selected partition and injected recovery dependencies', async () => {
+    await withIsolatedCommandRegistry(async () => {
+      const f = await recoveryFixture();
+      const subscriptions: vscode.Disposable[] = [];
+      registerRecoveryCommand({ subscriptions } as unknown as vscode.ExtensionContext, f.deps);
+      try {
+        await vscode.commands.executeCommand('bookmarks.recoverPartition', f.node);
+        assert.strictEqual(f.store.getView().detached.length, 0);
+        assert.strictEqual(f.state.updateCallCount, f.before + 1);
+      } finally { subscriptions.forEach(subscription => subscription.dispose()); }
+    });
+  });
+  test('folder reorder during mode selection uses current candidate IDs for the same destination', async () => {
+    const f = await recoveryFixture();
+    const getPick = f.prompter.showQuickPick;
+    f.prompter.showQuickPick = async (items, options) => {
+      const pick = await getPick(items, options);
+      if (items[0].label === 'Reattach only') {
+        const folders = [ { name: 'Other', index: 0, uri: vscode.Uri.parse('file:///another') },
+          { name: 'New root', index: 1, uri: vscode.Uri.parse('file:///new') } ];
+        f.setFolders(folders);
+        await f.store.reconcileRoots(toRootCandidates(folders));
+      }
+      return pick;
+    };
+    f.prompter.showWarningConfirm = async () => true;
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.store.getView().detached.length, 0);
+    assert.strictEqual(f.store.getAll().items[0].uri, 'file:///new/ok');
+  });
+  test('destination disappearance during confirmation cancels the commit', async () => {
+    const f = await recoveryFixture();
+    f.prompter.showWarningConfirm = async () => { f.setFolders([]); return true; };
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.state.updateCallCount, f.before);
+    assert.match(f.messages.at(-1)!, /not a current workspace root/);
+  });
+  for (const stage of [1, 2]) {
+    test(`context recovery cancellation at destination/mode stage ${stage} preserves the snapshot`, async () => {
+      const f = await recoveryFixture({ cancelPick: stage });
+      await createRecoverPartitionHandler(f.deps)(f.node);
+      assert.strictEqual(f.state.updateCallCount, f.before);
+      assert.strictEqual(f.warnings.length, 0);
+    });
+  }
+  test('salvage previews exact counts and commits all rewrites after modal confirmation', async () => {
+    const f = await recoveryFixture();
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.match(f.messages[0], /file:\/\/\/old.*4 bookmarks/);
+    assert.match(f.warnings[0], /1 recovered, 2 still missing, 1 incompatible/);
+    assert.strictEqual(f.state.updateCallCount, f.before + 1);
+    assert.deepStrictEqual(f.store.getAll().items.map(i => i.uri), ['file:///new/ok', 'file:///old/missing1', 'file:///old/missing2', 'file:///outside']);
+    assert.strictEqual(f.store.getView().detached.length, 0);
+    assert.strictEqual(f.store.getView().attached[0].partitionId, f.node.kind === 'detachedPartition' ? f.node.partitionId : '');
+  });
+  test('reattach only preserves every URI and explains that choice before confirmation', async () => {
+    const f = await recoveryFixture({ mode: 'Reattach only' });
+    const before = f.store.getAll();
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.deepStrictEqual(f.store.getAll(), before);
+    assert.match(f.warnings[0], /unchanged/);
+    assert.strictEqual(f.state.updateCallCount, f.before + 1);
+  });
+  for (const cancelPick of [1, 2, 3]) {
+    test(`palette cancellation at selection ${cancelPick} never mutates`, async () => {
+      const f = await recoveryFixture({ twoDetached: true, cancelPick });
+      await createRecoverPartitionHandler(f.deps)();
+      assert.strictEqual(f.state.updateCallCount, f.before);
+      assert.strictEqual(f.warnings.length, 0);
+    });
+  }
+  test('declining confirmation leaves attachment and content unchanged', async () => {
+    const f = await recoveryFixture({ confirmed: false });
+    const before = f.store.getView();
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.deepStrictEqual(f.store.getView(), before);
+    assert.strictEqual(f.state.updateCallCount, f.before);
+  });
+  test('palette selects among detached partitions and displays identifying URI and counts', async () => {
+    const f = await recoveryFixture({ twoDetached: true });
+    await createRecoverPartitionHandler(f.deps)();
+    assert.strictEqual(f.picks[0].length, 2);
+    assert.match(JSON.stringify(f.picks[0]), /file:\/\/\/old/);
+    assert.strictEqual(f.store.getView().detached.length, 1);
+  });
+  test('palette uses its only detached partition directly', async () => {
+    const f = await recoveryFixture();
+    await createRecoverPartitionHandler(f.deps)();
+    assert.strictEqual(f.picks.length, 2);
+  });
+  test('no detached partition or no destination is an informative no-op', async () => {
+    const f = await recoveryFixture();
+    f.setFolders([]);
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.state.updateCallCount, f.before);
+    assert.ok(f.messages.length > 0);
+    const ready = await partitionCommandFixture();
+    const prompt = new FakePrompter();
+    await createRecoverPartitionHandler({ ...f.deps, store: ready.workspace, prompter: prompt })();
+    assert.ok(prompt.lastInfoMessage);
+  });
+  test('wrong context and stale detached selection do not start recovery', async () => {
+    const f = await recoveryFixture();
+    await createRecoverPartitionHandler(f.deps)({ kind: 'globalRoot' });
+    await createRecoverPartitionHandler(f.deps)(partitionNode('gone', 'detachedPartition'));
+    assert.strictEqual(f.state.updateCallCount, f.before);
+    assert.strictEqual(f.picks.length, 0);
+  });
+  test('established destination conflicts are redacted and never confirmed', async () => {
+    const f = await recoveryFixture();
+    const owner = f.store.resolveAttachedOwner(vscode.Uri.parse('file:///new/x'))!;
+    await f.store.addCollection(owner, 'private name');
+    const before = f.state.updateCallCount;
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.state.updateCallCount, before);
+    assert.match(f.messages.at(-1)!, /established partition/);
+    assert.ok(!f.messages.at(-1)!.includes('private name'));
+    assert.strictEqual(f.warnings.length, 0);
+  });
+  for (const stage of ['preview', 'commit'] as const) {
+    for (const error of [new Error('unexpected'), new StaleRecoveryPreviewError('stale')]) {
+      test(`${stage} propagates ${error.name} to the extension boundary`, async () => {
+        const f = await recoveryFixture();
+        if (stage === 'preview') f.store.previewRecovery = async () => { throw error; };
+        else f.store.commitRecovery = async () => { throw error; };
+        await assert.rejects(createRecoverPartitionHandler(f.deps)(f.node), e => e === error);
+        assert.strictEqual(f.state.updateCallCount, f.before);
+      });
+    }
+  }
+  test('commit eligibility conflict is shown without exposing unrelated error details', async () => {
+    const f = await recoveryFixture();
+    f.store.commitRecovery = async () => { throw new RecoveryConflictError('Recovery destination eligibility changed.'); };
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.messages.at(-1), 'Recovery destination eligibility changed.');
+    assert.strictEqual(f.state.updateCallCount, f.before);
+  });
+  test('a destination removed during prompts cannot be recovered', async () => {
+    const f = await recoveryFixture();
+    const pick = f.prompter.showQuickPick;
+    f.prompter.showQuickPick = async (items, options) => { const result = await pick(items, options); f.setFolders([]); return result; };
+    await createRecoverPartitionHandler(f.deps)(f.node);
+    assert.strictEqual(f.state.updateCallCount, f.before);
+    assert.strictEqual(f.warnings.length, 0);
+  });
+});
+
+suite('commands - partition menu contributions (#62)', () => {
+  test('recovery and collection creation expose only their intended root contexts and remain in the palette', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../package.json'), 'utf8'));
+    const menus = manifest.contributes.menus;
+    assert.ok(manifest.contributes.commands.some((c: { command: string }) => c.command === 'bookmarks.recoverPartition'));
+    for (const [command, context] of [['bookmarks.recoverPartition', 'bookmarkDetachedPartition'], ['bookmarks.newCollection', 'bookmarkWorkspaceRoot']]) {
+      assert.deepStrictEqual(menus['view/item/context'].filter((m: { command: string }) => m.command === command).map((m: { when: string }) => m.when),
+        [`view == bookmarksView && viewItem == ${context}`]);
+      assert.ok(!menus.commandPalette.some((m: { command: string; when: string }) => m.command === command && m.when === 'false'));
+    }
+    assert.strictEqual(REATTACH_ONLY_LABEL, 'Reattach only');
+    assert.strictEqual(REATTACH_AND_SALVAGE_LABEL, 'Reattach and salvage');
+    assert.strictEqual(RECOVER_CONFIRM_LABEL, 'Recover');
+  });
+});
+
+suite('commands - partition owner routing (#62)', () => {
+  test('Unassigned content remains editable and removable without creating new content', async () => {
+    const f = await recoveryFixture();
+    const snapshot = f.state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    const preserved = snapshot.partitions[0].data;
+    snapshot.unassigned = preserved;
+    snapshot.partitions[0].data = { version: 2, items: [], collections: [] };
+    const collection: BookmarkCollection = { id: '00000000-0000-4000-8000-000000000099', name: 'Preserved', order: 0 };
+    snapshot.unassigned.collections.push(collection);
+    const workspace = await WorkspaceBookmarkStore.create({ state: new FakeMemento({ [WORKSPACE_PARTITION_STORAGE_KEY]: snapshot }), roots: f.roots, output: new FakeOutput() });
+    const stores = { workspace, global: new BookmarkStore(new FakeMemento()) };
+    const owner: WorkspaceOwnerRef = { kind: 'unassigned' };
+    const item = preserved.items[0];
+    const prompt = new FakePrompter({ inputBoxResult: 'Edited', warningConfirmResult: true, quickPickResult: { label: 'Preserved', id: collection.id, owner } });
+    await createNewCollectionHandler(workspace, prompt)(ownedCollection(owner, collection));
+    assert.strictEqual(workspace.getView().unassigned.collections.length, 1);
+    await createRenameCollectionHandler(stores, prompt)(ownedCollection(owner, collection));
+    await createSetDescriptionHandler(stores, prompt)(ownedCollection(owner, collection));
+    await createSetDescriptionHandler(stores, prompt)(ownedItem(owner, item));
+    await createMoveToCollectionHandler(stores, prompt)(ownedItem(owner, item));
+    assert.strictEqual(workspace.getView().unassigned.items[0].collectionId, collection.id);
+    assert.strictEqual(workspace.getView().unassigned.items[0].description, 'Edited');
+    assert.strictEqual(workspace.getView().unassigned.collections[0].name, 'Edited');
+    assert.strictEqual(workspace.getView().unassigned.collections[0].description, 'Edited');
+    await createDeleteCollectionHandler(stores, prompt)(ownedCollection(owner, collection));
+    await createRemoveHandler(stores)(ownedItem(owner, item));
+    assert.strictEqual(workspace.getView().unassigned.items.length, 3);
+    assert.strictEqual(workspace.getView().unassigned.collections.length, 0);
+  });
+  test('canceling each workspace content prompt never writes', async () => {
+    const f = await partitionCommandFixture();
+    const item = await f.workspace.addItem(f.owners[0], { type: 'file', uri: 'file:///a/x' });
+    const collection = await f.workspace.addCollection(f.owners[0], 'Saved');
+    const before = f.state.updateCallCount;
+    const prompt = new FakePrompter();
+    await createRenameCollectionHandler(f.stores, prompt)(ownedCollection(f.owners[0], collection));
+    await createSetDescriptionHandler(f.stores, prompt)(ownedCollection(f.owners[0], collection));
+    await createSetDescriptionHandler(f.stores, prompt)(ownedItem(f.owners[0], item));
+    await createDeleteCollectionHandler(f.stores, prompt)(ownedCollection(f.owners[0], collection));
+    await createMoveToCollectionHandler(f.stores, prompt)(ownedItem(f.owners[0], item));
+    assert.strictEqual(f.state.updateCallCount, before);
+  });
+  test('multiple URI copies within one owner remove the first deterministically without a prompt', async () => {
+    const f = await partitionCommandFixture();
+    const owner = f.owners[0];
+    const collection = await f.workspace.addCollection(owner, 'Group');
+    const uri = vscode.Uri.parse('file:///a/x');
+    const first = await f.workspace.addItem(owner, { type: 'file', uri: uri.toString() });
+    const second = await f.workspace.addItem(owner, { type: 'file', uri: uri.toString(), collectionId: collection.id });
+    const prompt = makePrompter({ showQuickPick: async () => { assert.fail('Only one owner exists'); } });
+    await createRemoveHandler(f.stores, prompt)(uri);
+    assert.deepStrictEqual(f.workspace.getAll().items.map(i => i.id), [second.id]);
+    assert.notStrictEqual(first.id, second.id);
+  });
+  for (const kind of ['suggestion', 'recentItem'] as const) {
+    for (const inside of [true, false]) {
+      test(`${kind} promotion ${inside ? 'uses deepest owner' : 'rejects an outside URI'}`, async () => {
+        const f = await partitionCommandFixture(['file:///a', 'file:///a/nested']);
+        const uri = inside ? 'file:///a/nested/new' : 'file:///outside';
+        const node: BookmarkNode = kind === 'suggestion'
+          ? { kind, recentItem: { uri, firstSeen: 0, previewCount: 0, promoted: true } } : { kind, uri };
+        const prompt = new FakePrompter();
+        const factory = kind === 'suggestion' ? createPromoteSuggestionHandler : createPromoteRecentItemHandler;
+        await factory(f.workspace, prompt)(node);
+        assert.strictEqual(f.workspace.getOwnerData(f.owners[0])!.items.length, 0);
+        assert.strictEqual(f.workspace.getOwnerData(f.owners[1])!.items.length, inside ? 1 : 0);
+        if (!inside) assert.ok(prompt.lastInfoMessage);
+        if (inside) {
+          await factory(f.workspace, prompt)(node);
+          assert.strictEqual(f.workspace.getAll().items.length, 1);
+          assert.match(prompt.lastInfoMessage!, /already bookmarked/);
+        }
+      });
+    }
+  }
+
+  test('cross-owner command moves are rejected with no write', async () => {
+    const f = await partitionCommandFixture();
+    const collection = await f.workspace.addCollection(f.owners[1], 'Elsewhere');
+    const item = await f.workspace.addItem(f.owners[0], { type: 'file', uri: 'file:///a/x' });
+    const prompt = new FakePrompter({ quickPickResult: { label: 'Elsewhere', id: collection.id, owner: f.owners[1] } });
+    const before = f.state.updateCallCount;
+    await createMoveToCollectionHandler(f.stores, prompt)(ownedItem(f.owners[0], item));
+    assert.strictEqual(f.state.updateCallCount, before);
+    assert.strictEqual(prompt.lastInfoMessage, 'Bookmarks cannot be moved between workspace roots.');
+  });
+
+  for (const context of ['root', 'collection', 'single'] as const) {
+    test(`new collection uses ${context} ownership without a root prompt`, async () => {
+      const f = await partitionCommandFixture(context === 'single' ? ['file:///a'] : undefined);
+      const owner = f.owners.at(-1)!;
+      const contextNode = context === 'root' ? partitionNode(owner.partitionId)
+        : context === 'collection' ? ownedCollection(owner, await f.workspace.addCollection(owner, 'Existing')) : undefined;
+      let picks = 0;
+      const prompt = makePrompter({ showInputBox: async () => 'Created', showQuickPick: async () => { picks++; return undefined; } });
+      await createNewCollectionHandler(f.workspace, prompt)(contextNode);
+      assert.strictEqual(f.workspace.getOwnerData(owner)!.collections.at(-1)!.name, 'Created');
+      assert.strictEqual(picks, 0);
+    });
+  }
+  for (const cancel of ['root', 'name'] as const) {
+    test(`new collection cancellation at ${cancel} never writes`, async () => {
+      const f = await partitionCommandFixture();
+      const prompt = makePrompter({ showInputBox: async () => cancel === 'name' ? undefined : 'Created',
+        showQuickPick: async options => cancel === 'root' ? undefined : options[0] });
+      const before = f.state.updateCallCount;
+      await createNewCollectionHandler(f.workspace, prompt)();
+      assert.strictEqual(f.state.updateCallCount, before);
+    });
+  }
+  test('no attached root is an informative no-op without prompting for a name', async () => {
+    const f = await partitionCommandFixture([]);
+    const prompt = new FakePrompter({ inputBoxResult: 'Created' });
+    await createNewCollectionHandler(f.workspace, prompt)();
+    assert.ok(prompt.lastInfoMessage);
+    assert.strictEqual(prompt.inputBoxCallCount, 0);
+  });
+  test('a root disappearing while entering a name prevents collection creation', async () => {
+    const f = await partitionCommandFixture(['file:///a']);
+    const prompt = new FakePrompter({ inputBoxResult: 'Created' });
+    prompt.showInputBox = async () => { await f.workspace.reconcileRoots([]); return 'Created'; };
+    await createNewCollectionHandler(f.workspace, prompt)();
+    assert.strictEqual(f.workspace.getAll().collections.length, 0);
+    assert.ok(prompt.lastInfoMessage);
+  });
+  test('Detached and Unassigned forbid creation but allow existing content edits and removal', async () => {
+    const f = await recoveryFixture();
+    const detached = f.store.getView().detached[0];
+    const owner: WorkspaceOwnerRef = { kind: 'partition', partitionId: detached.partitionId };
+    const prompt = new FakePrompter({ inputBoxResult: 'Edited' });
+    const stores = { workspace: f.store, global: new BookmarkStore(new FakeMemento()) };
+    await createNewCollectionHandler(f.store, prompt)(f.node);
+    await createNewCollectionHandler(f.store, prompt)({ kind: 'unassignedRoot', scope: 'workspace', collection: { id: '', name: '', order: 0 } });
+    assert.strictEqual(f.store.getAll().collections.length, 0);
+    await createSetDescriptionHandler(stores, prompt)(ownedItem(owner, detached.data.items[0]));
+    assert.strictEqual(f.store.getOwnerData(owner)!.items[0].description, 'Edited');
+    await createRemoveHandler(stores)(ownedItem(owner, detached.data.items[0]));
+    assert.strictEqual(f.store.getOwnerData(owner)!.items.length, 3);
+  });
+  test('all content mutations ignore ownerless workspace leaves and structural roots', async () => {
+    const f = await partitionCommandFixture();
+    const item = await f.workspace.addItem(f.owners[0], { type: 'file', uri: 'file:///a/x' });
+    const collection = await f.workspace.addCollection(f.owners[0], 'Saved');
+    const prompt = new FakePrompter({ inputBoxResult: 'Changed', warningConfirmResult: true });
+    const before = f.state.updateCallCount;
+    for (const node of [{ kind: 'item', scope: 'workspace', item }, { kind: 'collection', scope: 'workspace', collection },
+      partitionNode(f.owners[0].partitionId)] as BookmarkNode[]) {
+      await createRemoveHandler(f.stores)(node);
+      await createRenameCollectionHandler(f.stores, prompt)(node);
+      await createSetDescriptionHandler(f.stores, prompt)(node);
+      await createDeleteCollectionHandler(f.stores, prompt)(node);
+      await createMoveToCollectionHandler(f.stores, prompt)(node);
+    }
+    assert.strictEqual(f.state.updateCallCount, before);
+    assert.strictEqual(prompt.inputBoxCallCount, 0);
+  });
+  for (const cancel of [false, true]) {
+    test(`ambiguous URI removal ${cancel ? 'cancellation preserves every owner' : 'prompts for the owner and preserves Global'}`, async () => {
+      const f = await partitionCommandFixture(['file:///a']);
+      const uri = vscode.Uri.parse('file:///a/nested/x');
+      await f.workspace.addItem(f.owners[0], { type: 'file', uri: uri.toString() });
+      await f.workspace.reconcileRoots([...f.roots, { id: 'nested', label: 'Nested', uri: vscode.Uri.parse('file:///a/nested') }]);
+      const nested = f.workspace.resolveAttachedOwner(uri)!;
+      await f.workspace.addItem(nested, { type: 'file', uri: uri.toString() });
+      await f.global.addItem({ type: 'file', uri: uri.toString() });
+      let optionsSeen: vscode.QuickPickItem[] = [];
+      const prompt = makePrompter({ showQuickPick: async options => { optionsSeen = options; return cancel ? undefined : options[1]; } });
+      await createRemoveHandler(f.stores, prompt)(uri);
+      assert.strictEqual(optionsSeen.length, 2);
+      assert.match(JSON.stringify(optionsSeen), /file:\/\/\/a\/nested/);
+      assert.strictEqual(f.workspace.getOwnerData(f.owners[0])!.items.length, 1);
+      assert.strictEqual(f.workspace.getOwnerData(nested)!.items.length, cancel ? 1 : 0);
+      assert.strictEqual(f.global.getAll().items.length, 1);
+    });
+  }
+  test('URI removal falls back to Global only when workspace has no match', async () => {
+    const f = await partitionCommandFixture();
+    await f.global.addItem({ type: 'file', uri: 'file:///outside' });
+    await createRemoveHandler(f.stores)(vscode.Uri.parse('file:///outside'));
+    assert.strictEqual(f.global.getAll().items.length, 0);
+  });
+  test('removes only the item in its explicit owner', async () => {
+    const f = await partitionCommandFixture();
+    const item = await f.workspace.addItem(f.owners[1], { type: 'file', uri: 'file:///b/test' });
+    await createRemoveHandler(f.stores)(ownedItem(f.owners[1], item));
+    assert.deepStrictEqual(f.workspace.getOwnerData(f.owners[1])!.items, []);
+  });
+
+  for (const [name, factory, type] of [
+    ['file', createAddFileHandler, 'file'], ['folder', createAddFolderHandler, 'folder']
+  ] as const) {
+    test(`adds a ${name} to the deepest attached root`, async () => {
+      const f = await partitionCommandFixture(['file:///a', 'file:///a/nested']);
+      await factory(f.workspace, makePrompter())(vscode.Uri.parse('file:///a/nested/new'));
+      assert.strictEqual(f.workspace.getOwnerData(f.owners[0])!.items.length, 0);
+      assert.strictEqual(f.workspace.getOwnerData(f.owners[1])!.items[0].type, type);
+    });
+    test(`does not add an outside ${name}`, async () => {
+      const f = await partitionCommandFixture();
+      const messages: string[] = [];
+      await factory(f.workspace, makePrompter({ showInfo: async m => { messages.push(m); } }))(vscode.Uri.parse('file:///outside'));
+      assert.strictEqual(f.workspace.getAll().items.length, 0);
+      assert.strictEqual(messages.length, 1);
+    });
+  }
+
+  test('routes rename, descriptions, move, and deletion through the collection owner', async () => {
+    const f = await partitionCommandFixture();
+    const owner = f.owners[1];
+    const collection = await f.workspace.addCollection(owner, 'Before');
+    const item = await f.workspace.addItem(owner, { type: 'file', uri: 'file:///b/file' });
+    const prompt = makePrompter({ showInputBox: async () => 'After', showWarningConfirm: async () => true,
+      showQuickPick: async options => options.find(option => option.label === 'After') });
+    await createRenameCollectionHandler(f.stores, prompt)(ownedCollection(owner, collection));
+    await createSetDescriptionHandler(f.stores, prompt)(ownedCollection(owner, collection));
+    await createSetDescriptionHandler(f.stores, prompt)(ownedItem(owner, item));
+    await createMoveToCollectionHandler(f.stores, prompt)(ownedItem(owner, item));
+    const data = f.workspace.getOwnerData(owner)!;
+    assert.strictEqual(data.collections[0].name, 'After');
+    assert.strictEqual(data.collections[0].description, 'After');
+    assert.strictEqual(data.items[0].description, 'After');
+    assert.strictEqual(data.items[0].collectionId, collection.id);
+    await createDeleteCollectionHandler(f.stores, prompt)(ownedCollection(owner, collection));
+    assert.deepStrictEqual(f.workspace.getOwnerData(owner)!.collections, []);
+    assert.strictEqual(f.workspace.getOwnerData(owner)!.items[0].collectionId, null);
+    assert.deepStrictEqual(f.workspace.getOwnerData(f.owners[0])!.items, []);
+  });
+
+  test('creates a collection in the selected attached root', async () => {
+    const f = await partitionCommandFixture();
+    const prompt = makePrompter({ showInputBox: async () => 'Work', showQuickPick: async options => options[1] });
+    await createNewCollectionHandler(f.workspace, prompt)();
+    assert.strictEqual(f.workspace.getOwnerData(f.owners[1])!.collections[0].name, 'Work');
+    assert.strictEqual(f.workspace.getOwnerData(f.owners[0])!.collections.length, 0);
+  });
+
+  test('sole URI workspace match takes precedence over Global', async () => {
+    const f = await partitionCommandFixture();
+    await f.workspace.addItem(f.owners[1], { type: 'file', uri: 'file:///b/file' });
+    await f.global.addItem({ type: 'file', uri: 'file:///b/file' });
+    await createRemoveHandler(f.stores)(vscode.Uri.parse('file:///b/file'));
+    assert.strictEqual(f.workspace.getAll().items.length, 0);
+    assert.strictEqual(f.global.getAll().items.length, 1);
+  });
+});
 
 function makePrompter(overrides: Partial<Prompter> = {}): Prompter {
   return {
@@ -45,7 +527,7 @@ function makePrompter(overrides: Partial<Prompter> = {}): Prompter {
  * supplied gets a fresh, empty BookmarkStore backed by its own FakeMemento — never shared with
  * the other scope, so "the other store is untouched" assertions are meaningful.
  */
-function makeScopedStores(overrides: Partial<ScopedStores> = {}): ScopedStores {
+function makeScopedStores(overrides: Partial<ScopedStores<BookmarkStore>> = {}): ScopedStores<BookmarkStore> {
   return {
     workspace: overrides.workspace ?? new BookmarkStore(new FakeMemento()),
     global: overrides.global ?? new BookmarkStore(new FakeMemento())
@@ -1429,8 +1911,7 @@ suite('commands - addToWorkspace', () => {
   });
 
   test(
-    'single-root, confirmed: shows a confirm naming the mirror and restart consequences, then ' +
-      'flushes, then adds at index 1',
+    'single-root: flushes then adds the second root without an obsolete mirror warning',
     async () => {
       const root = vscode.Uri.file('/workspace/project');
       const folders = [folder(root)];
@@ -1444,23 +1925,10 @@ suite('commands - addToWorkspace', () => {
 
       assert.deepStrictEqual(
         fakes.calls,
-        ['confirm', 'flush', 'update'],
-        'must confirm, then flush the mirror, then update folders — in that order'
+        ['flush', 'update'],
+        'must flush the mirror then update folders'
       );
-      assert.strictEqual(fakes.confirmCalls.length, 1);
-      const { message, confirmLabel } = fakes.confirmCalls[0];
-      assert.ok(message.length > 0, 'the confirm message must not be empty');
-      assert.match(
-        message,
-        /mirror|bookmarks\.json/i,
-        'the confirm message must name the mirror-disabling consequence'
-      );
-      assert.match(
-        message,
-        /restart|reload/i,
-        'the confirm message must name the possible extension-host restart consequence'
-      );
-      assert.ok(confirmLabel.length > 0, 'the confirm label must not be empty');
+      assert.strictEqual(fakes.confirmCalls.length, 0);
 
       assert.strictEqual(fakes.updateCalls.length, 1);
       assert.strictEqual(fakes.updateCalls[0].start, 1, 'start index must equal the current folder count (1)');
@@ -1469,7 +1937,7 @@ suite('commands - addToWorkspace', () => {
     }
   );
 
-  test('single-root, declined: never updates workspace folders or flushes the mirror', async () => {
+  test('single-root addition no longer depends on obsolete mirror confirmation', async () => {
     const root = vscode.Uri.file('/workspace/project');
     const folders = [folder(root)];
     const fakes = makeAddToWorkspaceFakes({ folders, confirmResult: false });
@@ -1482,8 +1950,8 @@ suite('commands - addToWorkspace', () => {
 
     assert.deepStrictEqual(
       fakes.calls,
-      ['confirm'],
-      'declining the confirmation must stop before any flush or update call'
+      ['flush', 'update'],
+      'the obsolete confirmation is never requested'
     );
   });
 

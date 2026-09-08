@@ -212,6 +212,8 @@ export interface FakePrompterOptions {
  * `value`) and whether the box was opened at all.
  */
 export class FakePrompter implements Prompter {
+  lastInfoMessage: string | undefined;
+  lastWarningMessage: string | undefined;
   lastInputBoxOptions: vscode.InputBoxOptions | undefined;
   inputBoxCallCount = 0;
   lastActionPromptArgs: { message: string; actions: string[] } | undefined;
@@ -241,11 +243,13 @@ export class FakePrompter implements Prompter {
     return Promise.resolve(this.quickPickResult as T | undefined);
   }
 
-  showWarningConfirm(): Thenable<boolean> {
+  showWarningConfirm(message: string): Thenable<boolean> {
+    this.lastWarningMessage = message;
     return Promise.resolve(this.warningConfirmResult);
   }
 
-  showInfo(): Thenable<unknown> {
+  showInfo(message: string): Thenable<unknown> {
+    this.lastInfoMessage = message;
     return Promise.resolve(this.infoResult);
   }
 

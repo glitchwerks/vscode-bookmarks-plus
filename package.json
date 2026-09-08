@@ -42,6 +42,7 @@
       { "command": "bookmarks.remove", "title": "Remove Bookmark", "category": "Bookmarks Plus", "icon": "$(trash)" },
       { "command": "bookmarks.reveal", "title": "Reveal in Explorer", "category": "Bookmarks Plus", "icon": "$(go-to-file)" },
       { "command": "bookmarks.newCollection", "title": "New Collection", "category": "Bookmarks Plus", "icon": "$(new-folder)" },
+      { "command": "bookmarks.recoverPartition", "title": "Recover Detached Workspace", "category": "Bookmarks Plus" },
       { "command": "bookmarks.newGlobalCollection", "title": "New Collection", "category": "Bookmarks Plus", "icon": "$(new-folder)" },
       { "command": "bookmarks.renameCollection", "title": "Rename Collection", "category": "Bookmarks Plus", "icon": "$(edit)" },
       { "command": "bookmarks.setDescription", "title": "Set Description", "category": "Bookmarks Plus", "icon": "$(note)" },
@@ -79,6 +80,8 @@
         { "command": "bookmarks.refresh", "when": "view == bookmarksView", "group": "navigation@4" }
       ],
       "view/item/context": [
+        { "command": "bookmarks.recoverPartition", "when": "view == bookmarksView && viewItem == bookmarkDetachedPartition", "group": "bookmarks@1" },
+        { "command": "bookmarks.newCollection", "when": "view == bookmarksView && viewItem == bookmarkWorkspaceRoot", "group": "inline@1" },
         { "command": "bookmarks.remove", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@1" },
         { "command": "bookmarks.reveal", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@2" },
         { "command": "bookmarks.moveToCollection", "when": "view == bookmarksView && viewItem =~ /^bookmarkItem\\b/", "group": "inline@3" },
