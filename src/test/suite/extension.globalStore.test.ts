@@ -41,13 +41,191 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
     async start() { await activate(context as unknown as vscode.ExtensionContext, deps as unknown as Parameters<typeof activate>[1]); },
     async change(names: string[]) {
       folders = names.map((name, index) => ({ name, index, uri: vscode.Uri.parse('file:///' + name) }));
-      assert.ok(changed); await changed();
+      await changed?.();
     },
     async stop() { await deactivate(); context.subscriptions.forEach(value => value.dispose()); }
   };
 }
 
+/** Holds external I/O at a known boundary without relying on debounce timing. */
+function barrier() {
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  return { entered, release, async wait() { enter(); await blocked; } };
+}
+
 suite('Extension - partitioned activation (#62)', () => {
+  test('folder changes during migration are reconciled before activation completes', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+    let firstWrite = true;
+    f.context.workspaceState.update = async (key, value) => {
+      if (key === WORKSPACE_PARTITION_STORAGE_KEY && firstWrite) {
+        firstWrite = false; await gate.wait();
+      }
+      await update(key, value);
+    };
+    const start = f.start();
+    try {
+      await gate.entered;
+      const change = f.change(['a', 'b']);
+      gate.release();
+      await Promise.all([start, change]);
+      assert.deepStrictEqual(f.stores.workspace.getView().attached.map(root => root.rootUri), ['file:///a', 'file:///b']);
+      assert.deepStrictEqual([...f.resources.keys()].sort(), ['file:///a', 'file:///b']);
+      const definitions = await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken);
+      assert.deepStrictEqual(definitions?.map(value => (value as vscode.McpStdioServerDefinition).args[1]),
+        [vscode.Uri.parse('file:///a').fsPath, vscode.Uri.parse('file:///b').fsPath]);
+      assert.strictEqual(f.context.environmentVariableCollection.calls.at(-1)!.value, 'disabled:multi-root');
+    } finally { gate.release(); await start; await f.stop(); }
+  });
+
+  test('folder changes during initial mirror reads retire obsolete watchers before activation completes', async () => {
+    const f = activationFixture();
+    const gate = barrier();
+    const create = f.deps.createMirrorResources;
+    f.deps.createMirrorResources = root => {
+      const resource = create(root);
+      if (root.toString() === 'file:///b') {
+        resource.port.read = async () => { await gate.wait(); return undefined; };
+      }
+      return resource;
+    };
+    const start = f.start();
+    try {
+      await gate.entered;
+      const change = f.change(['a', 'c']);
+      gate.release();
+      await Promise.all([start, change]);
+      assert.deepStrictEqual(f.stores.workspace.getView().attached.map(root => root.rootUri), ['file:///a', 'file:///c']);
+      assert.strictEqual(f.resources.get('file:///b')!.disposed, true);
+      assert.strictEqual(f.resources.get('file:///c')!.disposed, false);
+      const definitions = await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken);
+      assert.deepStrictEqual(definitions?.map(value => (value as vscode.McpStdioServerDefinition).args[1]),
+        [vscode.Uri.parse('file:///a').fsPath, vscode.Uri.parse('file:///c').fsPath]);
+      assert.strictEqual(f.context.environmentVariableCollection.calls.at(-1)!.value, 'disabled:multi-root');
+    } finally { gate.release(); await start; await f.stop(); }
+  });
+
+  test('native definitions exclude an attached canonical collision and restore it when unique again', async () => {
+    const f = activationFixture(['a']);
+    try {
+      await f.start();
+      const partitionId = f.stores.workspace.getView().attached[0].partitionId;
+      let events = 0;
+      f.mcp.onDidChangeMcpServerDefinitions?.(() => events++);
+      assert.strictEqual((await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken))?.length, 1);
+      await f.change(['a', 'a']);
+      assert.deepStrictEqual(f.stores.workspace.getView().unavailableRoots, ['file:///a']);
+      assert.strictEqual(f.stores.workspace.getView().attached[0].partitionId, partitionId);
+      assert.deepStrictEqual(await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken), []);
+      assert.strictEqual(events, 1);
+      await f.change(['a']);
+      assert.strictEqual(f.stores.workspace.getView().attached[0].partitionId, partitionId);
+      assert.strictEqual((await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken))?.length, 1);
+      assert.strictEqual(events, 2);
+    } finally { await f.stop(); }
+  });
+
+  for (const failure of ['malformed snapshot', 'persistence failure']) {
+    test(`terminal environment follows actual folders after ${failure}`, async () => {
+      const f = activationFixture(['a'], failure === 'malformed snapshot');
+      try {
+        await f.start();
+        if (failure === 'persistence failure') f.context.workspaceState.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
+        await f.change(['a', 'b']);
+        assert.strictEqual(f.context.environmentVariableCollection.calls.at(-1)!.value, 'disabled:multi-root');
+        assert.strictEqual(f.stores.workspace.getView().attached.length, failure === 'malformed snapshot' ? 0 : 1);
+        await f.change(['a']);
+        assert.strictEqual(f.context.environmentVariableCollection.calls.at(-1)!.value, vscode.Uri.parse('file:///a').fsPath);
+      } finally { await f.stop(); }
+    });
+  }
+
+  test('older queued root commits cannot overwrite the latest terminal topology', async () => {
+    const f = activationFixture();
+    const gate = barrier();
+    let first: Promise<void> | undefined, second: Promise<void> | undefined;
+    try {
+      await f.start();
+      const uri = vscode.Uri.parse('file:///b/file');
+      await f.stores.workspace.addItem(f.stores.workspace.resolveAttachedOwner(uri)!, { type: 'file', uri: uri.toString() });
+      const port = f.resources.get('file:///b')!.port;
+      const write = port.write.bind(port);
+      port.write = async content => { await gate.wait(); await write(content); };
+      first = f.change(['a']);
+      await gate.entered;
+      second = f.change(['a', 'c']);
+      const seen: string[] = [];
+      f.stores.workspace.onDidChangePartitions(() => {
+        seen.push(f.context.environmentVariableCollection.calls.at(-1)!.value);
+      });
+      gate.release();
+      await Promise.all([first, second]);
+      assert.deepStrictEqual(seen, ['disabled:multi-root', 'disabled:multi-root']);
+    } finally { gate.release(); await Promise.all([first, second]); await f.stop(); }
+  });
+
+  for (const recoveryState of ['committed', 'pending']) {
+    test(`deactivation drains ${recoveryState} recovery and waits for the destination write and bookkeeping`, async () => {
+      const f = activationFixture(['anchor', 'old']);
+      const gate = barrier();
+      const commitGate = barrier();
+      let holdRecoveredWrite = false;
+      const create = f.deps.createMirrorResources;
+      f.deps.createMirrorResources = root => {
+        const resource = create(root);
+        if (root.toString() === 'file:///new' && holdRecoveredWrite) {
+          const write = resource.port.write.bind(resource.port);
+          resource.port.write = async content => { await gate.wait(); await write(content); };
+        }
+        return resource;
+      };
+      let stop: Promise<void> | undefined;
+      let commit: Promise<void> | undefined;
+      try {
+        await f.start();
+        const store = f.stores.workspace;
+        const owner = store.resolveAttachedOwner(vscode.Uri.parse('file:///old/file'))!;
+        assert.strictEqual(owner.kind, 'partition');
+        await store.addItem(owner, { type: 'file', uri: 'file:///old/file' });
+        await f.change(['anchor', 'new']);
+        const retired = f.resources.get('file:///new')!;
+        const preview = await store.previewRecovery(store.getView().detached[0].partitionId,
+          { id: 'new', label: 'new', uri: vscode.Uri.parse('file:///new') }, 'salvage',
+          { stat: async () => ({ type: vscode.FileType.File, size: 0, ctime: 0, mtime: 0 }) });
+        holdRecoveredWrite = true;
+        if (recoveryState === 'pending') {
+          const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+          f.context.workspaceState.update = async (key, value) => { await commitGate.wait(); await update(key, value); };
+        }
+        commit = store.commitRecovery(preview.token);
+        if (recoveryState === 'pending') await commitGate.entered;
+        else await commit;
+        let stopped = false;
+        stop = deactivate().then(() => { stopped = true; });
+        if (recoveryState === 'pending') {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.strictEqual(stopped, false, 'shutdown must wait for the accepted recovery commit');
+          commitGate.release();
+          await commit;
+        }
+        await gate.entered;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.strictEqual(stopped, false, 'shutdown must wait for recovered mirror content');
+        assert.strictEqual(f.resources.get('file:///new')!.disposed, false);
+        gate.release();
+        await stop;
+        assert.strictEqual(retired.disposed, true);
+        assert.strictEqual(f.resources.get('file:///new')!.disposed, true);
+        assert.deepStrictEqual(JSON.parse(f.resources.get('file:///new')!.port.content!).items.map((item: { uri: string }) => item.uri), ['file:///new/file']);
+        assert.strictEqual(store.getMirrorState(store.getView().attached.find(root => root.rootUri === 'file:///new')!.partitionId)!.dirty, false);
+      } finally { commitGate.release(); gate.release(); await commit; await stop; await f.stop(); }
+    });
+  }
+
   test('activation accepts a Windows drive URI after persistence serialization', async () => {
     const f = activationFixture(['C:/Work/Repo']);
     try {
@@ -56,6 +234,31 @@ suite('Extension - partitioned activation (#62)', () => {
       assert.strictEqual(f.resources.size, 1);
       assert.strictEqual((await f.mcp.provideMcpServerDefinitions({} as vscode.CancellationToken))?.length, 1);
     } finally { await f.stop(); }
+  });
+
+  test('deactivation flushes edits accepted while another root write is draining', async () => {
+    const f = activationFixture();
+    const gate = barrier();
+    let stop: Promise<void> | undefined;
+    try {
+      await f.start();
+      const store = f.stores.workspace;
+      const ownerA = store.resolveAttachedOwner(vscode.Uri.parse('file:///a/first'))!;
+      const ownerB = store.resolveAttachedOwner(vscode.Uri.parse('file:///b/first'))!;
+      await store.addItem(ownerA, { type: 'file', uri: 'file:///a/first' });
+      await store.addItem(ownerB, { type: 'file', uri: 'file:///b/first' });
+      const port = f.resources.get('file:///b')!.port;
+      const write = port.write.bind(port);
+      port.write = async content => { await gate.wait(); await write(content); };
+      stop = deactivate();
+      await gate.entered;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await store.addItem(ownerA, { type: 'file', uri: 'file:///a/later' });
+      gate.release();
+      await stop;
+      assert.deepStrictEqual(JSON.parse(f.resources.get('file:///a')!.port.content!).items.map((item: { uri: string }) => item.uri),
+        ['file:///a/first', 'file:///a/later']);
+    } finally { gate.release(); await stop; await f.stop(); }
   });
 
   test('activation creates and reconciles one mirror per attached root', async () => {

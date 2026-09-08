@@ -193,6 +193,50 @@ class DeferredFirstWorkspaceUpdateMemento extends FakeMemento {
 }
 
 suite('WorkspaceBookmarkStore content operations', () => {
+  test('whenIdle drains operations accepted while an earlier write is pending', async () => {
+    const { store, state, ownerA } = await readyStore();
+    let releaseFirst!: () => void, releaseSecond!: () => void;
+    let enterFirst!: () => void, enterSecond!: () => void;
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve; });
+    const firstEntered = new Promise<void>(resolve => { enterFirst = resolve; });
+    const secondEntered = new Promise<void>(resolve => { enterSecond = resolve; });
+    const update = state.update.bind(state);
+    let writes = 0;
+    state.update = async (key, value) => {
+      if (++writes === 1) { enterFirst(); await firstGate; }
+      else { enterSecond(); await secondGate; }
+      await update(key, value);
+    };
+    const first = store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/first' });
+    let second: Promise<BookmarkItem> | undefined;
+    try {
+      await firstEntered;
+      let idle = false;
+      const drained = store.whenIdle().then(() => { idle = true; });
+      second = store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/second' });
+      releaseFirst();
+      await secondEntered;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(idle, false, 'a later accepted write is still pending');
+      releaseSecond();
+      await drained;
+      assert.deepStrictEqual(store.getAll().items.map(item => item.uri), ['file:///workspace/a/first', 'file:///workspace/a/second']);
+    } finally { releaseFirst(); releaseSecond(); await Promise.all([first, second]); store.dispose(); }
+  });
+
+  test('whenIdle waits past a rejected operation for the next successful commit', async () => {
+    const { store, state, ownerA } = await readyStore();
+    try {
+      state.failUpdateForKey = WORKSPACE_PARTITION_STORAGE_KEY;
+      const failed = assert.rejects(store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/failed' }));
+      const committed = store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/kept' });
+      await store.whenIdle();
+      await Promise.all([failed, committed]);
+      assert.deepStrictEqual(store.getAll().items.map(item => item.uri), ['file:///workspace/a/kept']);
+    } finally { store.dispose(); }
+  });
+
   test('creates only inside the explicit matching attached partition', async () => {
     const { store, state, ownerA, ownerB } = await readyStore();
     const events: number[] = [];

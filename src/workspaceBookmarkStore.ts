@@ -677,6 +677,15 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     });
   }
 
+  /** Waits for accepted operations, including operations queued while earlier writes settle. */
+  async whenIdle(): Promise<void> {
+    let tail: Promise<void>;
+    do {
+      tail = this.operationTail;
+      await tail;
+    } while (tail !== this.operationTail);
+  }
+
   /** Disposes the change event emitter; workspace state itself remains untouched. */
   dispose(): void {
     this.disposed = true;

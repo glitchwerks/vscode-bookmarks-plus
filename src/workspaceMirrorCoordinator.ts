@@ -51,11 +51,15 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[];
   private lifecycleTail: Promise<void> = Promise.resolve();
   private nextGeneration = 1;
+  private contentRevision = 0;
   private disposed = false;
 
   constructor(private readonly options: WorkspaceMirrorCoordinatorOptions) {
     this.subscriptions = [
-      options.store.onBookmarksChanged(() => this.scheduleDirtyPartitions()),
+      options.store.onBookmarksChanged(() => {
+        this.contentRevision++;
+        this.scheduleDirtyPartitions();
+      }),
       options.store.onDidChangePartitions(() => {
         void this.reconcileBindings().catch(() => this.log('lifecycle', 'reconcile'));
       })
@@ -139,6 +143,26 @@ export class WorkspaceMirrorCoordinator implements vscode.Disposable {
       }
     });
     if (errors.length > 0) { throw new AggregateError(errors, 'Workspace mirror flush failed.'); }
+  }
+
+  /** Drains accepted store/lifecycle work before flushing the final shutdown binding set. */
+  async drainAndFlush(): Promise<void> {
+    const errors: unknown[] = [];
+    for (;;) {
+      await this.options.store.whenIdle();
+      const lifecycle = this.lifecycleTail;
+      await lifecycle;
+      await this.options.store.whenIdle();
+      // Recovery and mirror adoption can publish more lifecycle work while a binding settles.
+      if (lifecycle !== this.lifecycleTail) { continue; }
+      const contentRevision = this.contentRevision;
+      try { await this.flushAll(); }
+      catch (error) { errors.push(error); }
+      await this.options.store.whenIdle();
+      // An edit can arrive after its root flushed while another root still has pending I/O.
+      if (lifecycle === this.lifecycleTail && contentRevision === this.contentRevision) { break; }
+    }
+    if (errors.length > 0) { throw new AggregateError(errors, 'Workspace mirror shutdown flush failed.'); }
   }
 
   /** Cancels pending work and prevents in-flight reads and writes from publishing metadata. */
