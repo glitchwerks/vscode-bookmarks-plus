@@ -102,6 +102,37 @@ async function recoveryFixture(options: { mode?: string; confirmed?: boolean; ca
 }
 
 suite('commands - partition recovery (#62)', () => {
+  for (const mode of ['Reattach only', 'Reattach and salvage']) {
+    test(`${mode} commits exactly once after existing roots reorder during confirmation`, async () => {
+      const f = await recoveryFixture({ mode });
+      const folders = [
+        { name: 'New root', index: 0, uri: vscode.Uri.parse('file:///new') },
+        { name: 'Other', index: 1, uri: vscode.Uri.parse('file:///other') }
+      ];
+      f.setFolders(folders);
+      await f.store.reconcileRoots(toRootCandidates(folders));
+      const beforeWrites = f.state.updateCallCount;
+      let confirmations = 0;
+      let events = 0;
+      const subscription = f.store.onBookmarksChanged(() => { events++; });
+      f.prompter.showWarningConfirm = async () => {
+        confirmations++;
+        const reordered = [folders[1], folders[0]];
+        f.setFolders(reordered);
+        await f.store.reconcileRoots(toRootCandidates(reordered));
+        assert.strictEqual(f.state.updateCallCount, beforeWrites, 'reordering must not change the snapshot revision');
+        return true;
+      };
+      try {
+        await createRecoverPartitionHandler(f.deps)(f.node);
+        assert.strictEqual(f.store.getView().detached.length, 0, 'the confirmed partition must reattach after index-only ID changes');
+        assert.strictEqual(f.state.updateCallCount, beforeWrites + 1);
+        assert.strictEqual(events, 1);
+        assert.strictEqual(confirmations, 1);
+        assert.strictEqual(f.store.getAll().items[0].uri, mode === 'Reattach only' ? 'file:///old/ok' : 'file:///new/ok');
+      } finally { subscription.dispose(); }
+    });
+  }
   test('registered recovery command uses the selected partition and injected recovery dependencies', async () => {
     await withIsolatedCommandRegistry(async () => {
       const f = await recoveryFixture();

@@ -775,11 +775,10 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     } catch {
       throw new RecoveryConflictError('Recovery destination is not a current workspace root.');
     }
-    const matchingRoots = this.roots.filter((root) => root.id === requestedDestination.id
-      && canonicalizeRootUri(root.uri) === destinationCanonical);
-    if (matchingRoots.length !== 1 || this.roots.filter(
-      (root) => canonicalizeRootUri(root.uri) === destinationCanonical
-    ).length !== 1) {
+    // Candidate IDs include folder indices and may change after preview. Only a unique
+    // canonical URI establishes continuity; collisions must still reject recovery.
+    const matchingRoots = this.roots.filter((root) => canonicalizeRootUri(root.uri) === destinationCanonical);
+    if (matchingRoots.length !== 1) {
       throw new RecoveryConflictError('Recovery destination is unavailable.');
     }
     const destination = matchingRoots[0];
