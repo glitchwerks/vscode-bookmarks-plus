@@ -44,7 +44,7 @@ after(() => {
  * files -- clobbering that directory mid-run would make every other test
  * file in this suite unreliable, not just this one.
  */
-function buildScratchTree(): { scratchMcpServerRoot: string } {
+function buildScratchTree(includeBridgeSchema = true): { scratchMcpServerRoot: string } {
   const scratchRoot = mkdtempSync(join(tmpdir(), 'bookmarks-copy-schema-test-'));
   tempDirs.push(scratchRoot);
 
@@ -56,10 +56,12 @@ function buildScratchTree(): { scratchMcpServerRoot: string } {
     join(repoRoot, 'schemas', 'bookmarks.schema.json'),
     join(scratchRoot, 'schemas', 'bookmarks.schema.json'),
   );
-  cpSync(
-    join(repoRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
-    join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
-  );
+  if (includeBridgeSchema) {
+    cpSync(
+      join(repoRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+      join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+    );
+  }
 
   // Copies the whole scripts/ directory, not just copy-schema.mjs, so this
   // test survives an implementer factoring shared copy logic into a sibling
@@ -97,6 +99,22 @@ test('copy-schema.mjs copies both tracked schemas into dist', () => {
   assert.ok(
     existsSync(join(scratchMcpServerRoot, 'dist', 'live-mcp-bridge-v1.schema.json')),
     'copy-schema.mjs must copy the bridge schema to dist/live-mcp-bridge-v1.schema.json',
+  );
+});
+
+test('copy-schema.mjs fails and names a missing tracked schema source', () => {
+  const { scratchMcpServerRoot } = buildScratchTree(false);
+  const expectedSource = join(scratchMcpServerRoot, '..', 'schemas', 'live-mcp-bridge-v1.schema.json');
+
+  assert.throws(
+    () => execFileSync(process.execPath, [join(scratchMcpServerRoot, 'scripts', 'copy-schema.mjs')], {
+      cwd: scratchMcpServerRoot,
+      stdio: 'pipe',
+    }),
+    (error: unknown) => {
+      const failure = error as { status?: unknown; stderr?: unknown };
+      return failure.status === 1 && String(failure.stderr).includes(expectedSource);
+    },
   );
 });
 

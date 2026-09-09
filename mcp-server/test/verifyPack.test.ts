@@ -132,6 +132,10 @@ function buildScratchTree(mutateManifest?: (pkg: PackageManifest) => void): {
     join(repoRoot, 'schemas', 'bookmarks.schema.json'),
     join(scratchRoot, 'schemas', 'bookmarks.schema.json'),
   );
+  cpSync(
+    join(repoRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+    join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+  );
 
   for (const entry of ['scripts', 'src']) {
     cpSync(join(mcpServerRoot, entry), join(scratchMcpServerRoot, entry), { recursive: true });

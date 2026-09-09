@@ -69,6 +69,7 @@ export class NdjsonFrameDecoder {
   private readonly decoder = new StringDecoder('utf8');
   private bufferedText = '';
   private bufferedByteLength = 0;
+  private bufferedEndsWithCarriageReturn = false;
 
   /** Adds a socket chunk and returns each complete LF or CRLF-delimited frame. */
   push(chunk: Buffer): string[] {
@@ -80,6 +81,7 @@ export class NdjsonFrameDecoder {
   /** Completes the stream, rejecting an unterminated final frame. */
   finish(): void {
     this.bufferedText += this.decoder.end();
+    this.ensureFrameSize(this.bufferedByteLength);
     if (this.bufferedText.length !== 0) {
       throw new BridgeProtocolError('invalid-request', 'Bridge stream ended with an incomplete frame.');
     }
@@ -92,12 +94,18 @@ export class NdjsonFrameDecoder {
       if (chunk[index] !== 0x0a) {
         continue;
       }
-      this.ensureFrameSize(this.bufferedByteLength + index - segmentStart);
+      const frameEndsWithCarriageReturn =
+        (index > segmentStart && chunk[index - 1] === 0x0d) ||
+        (index === segmentStart && this.bufferedEndsWithCarriageReturn);
+      const carriageReturnBytes = frameEndsWithCarriageReturn ? 1 : 0;
+      this.ensureFrameSize(this.bufferedByteLength + index - segmentStart - carriageReturnBytes);
       this.bufferedByteLength = 0;
+      this.bufferedEndsWithCarriageReturn = false;
       segmentStart = index + 1;
     }
     this.bufferedByteLength += chunk.length - segmentStart;
-    this.ensureFrameSize(this.bufferedByteLength);
+    this.bufferedEndsWithCarriageReturn = chunk.length > segmentStart && chunk[chunk.length - 1] === 0x0d;
+    this.ensureFrameSize(this.bufferedByteLength - (this.bufferedEndsWithCarriageReturn ? 1 : 0));
   }
 
   /** Rejects a frame before retaining more than the published byte limit. */

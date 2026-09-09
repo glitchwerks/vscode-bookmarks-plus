@@ -68,6 +68,34 @@ suite('live MCP bridge client protocol', () => {
     assert.deepStrictEqual(decoder.push(Buffer.from('{"lf":true}\n{"crlf":true}\r\n')), ['{"lf":true}', '{"crlf":true}']);
   });
 
+  test('accepts a 16 MiB payload with an LF delimiter', () => {
+    const decoder = new NdjsonFrameDecoder();
+
+    const frames = decoder.push(Buffer.concat([Buffer.alloc(MAX_LIVE_BRIDGE_FRAME_BYTES, 0x61), Buffer.from('\n')]));
+
+    assert.strictEqual(frames.length, 1);
+    assert.strictEqual(frames[0].length, MAX_LIVE_BRIDGE_FRAME_BYTES);
+  });
+
+  test('accepts a 16 MiB payload with a CRLF delimiter', () => {
+    const decoder = new NdjsonFrameDecoder();
+
+    const frames = decoder.push(Buffer.concat([Buffer.alloc(MAX_LIVE_BRIDGE_FRAME_BYTES, 0x61), Buffer.from('\r\n')]));
+
+    assert.strictEqual(frames.length, 1);
+    assert.strictEqual(frames[0].length, MAX_LIVE_BRIDGE_FRAME_BYTES);
+  });
+
+  test('accepts a 16 MiB payload when a CRLF delimiter spans chunks', () => {
+    const decoder = new NdjsonFrameDecoder();
+
+    assert.deepStrictEqual(decoder.push(Buffer.concat([Buffer.alloc(MAX_LIVE_BRIDGE_FRAME_BYTES, 0x61), Buffer.from('\r')])), []);
+    const frames = decoder.push(Buffer.from('\n'));
+
+    assert.strictEqual(frames.length, 1);
+    assert.strictEqual(frames[0].length, MAX_LIVE_BRIDGE_FRAME_BYTES);
+  });
+
   test('preserves malformed JSON framing for the caller to reject', () => {
     const decoder = new NdjsonFrameDecoder();
 

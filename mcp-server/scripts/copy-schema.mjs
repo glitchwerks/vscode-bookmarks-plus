@@ -21,7 +21,8 @@ for (const schemaName of schemaNames) {
   const schemaSrc = join(mcpServerRoot, '..', 'schemas', schemaName);
   const schemaDest = join(mcpServerRoot, 'dist', schemaName);
   if (!existsSync(schemaSrc)) {
-    continue;
+    console.error(`copy-schema: schema source not found at ${schemaSrc}`);
+    process.exit(1);
   }
   mkdirSync(dirname(schemaDest), { recursive: true });
   copyFileSync(schemaSrc, schemaDest);
