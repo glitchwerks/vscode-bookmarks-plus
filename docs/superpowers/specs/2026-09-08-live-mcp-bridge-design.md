@@ -90,6 +90,8 @@ must pass through those stores rather than compete with the extension through
 7. A bootstrap expires after 60 seconds and is single-use. An authenticated session has no lease or
    heartbeat and may remain connected for the life of a persistent MCP client.
 8. Native bridge failure blocks MCP initialization; there is no workspace-mirror fallback.
+9. The live client has one absolute 10-second bridge-handshake deadline. It is not extended by
+   partial traffic and fails held MCP initialization with `bridge-unavailable` on expiry.
 
 ## Transport comparison
 
@@ -156,7 +158,8 @@ package boundary. (`docs/superpowers/specs/2026-08-09-mcp-dynamic-workspace-reso
 `LiveMcpBridgeClient` in the bundled server:
 
 - Reads the endpoint and raw token from environment variables.
-- Authenticates before allowing MCP initialization to complete.
+- Starts one absolute 10-second handshake deadline before opening the IPC connection and
+  authenticates before allowing MCP initialization to complete.
 - Correlates concurrent bridge requests and responses.
 - Converts bridge errors into safe MCP initialization or tool errors.
 - Closes the bridge socket when stdio closes.
@@ -341,6 +344,24 @@ The live client begins connecting as the subprocess starts. A small transport wr
   `data.bookmarksPlusCode`, closes stdio, and exits nonzero.
 - It never forwards tool discovery or tool calls before initialization succeeds.
 
+The live client enforces a 10-second absolute handshake deadline. One one-shot timer starts
+immediately before initiating the IPC connection and covers connection establishment, transmission
+of `hello`, and receipt and validation of `ready`. Connection success, writes, and complete or
+partial incoming frames do not reset or extend it. The client clears the timer only after a valid
+`ready` frame installs the active session, or when another terminal startup path has already closed
+the connection. This is an absolute deadline rather than `socket.setTimeout()`: Node sockets have no
+timeout by default, and an inactivity timeout only emits an event until the caller explicitly closes
+the socket.
+(https://nodejs.org/api/net.html#socketsettimeouttimeout-callback, fetched 2026-09-09)
+
+Deadline expiry atomically marks the handshake terminal, destroys the bridge socket, and rejects the
+held initialization with `data.bookmarksPlusCode: 'bridge-unavailable'`. The wrapper writes exactly
+one JSON-RPC initialization error, waits for that write to complete, closes the stdio transport, and
+then exits nonzero. Any later socket event or `ready` frame is ignored and cannot revive the
+handshake. The 60-second bootstrap lifetime remains independent and unchanged: an unconsumed grant
+can remain pending until its normal expiry, while destruction of a socket whose `hello` was already
+accepted releases the resulting active session.
+
 This preserves the SDK's normal initialization implementation while satisfying the approved rule
 that the subprocess prove and consume its bootstrap before reporting MCP success.
 (`mcp-server/src/index.ts:L1-L98`;
@@ -444,6 +465,7 @@ The workspace store's current queue is the reference commit model.
 | --- | --- | --- | --- |
 | Bootstrap reaches 60 seconds | Removed; authentication returns `bootstrap-expired` when distinguishable | No effect | Startup fails if not already authenticated |
 | Resolve succeeds but launch is abandoned | Remains pending until 60-second expiry and cleanup | Not created | Never starts |
+| Bridge handshake reaches 10-second deadline | Remains pending until normal expiry if not consumed; otherwise consumed and retired | Any session created from an accepted `hello` closes with the destroyed socket | Writes one `bridge-unavailable` initialization error, closes stdio, and exits nonzero |
 | Same token reused | Second attempt returns `bootstrap-consumed` when distinguishable | First session unaffected | Reusing process fails initialization |
 | Consumer closes stdio | Not applicable | Socket closes and resources release | Exits normally |
 | Subprocess crashes | Not applicable | Socket close releases session | Already exited |
@@ -539,6 +561,13 @@ pipe or socket name receives no data.
 - A packaged extension launches the bundled server, completes MCP initialization through the live
   bridge, lists both scopes, adds to each store, and observes the committed extension state.
 - Bridge rejection prevents MCP initialization and never creates or mutates a mirror.
+- A fake endpoint that accepts but never responds reaches the absolute 10-second handshake deadline.
+  An endpoint that sends an incomplete or trickled readiness frame reaches the same deadline because
+  traffic does not reset it. Tests also attempt a late `ready` and prove it is ignored after timeout.
+  These cases assert one deterministic JSON-RPC initialization error with
+  `data.bookmarksPlusCode: 'bridge-unavailable'`, socket and stdio closure after the error write, and
+  nonzero subprocess exit. Test-only injected timers shorten these integration cases without
+  changing the production 10-second constant.
 - Stdio closure and extension disposal terminate the bundled process.
 - The standalone server builds, tests, packs, and runs without extension source files or live
   environment variables.
