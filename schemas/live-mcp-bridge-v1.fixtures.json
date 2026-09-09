@@ -1,0 +1,22 @@
+{
+  "validClient": [
+    { "name": "hello", "value": { "kind": "hello", "version": 1, "generation": "g1", "token": "token" } },
+    { "name": "list", "value": { "kind": "request", "id": "1", "sessionId": "s1", "workspaceFolderUri": "file:///root", "method": "list", "params": {} } },
+    { "name": "global-add", "value": { "kind": "request", "id": "2", "sessionId": "s1", "workspaceFolderUri": "file:///root", "method": "add", "params": { "scope": "global", "uri": "file:///target", "type": "file" } } }
+  ],
+  "validServer": [
+    { "name": "ready", "value": { "kind": "ready", "version": 1, "sessionId": "s1", "workspaceFolderUri": "file:///root", "grantedScopes": ["workspace", "global"] } },
+    { "name": "result", "value": { "kind": "response", "id": "1", "result": { "items": [], "collections": [] } } },
+    { "name": "error", "value": { "kind": "response", "id": "2", "error": { "code": "scope-unavailable", "message": "Scope is unavailable." } } }
+  ],
+  "invalidClient": [
+    { "name": "wrong-version", "value": { "kind": "hello", "version": 2, "generation": "g1", "token": "token" } },
+    { "name": "missing-session", "value": { "kind": "request", "id": "1", "workspaceFolderUri": "file:///root", "method": "list", "params": {} } },
+    { "name": "unknown-method", "value": { "kind": "request", "id": "1", "sessionId": "s1", "workspaceFolderUri": "file:///root", "method": "delete", "params": {} } }
+  ],
+  "invalidServer": [
+    { "name": "empty-scopes", "value": { "kind": "ready", "version": 1, "sessionId": "s1", "workspaceFolderUri": "file:///root", "grantedScopes": [] } },
+    { "name": "result-and-error", "value": { "kind": "response", "id": "1", "result": {}, "error": { "code": "internal-error", "message": "bad" } } },
+    { "name": "unknown-code", "value": { "kind": "response", "id": "1", "error": { "code": "unknown", "message": "bad" } } }
+  ]
+}

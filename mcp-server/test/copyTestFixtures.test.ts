@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 // up (dist/test -> dist -> mcp-server).
 const here = dirname(fileURLToPath(import.meta.url));
 const mcpServerRoot = join(here, '..', '..');
+const repoRoot = join(mcpServerRoot, '..');
 
 // Issue #66 / T1, constraint 3.1(a): the fixture-copy logic that today lives
 // (buggily) inside copy-schema.mjs must move into a brand-new
@@ -73,6 +74,11 @@ function buildScratchTree(): { scratchMcpServerRoot: string; scratchScriptPath: 
   cpSync(join(mcpServerRoot, 'test', 'fixtures'), join(scratchMcpServerRoot, 'test', 'fixtures'), {
     recursive: true,
   });
+  mkdirSync(join(scratchRoot, 'schemas'), { recursive: true });
+  cpSync(
+    join(repoRoot, 'schemas', 'live-mcp-bridge-v1.fixtures.json'),
+    join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.fixtures.json'),
+  );
 
   const realScriptPath = join(mcpServerRoot, 'scripts', 'copy-test-fixtures.mjs');
   assert.ok(
@@ -100,8 +106,12 @@ test('copy-test-fixtures.mjs copies every file under test/fixtures into dist/tes
   assert.ok(sourceFiles.length > 0, 'test setup sanity check: the fixtures source must be non-empty');
   assert.deepEqual(
     destFiles,
-    sourceFiles,
-    'copy-test-fixtures.mjs must copy every file under test/fixtures into dist/test/fixtures, ' +
-      'matching exactly (same relative paths)',
+    [...sourceFiles, 'live-mcp-bridge-v1.fixtures.json'].sort(),
+    'copy-test-fixtures.mjs must copy the existing mirror fixtures and the committed bridge fixture ' +
+      'into dist/test/fixtures, matching their relative paths',
+  );
+  assert.ok(
+    existsSync(join(scratchMcpServerRoot, 'dist', 'test', 'fixtures', 'live-mcp-bridge-v1.fixtures.json')),
+    'copy-test-fixtures.mjs must copy the committed bridge fixtures into dist/test/fixtures',
   );
 });

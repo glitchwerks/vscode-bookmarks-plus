@@ -56,6 +56,10 @@ function buildScratchTree(): { scratchMcpServerRoot: string } {
     join(repoRoot, 'schemas', 'bookmarks.schema.json'),
     join(scratchRoot, 'schemas', 'bookmarks.schema.json'),
   );
+  cpSync(
+    join(repoRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+    join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+  );
 
   // Copies the whole scripts/ directory, not just copy-schema.mjs, so this
   // test survives an implementer factoring shared copy logic into a sibling
@@ -79,7 +83,7 @@ function buildScratchTree(): { scratchMcpServerRoot: string } {
   return { scratchMcpServerRoot };
 }
 
-test('copy-schema.mjs copies the schema into dist/bookmarks.schema.json', () => {
+test('copy-schema.mjs copies both tracked schemas into dist', () => {
   const { scratchMcpServerRoot } = buildScratchTree();
 
   execFileSync(process.execPath, [join(scratchMcpServerRoot, 'scripts', 'copy-schema.mjs')], {
@@ -89,6 +93,10 @@ test('copy-schema.mjs copies the schema into dist/bookmarks.schema.json', () => 
   assert.ok(
     existsSync(join(scratchMcpServerRoot, 'dist', 'bookmarks.schema.json')),
     'copy-schema.mjs must copy the schema to dist/bookmarks.schema.json',
+  );
+  assert.ok(
+    existsSync(join(scratchMcpServerRoot, 'dist', 'live-mcp-bridge-v1.schema.json')),
+    'copy-schema.mjs must copy the bridge schema to dist/live-mcp-bridge-v1.schema.json',
   );
 });
 

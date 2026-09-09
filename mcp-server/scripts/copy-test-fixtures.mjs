@@ -5,7 +5,7 @@
 // script -- never from `build` -- so a plain `npm run build` never emits
 // dist/test/** (issue #66 / T1, constraint 3.1(a)). This logic used to live,
 // unconditionally and incorrectly, inside scripts/copy-schema.mjs.
-import { existsSync, mkdirSync, cpSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, copyFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,4 +18,10 @@ const fixturesDest = join(mcpServerRoot, 'dist', 'test', 'fixtures');
 if (existsSync(fixturesSrc)) {
   mkdirSync(fixturesDest, { recursive: true });
   cpSync(fixturesSrc, fixturesDest, { recursive: true });
+}
+
+const bridgeFixturesSrc = join(mcpServerRoot, '..', 'schemas', 'live-mcp-bridge-v1.fixtures.json');
+if (existsSync(bridgeFixturesSrc)) {
+  mkdirSync(fixturesDest, { recursive: true });
+  copyFileSync(bridgeFixturesSrc, join(fixturesDest, 'live-mcp-bridge-v1.fixtures.json'));
 }
