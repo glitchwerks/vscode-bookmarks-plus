@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createServer } from '../src/index.js';
-import type { Config } from '../src/config.js';
+import type { BookmarkBackend } from '../src/backend.js';
 
 // Same import.meta.url -> directory pattern established in contract.test.ts
 // / add.test.ts / schemaDrift.test.ts, for the same reason: import.meta.dirname
@@ -23,12 +23,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // registration only closes over `config`, it does not perform I/O — so an
 // arbitrary (non-existent) workspace path is fine here. Real filesystem
 // fixtures are unnecessary for this test.
-function makeConfig(): Config {
-  const workspacePath = path.join(os.tmpdir(), 'bookmarks-index-test-workspace');
+function makeBackend(): BookmarkBackend {
   return {
-    workspacePath,
-    mirrorPath: path.join(workspacePath, '.vscode', 'bookmarks.json'),
-    verifyDelayMs: 400,
+    mode: 'mirror',
+    list: async () => ({ workspacePath: '/workspace', mirrorPath: '/workspace/.vscode/bookmarks.json', collections: [], items: [] }),
+    add: async () => ({ id: 'new-id', scope: 'workspace', collection: null }),
+    close: async () => {},
   };
 }
 
@@ -80,9 +80,9 @@ function registeredTools(server: McpServer): Record<string, RegisteredToolLike> 
 }
 
 test('createServer registers exactly list_bookmarks and add_bookmark with the expected annotations, without connecting a transport', () => {
-  const config = makeConfig();
+  const backend = makeBackend();
 
-  const server = createServer(config);
+  const server = createServer(backend);
 
   // 1. Returns an McpServer without throwing, and this test never calls
   // .connect() — the assertion below confirms the server agrees it is not
@@ -111,16 +111,16 @@ test('createServer registers exactly list_bookmarks and add_bookmark with the ex
 });
 
 // ---------------------------------------------------------------------------
-// createServer(config: Config | undefined, options?: { disabledReason?: string })
+// createServer(backend: BookmarkBackend | undefined, options?: { disabledReason?: string })
 // (spec § 4B.8, strategy (a)). Registration itself must never fail on a
 // disabled workspace -- the transport still connects, and the refusal is
 // deferred to tool-call time inside each handler.
 // ---------------------------------------------------------------------------
 
-test('createServer still accepts a single Config argument (the pre-#57 call shape) and registers both tools', () => {
-  const config = makeConfig();
+test('createServer accepts a BookmarkBackend and registers both tools', () => {
+  const backend = makeBackend();
 
-  const server = createServer(config);
+  const server = createServer(backend);
 
   const registered = registeredTools(server);
   assert.deepEqual(Object.keys(registered).sort(), ['add_bookmark', 'list_bookmarks']);
@@ -194,9 +194,9 @@ interface ServerWithInfo {
 }
 
 test("createServer reports mcp-server/package.json's actual version to clients, not a hardcoded literal", () => {
-  const config = makeConfig();
+  const backend = makeBackend();
 
-  const server = createServer(config);
+  const server = createServer(backend);
 
   const packageJsonPath = path.join(here, '..', '..', 'package.json');
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { version: string };
@@ -259,11 +259,11 @@ test('createServer falls back to a placeholder version instead of throwing when 
     // place readPackageVersion's upward walk checks.
     await fs.writeFile(path.join(nestedSrcDir, 'package.json'), '{ this is not valid json', 'utf8');
 
-    const config = makeConfig();
+    const backend = makeBackend();
     let server: McpServer | undefined;
 
     assert.doesNotThrow(() => {
-      server = mod.createServer(config);
+      server = mod.createServer(backend);
     }, 'createServer must not throw when the nearest package.json exists but fails to parse -- reported version is diagnostic-only metadata');
 
     const info = (server?.server as unknown as ServerWithInfo)._serverInfo;
@@ -296,11 +296,11 @@ test('createServer falls back to a placeholder version instead of throwing when 
     const nestedIndexUrl = pathToFileURL(path.join(nestedSrcDir, 'index.js')).href;
     const mod = (await import(nestedIndexUrl)) as { createServer: typeof createServer };
 
-    const config = makeConfig();
+    const backend = makeBackend();
     let server: McpServer | undefined;
 
     assert.doesNotThrow(() => {
-      server = mod.createServer(config);
+      server = mod.createServer(backend);
     }, 'createServer must not throw when no package.json is found within the 5-directory search -- reported version is diagnostic-only metadata');
 
     const info = (server?.server as unknown as ServerWithInfo)._serverInfo;

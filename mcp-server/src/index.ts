@@ -1,20 +1,17 @@
 #!/usr/bin/env node
-import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { resolveWorkspaceState, type Config, type WorkspaceState } from './config.js';
-import { readMirror, writeMirrorAtomic } from './mirrorFile.js';
+import { type BookmarkBackend } from './backend.js';
+import { resolveWorkspaceState, type WorkspaceState } from './config.js';
+import { MirrorBookmarkBackend } from './mirrorBackend.js';
 import { createAddHandler } from './tools/add.js';
 import { createListHandler } from './tools/list.js';
 
 declare const __BOOKMARKS_PLUS_MCP_VERSION__: string | undefined;
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const UNKNOWN_VERSION = '0.0.0-unknown';
 
@@ -44,7 +41,7 @@ function readPackageVersion(): string {
 }
 
 export function createServer(
-  config: Config | undefined,
+  backend: BookmarkBackend | undefined,
   options?: { disabledReason?: string },
 ): McpServer {
   const server = new McpServer({
@@ -52,10 +49,7 @@ export function createServer(
     version: readPackageVersion(),
   });
 
-  const listTool = createListHandler(config, {
-    readMirror,
-    disabledReason: options?.disabledReason,
-  });
+  const listTool = createListHandler(backend, { disabledReason: options?.disabledReason });
   server.registerTool(
     listTool.name,
     {
@@ -66,13 +60,7 @@ export function createServer(
     listTool.handler,
   );
 
-  const addTool = createAddHandler(config, {
-    readMirror,
-    writeMirrorAtomic,
-    sleep,
-    uuid: randomUUID,
-    disabledReason: options?.disabledReason,
-  });
+  const addTool = createAddHandler(backend, { disabledReason: options?.disabledReason });
   server.registerTool(
     addTool.name,
     {
@@ -98,7 +86,7 @@ async function main(): Promise<void> {
 
   const server =
     state.kind === 'ok'
-      ? createServer(state.config)
+      ? createServer(new MirrorBookmarkBackend(state.config))
       : createServer(undefined, { disabledReason: state.reason });
   await server.connect(new StdioServerTransport());
 }
