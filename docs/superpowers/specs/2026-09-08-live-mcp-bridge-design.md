@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-08
 
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Approved in conversation; written-spec review corrections incorporated
 
 **Issue:** #129
 
@@ -179,10 +179,14 @@ correlation remain private to `LiveBookmarkBackend`.
 ## Native provider and late bootstrap issuance
 
 `provideMcpServerDefinitions()` is called eagerly, while `resolveMcpServerDefinition()` is called
-when VS Code needs to start a server and permits last-moment authentication work. Therefore the
-provider must not create bootstrap tokens while enumerating definitions.
+when VS Code needs to start a server and permits last-moment authentication work. VS Code retains
+the objects returned by enumeration and passes the retained object to resolution. Therefore the
+provider must not create bootstrap tokens while enumerating definitions or mutate an enumerated
+definition during resolution.
 (https://code.visualstudio.com/api/references/vscode-api#McpServerDefinitionProvider,
-fetched 2026-09-08)
+fetched 2026-09-09;
+https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMcp.ts,
+fetched 2026-09-09)
 
 Provider flow:
 
@@ -194,11 +198,23 @@ Provider flow:
 3. `resolveMcpServerDefinition()` rechecks extension state, root attachment, bridge generation, and
    bridge readiness.
 4. It asks the bridge service for a 60-second grant with `['workspace', 'global']`.
-5. It returns a resolved definition whose environment adds `BOOKMARKS_PLUS_BRIDGE_ENDPOINT`,
-   `BOOKMARKS_PLUS_BRIDGE_PROTOCOL`, `BOOKMARKS_PLUS_BRIDGE_GENERATION`, and
-   `BOOKMARKS_PLUS_BRIDGE_TOKEN`. Only the token value is authorization material. The future #138
-   descriptor lists only `BOOKMARKS_PLUS_BRIDGE_TOKEN` in `sensitiveEnvKeys`.
-6. Cancellation or resolve failure revokes any grant created by that resolve attempt.
+5. It constructs and returns a new `McpStdioServerDefinition` for every resolve. The new definition
+   copies all applicable base fields from the supplied definition, including `label`, `command`,
+   `version`, and `cwd`, while using fresh `args` and `env` containers. Its environment adds
+   `BOOKMARKS_PLUS_BRIDGE_ENDPOINT`, `BOOKMARKS_PLUS_BRIDGE_PROTOCOL`,
+   `BOOKMARKS_PLUS_BRIDGE_GENERATION`, and `BOOKMARKS_PLUS_BRIDGE_TOKEN`. Only the token value is
+   authorization material. The future #138 descriptor lists only `BOOKMARKS_PLUS_BRIDGE_TOKEN` in
+   `sensitiveEnvKeys`. The supplied enumerated definition remains token-free and unmodified.
+6. If resolution fails after grant issuance, the provider revokes that grant. If the supplied
+   cancellation token is observably cancelled before resolution returns, the provider revokes the
+   grant and does not return the resolved definition.
+7. A successfully returned definition whose process launch is later abandoned has no observable
+   provider callback. Its unused grant remains pending until the 60-second expiry, after which
+   request-time validation or the cleanup timer removes it. The current VS Code extension host calls
+   the resolver with `CancellationToken.None`, so expiry is the required cleanup path for abandoned
+   successful resolutions.
+   (https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMcp.ts,
+   fetched 2026-09-09)
 
 The future #138 service adapter will call the same internal grant issuer after validating its public
 request. It will not reach into the native provider. (#138;
@@ -265,7 +281,8 @@ The service retains a bounded digest-only retirement cache for recently expired 
 so immediate retries receive `bootstrap-expired` or `bootstrap-consumed`. The cache holds at most
 4,096 entries for at most five minutes; oldest entries are evicted first. A token absent from both
 pending and retirement maps is an invalid bootstrap and receives a generic `bridge-unavailable`
-startup classification. Raw tokens are never retained after descriptor construction.
+startup classification. The bridge service never retains raw tokens after constructing the fresh
+resolved definition; the supplied enumerated definition remains token-free.
 
 ## Bridge protocol v1
 
@@ -377,10 +394,27 @@ The existing input gains `scope?: 'workspace' | 'global'`.
 - Global scope: the URI may be outside the selected root.
 - The store-level add input gains normalized optional `description` support so live adds preserve
   the existing MCP field in both scopes.
-- Success returns `id`, explicit `scope`, and the resolved collection or `null`.
+- Success has this exact common shape:
 
-Mirror mode grants only workspace scope, preserves the current write-and-verify behavior, and adds
-the explicit workspace scope to its result. Live mode never writes or verifies a mirror.
+  ```ts
+  interface AddBookmarkResult {
+    readonly id: string;
+    readonly scope: BookmarkScope;
+    readonly collection:
+      | (BookmarkCollection & { readonly scope: BookmarkScope })
+      | null;
+  }
+  ```
+
+  When a collection is returned, its nested `scope` equals the top-level bookmark `scope`, so the
+  collection retains its provenance when consumed independently. An uncollected bookmark returns
+  `collection: null` and is identified by the top-level scope.
+
+Mirror mode grants only workspace scope, preserves the current write-and-verify behavior and
+existing `mirrorPath`, and adds workspace scope to both the top level and any returned collection.
+Its exact payload is `AddBookmarkResult & { readonly mirrorPath: string }`. Live mode returns
+`AddBookmarkResult` and never writes or verifies a mirror.
+(#129; `mcp-server/src/tools/add.ts:L216-L225`)
 
 ## Store integration and concurrency
 
@@ -409,6 +443,7 @@ The workspace store's current queue is the reference commit model.
 | Event | Pending grant | Active session | Subprocess |
 | --- | --- | --- | --- |
 | Bootstrap reaches 60 seconds | Removed; authentication returns `bootstrap-expired` when distinguishable | No effect | Startup fails if not already authenticated |
+| Resolve succeeds but launch is abandoned | Remains pending until 60-second expiry and cleanup | Not created | Never starts |
 | Same token reused | Second attempt returns `bootstrap-consumed` when distinguishable | First session unaffected | Reusing process fails initialization |
 | Consumer closes stdio | Not applicable | Socket closes and resources release | Exits normally |
 | Subprocess crashes | Not applicable | Socket close releases session | Already exited |
@@ -477,7 +512,8 @@ pipe or socket name receives no data.
 ### Authentication and lifecycle tests
 
 - Valid bootstrap, expiry, atomic single-use consumption, wrong generation, wrong root, wrong scope,
-  cancellation, and service disposal.
+  resolve failure after issuance, observable cancellation with a synthetic token, abandoned-success
+  expiry, and service disposal. Abandoned-success expiry is the required VS Code lifecycle path.
 - A persistent session remains valid beyond bootstrap expiry.
 - Selected-root removal closes only matching sessions; unrelated add/remove/reorder changes do not.
 - Extension shutdown closes the listener and every socket, and admitted store operations finish
@@ -486,7 +522,8 @@ pipe or socket name receives no data.
 ### Store and tool tests
 
 - Workspace and global list results contain explicit scope and stable ordering.
-- Both-scope, one-scope, omitted-scope, and ungranted-scope add behavior.
+- Both-scope, one-scope, omitted-scope, and ungranted-scope add behavior, including exact workspace
+  and global result shapes and matching nested collection scope.
 - Same collection ID in both stores resolves only within the selected scope.
 - Workspace URI containment and global URIs outside the selected root.
 - Concurrent global UI/MCP mutations serialize without lost updates; persistence failure does not
@@ -496,7 +533,9 @@ pipe or socket name receives no data.
 ### Integration and packaging tests
 
 - Native provider enumeration contains no token; resolve issues a fresh token and revalidates root
-  state at start time.
+  state at start time. Resolving the same enumerated definition twice leaves that definition
+  token-free, returns distinct single-use tokens in separate fresh definitions, and does not let the
+  second resolve alter the first result's `args` or `env`.
 - A packaged extension launches the bundled server, completes MCP initialization through the live
   bridge, lists both scopes, adds to each store, and observes the committed extension state.
 - Bridge rejection prevents MCP initialization and never creates or mutates a mirror.
