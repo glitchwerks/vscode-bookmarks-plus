@@ -97,8 +97,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     let moveFailed = false;
     if (envelope.scope === 'global') {
       if (!this.globalStore) return;
-      const data = this.globalStore.getAll();
       for (const id of envelope.ids) {
+        const data = this.globalStore.getAll();
         try { await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data)); }
         catch { moveFailed = true; }
       }
@@ -227,9 +227,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined;
       return {
         collectionId: target.item.collectionId,
-        index: (data) => scope === 'workspace'
-          ? data.items.find(item => item.id === target.item.id)?.order ?? target.item.order
-          : target.item.order
+        index: (data) => data.items.find(item => item.id === target.item.id)?.order ?? target.item.order
       };
     }
     return undefined;

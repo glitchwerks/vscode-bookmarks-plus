@@ -374,6 +374,24 @@ suite('WorkspaceBookmarkStore content operations', () => {
     })), [{ collectionId: null, description: 'item note', order: 0 }]);
   });
 
+  test('addItem normalizes descriptions before returning and persisting owner data', async () => {
+    const { store, state, ownerA } = await readyStore();
+
+    const trimmed = await store.addItem(ownerA, {
+      type: 'file', uri: 'file:///workspace/a/trimmed.ts', description: '  entrypoint  '
+    });
+    const absent = await store.addItem(ownerA, {
+      type: 'file', uri: 'file:///workspace/a/absent.ts', description: '   '
+    });
+
+    assert.strictEqual(trimmed.description, 'entrypoint');
+    assert.strictEqual('description' in absent, false);
+    const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    const items = persisted.partitions.find((partition) => partition.id === ownerA.partitionId)!.data.items;
+    assert.strictEqual(items.find((item) => item.id === trimmed.id)?.description, 'entrypoint');
+    assert.strictEqual('description' in items.find((item) => item.id === absent.id)!, false);
+  });
+
   test('rejects Unassigned and detached creates without writing', async () => {
     const state = new FakeMemento({
       [WORKSPACE_PARTITION_STORAGE_KEY]: snapshotWithDetachedAndUnassigned()
@@ -416,6 +434,18 @@ suite('WorkspaceBookmarkStore content operations', () => {
       store.getAll().items.map((item: BookmarkItem) => item.uri).sort(),
       ['file:///workspace/a/a.ts', 'file:///workspace/b/b.ts']
     );
+  });
+
+  test('getOwnerData returns a defensive copy', async () => {
+    const { store, ownerA } = await readyStore();
+    await store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/a.ts' });
+
+    const first = store.getOwnerData(ownerA)!;
+    first.items.push({
+      id: 'outside', type: 'file', uri: 'file:///workspace/a/outside.ts', collectionId: null, order: 1
+    });
+
+    assert.strictEqual(store.getOwnerData(ownerA)?.items.length, 1);
   });
 
   test('serializes concurrent mutations and persists one snapshot/event per change', async () => {

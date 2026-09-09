@@ -3,6 +3,57 @@ import { BookmarkStore, DuplicateBookmarkError } from '../../bookmarkStore';
 import { BookmarkData } from '../../types';
 import { FakeMemento, FakeOutput } from './fixtures';
 
+class DeferredFirstGlobalUpdateMemento extends FakeMemento {
+  private readonly firstUpdateGate: Promise<void>;
+  private releaseFirstUpdate: (() => void) | undefined;
+  private signalFirstUpdate: (() => void) | undefined;
+  private signalSecondUpdate: (() => void) | undefined;
+  private shouldDeferFirstUpdate = true;
+  private shouldRejectFirstUpdate = false;
+
+  readonly firstGlobalUpdateStarted: Promise<void>;
+  readonly secondGlobalUpdateStarted: Promise<void>;
+
+  constructor() {
+    super();
+    this.firstUpdateGate = new Promise<void>((resolve) => {
+      this.releaseFirstUpdate = resolve;
+    });
+    this.firstGlobalUpdateStarted = new Promise<void>((resolve) => {
+      this.signalFirstUpdate = resolve;
+    });
+    this.secondGlobalUpdateStarted = new Promise<void>((resolve) => {
+      this.signalSecondUpdate = resolve;
+    });
+  }
+
+  rejectFirstGlobalUpdate(): void {
+    this.shouldRejectFirstUpdate = true;
+  }
+
+  releaseFirstGlobalUpdate(): void {
+    this.releaseFirstUpdate?.();
+  }
+
+  update(key: string, value: unknown): Thenable<void> {
+    if (key !== 'bookmarks.data') {
+      return super.update(key, value);
+    }
+    if (this.shouldDeferFirstUpdate) {
+      this.shouldDeferFirstUpdate = false;
+      this.signalFirstUpdate?.();
+      return this.firstUpdateGate.then(() => {
+        if (this.shouldRejectFirstUpdate) {
+          throw new Error('simulated held global update failure');
+        }
+        return super.update(key, value);
+      });
+    }
+    this.signalSecondUpdate?.();
+    return super.update(key, value);
+  }
+}
+
 suite('BookmarkStore - load and core CRUD', () => {
   test('initializes empty data when storage is empty', () => {
     const store = new BookmarkStore(new FakeMemento());
@@ -134,12 +185,75 @@ suite('BookmarkStore - load and core CRUD', () => {
     assert.strictEqual(fired, false);
   });
 
+  test('getAll returns a defensive copy', () => {
+    const store = new BookmarkStore(new FakeMemento());
+
+    const first = store.getAll();
+    first.items.push({ id: 'outside', type: 'file', uri: 'file:///outside', collectionId: null, order: 0 });
+
+    assert.strictEqual(store.getAll().items.length, 0);
+  });
+
   test('addItem fires onBookmarksChanged exactly once', async () => {
     const store = new BookmarkStore(new FakeMemento());
     let fireCount = 0;
     store.onBookmarksChanged(() => { fireCount++; });
     await store.addItem({ type: 'file', uri: 'file:///a.txt' });
     assert.strictEqual(fireCount, 1);
+  });
+
+  test('serializes concurrent adds behind a held persistence update', async () => {
+    const state = new DeferredFirstGlobalUpdateMemento();
+    const store = new BookmarkStore(state);
+    const firstAdd = store.addItem({ type: 'file', uri: 'file:///a' });
+    await state.firstGlobalUpdateStarted;
+    const secondAdd = store.addItem({ type: 'file', uri: 'file:///b' });
+    let secondUpdateStarted = false;
+    state.secondGlobalUpdateStarted.then(() => { secondUpdateStarted = true; });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.strictEqual(secondUpdateStarted, false, 'the second update must wait for the first update to settle');
+    state.releaseFirstGlobalUpdate();
+    await Promise.all([firstAdd, secondAdd]);
+
+    assert.deepStrictEqual(store.getAll().items.map((item) => item.order), [0, 1]);
+  });
+
+  test('rolls back a rejected held update without firing and continues with queued work', async () => {
+    const state = new DeferredFirstGlobalUpdateMemento();
+    const store = new BookmarkStore(state);
+    let events = 0;
+    store.onBookmarksChanged(() => { events++; });
+    const failedAdd = store.addItem({ type: 'file', uri: 'file:///failed' });
+    await state.firstGlobalUpdateStarted;
+    const committedAdd = store.addItem({ type: 'file', uri: 'file:///kept' });
+    let secondUpdateStarted = false;
+    state.secondGlobalUpdateStarted.then(() => { secondUpdateStarted = true; });
+
+    state.rejectFirstGlobalUpdate();
+    state.releaseFirstGlobalUpdate();
+    await assert.rejects(failedAdd, /simulated held global update failure/);
+    await committedAdd;
+
+    assert.strictEqual(secondUpdateStarted, true);
+    assert.deepStrictEqual(store.getAll().items.map((item) => ({ uri: item.uri, order: item.order })), [
+      { uri: 'file:///kept', order: 0 }
+    ]);
+    assert.deepStrictEqual(state.get<BookmarkData>('bookmarks.data')?.items.map((item) => item.uri), ['file:///kept']);
+    assert.strictEqual(events, 1);
+  });
+
+  test('rejects mutations after disposal without persisting or firing events', async () => {
+    const state = new FakeMemento();
+    const store = new BookmarkStore(state);
+    let events = 0;
+    store.onBookmarksChanged(() => { events++; });
+    store.dispose();
+
+    await assert.rejects(store.addItem({ type: 'file', uri: 'file:///disposed' }), /Global bookmark store is disposed/);
+
+    assert.strictEqual(state.updateCallCount, 0);
+    assert.strictEqual(events, 0);
   });
 });
 
@@ -432,6 +546,26 @@ suite('BookmarkStore - schema migration', () => {
 });
 
 suite('BookmarkStore - descriptions', () => {
+  test('addItem normalizes a description before returning and persisting it', async () => {
+    const state = new FakeMemento();
+    const store = new BookmarkStore(state);
+
+    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', description: '  entrypoint  ' });
+
+    assert.strictEqual(item.description, 'entrypoint');
+    assert.strictEqual(state.get<BookmarkData>('bookmarks.data')?.items[0].description, 'entrypoint');
+  });
+
+  test('addItem omits a whitespace-only description', async () => {
+    const state = new FakeMemento();
+    const store = new BookmarkStore(state);
+
+    const item = await store.addItem({ type: 'file', uri: 'file:///a.txt', description: '   ' });
+
+    assert.strictEqual('description' in item, false);
+    assert.strictEqual('description' in state.get<BookmarkData>('bookmarks.data')!.items[0], false);
+  });
+
   test('setItemDescription sets a trimmed description', async () => {
     const store = new BookmarkStore(new FakeMemento());
     const item = await store.addItem({ type: 'file', uri: 'file:///a.txt' });

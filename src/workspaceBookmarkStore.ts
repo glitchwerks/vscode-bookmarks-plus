@@ -386,12 +386,14 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       if (hasDuplicateBookmark(data, input.uri, collectionId)) {
         throw new DuplicateBookmarkError(input.uri, collectionId);
       }
+      const description = normalizeDescription(input.description);
       const item: BookmarkItem = {
         id: this.allocateId(draft),
         type: input.type,
         uri: input.uri,
         collectionId,
-        order: data.items.filter((candidate) => candidate.collectionId === collectionId).length
+        order: data.items.filter((candidate) => candidate.collectionId === collectionId).length,
+        ...(description === undefined ? {} : { description })
       };
       data.items.push(item);
       markContentMutation(partition);
