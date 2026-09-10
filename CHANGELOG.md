@@ -7,10 +7,13 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 ### Added
 
 - VS Code-native MCP integration (#124): installing Bookmarks Plus now registers the bundled
-  **Bookmarks Plus** MCP server automatically in VS Code. In a single-folder workspace, Agent
-  mode can use `list_bookmarks` and `add_bookmark` without an `mcp.json` entry or separate server
-  installation. The initial integration exposes workspace bookmarks only; global and multi-root
-  support remain tracked by #129 and #62.
+  **Bookmarks Plus** MCP server automatically in VS Code. Agent mode can use `list_bookmarks`
+  and `add_bookmark` without an `mcp.json` entry or separate server installation. The live bridge
+  (#129) exposes the selected root's workspace bookmarks and global bookmarks through
+  extension-owned stores, with one native server per attached root and explicit scope on results.
+  Adds default to workspace when both scopes are granted. Bridge failure blocks initialization
+  without mirror fallback; direct npm/Claude launches remain workspace-mirror-only. Remote
+  extension-host support is not claimed.
 - Toggle Show Full Path (#115): a view-title-bar button switches bookmark labels between
   filename-only (the default) and the path relative to the workspace root, using `/` separators.
   Combines cleanly with Group by Repo (no duplicated repo-name prefix); a bookmark outside every
