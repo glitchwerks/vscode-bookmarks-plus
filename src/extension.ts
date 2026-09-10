@@ -51,7 +51,9 @@ let activeRuntime: {
   store: WorkspaceBookmarkStore; globalStore: BookmarkStore; mirrors: WorkspaceMirrorCoordinator;
   bridge?: LiveMcpBridgeService;
   output: OutputSink; pending: Promise<void>; stopping: boolean;
+  shutdown?: Promise<void>;
 } | undefined;
+let lastShutdown: Promise<void> = Promise.resolve();
 
 export interface McpActivationDependencies {
   getWorkspaceFolders: () => readonly vscode.WorkspaceFolder[] | undefined;
@@ -278,7 +280,9 @@ export async function activate(
       vscode.workspace.onDidChangeWorkspaceFolders(listener)
   }
 ): Promise<void> {
+  const subscriptionStart = context.subscriptions.length;
   const output = mcpDeps.createOutputChannel?.() ?? vscode.window.createOutputChannel('Bookmarks Plus');
+  context.subscriptions.push(output);
   const folders = mcpDeps.getWorkspaceFolders();
   applyWorkspaceEnv(context.environmentVariableCollection, folders);
   const bufferedRoots: (readonly RootCandidate[])[] = [];
@@ -307,181 +311,193 @@ export async function activate(
     store, globalStore, mirrors: mirrorCoordinator, output, pending: Promise.resolve(), stopping: false
   };
   activeRuntime = runtime;
-  if (store.getView().kind === 'ready') {
-    await store.reconcileRoots(toRootCandidates(folders));
-    await mirrorCoordinator.reconcileBindings();
-  }
   const reconcileFolders = (roots: readonly RootCandidate[]): Promise<void> => {
     if (runtime.stopping) return Promise.resolve();
     runtime.pending = mirrorCoordinator.handleRootsChanged(roots).then(() => undefined,
       () => { output.appendLine('Bookmarks Plus: workspace folder reconciliation failed.'); });
     return runtime.pending;
   };
-  while (bufferedRoots.length > 0) {
-    await reconcileFolders(bufferedRoots.shift()!);
-  }
-  // No await between draining the buffer and switching to the live listener.
-  initializing = false;
-
-  const getAvailableRoots = () => {
-    const view = store.getView();
-    const unavailable = new Set(view.unavailableRoots);
-    return view.attached.filter(root => !unavailable.has(root.canonicalRootUri));
-  };
-  const getAttachedRoot: LiveMcpBridgeServiceOptions['getAttachedRoot'] = canonicalRootUri => {
-    const root = getAvailableRoots().find(value => value.canonicalRootUri === canonicalRootUri);
-    return root ? { rootUri: root.rootUri, canonicalRootUri: root.canonicalRootUri,
-      owner: { kind: 'partition', partitionId: root.partitionId } } : undefined;
-  };
-  const trusted = (mcpDeps.isWorkspaceTrusted ?? (() => vscode.workspace.isTrusted))();
-  if (trusted) {
-    try {
-      runtime.bridge = await (mcpDeps.startLiveBridge ?? LiveMcpBridgeService.start)({
-        workspaceStore: store, globalStore, output, getAttachedRoot,
-        editorSessionId: vscode.env.sessionId, extensionId: context.extension.id
-      });
-      context.subscriptions.push(store.onDidChangePartitions(() => runtime.bridge?.refreshAvailableRoots()));
-    } catch {
-      output.appendLine('Bookmarks Plus: live MCP bridge startup failed.');
+  try {
+    if (store.getView().kind === 'ready') {
+      await store.reconcileRoots(toRootCandidates(folders));
+      await mirrorCoordinator.reconcileBindings();
     }
-  }
+    while (bufferedRoots.length > 0) {
+      await reconcileFolders(bufferedRoots.shift()!);
+    }
+    // No await between draining the buffer and switching to the live listener.
+    initializing = false;
 
-  let provider: BookmarksTreeDataProvider | undefined = undefined;
-  const getGitApi = createGitApiFactory(
-    () => vscode.extensions.getExtension<GitExtensionExports>('vscode.git'),
-    () => provider?.refresh()
-  );
-  const cache = new FsGitCache(createCacheResolver(getGitApi));
-  // Read once at activation, normalized (CodeRabbit: maxItems config normalization) so both
-  // consumers below receive an already-clamped-and-floored value rather than a raw, possibly
-  // negative/fractional setting. Held as a mutable field on each consumer's own DI object
-  // (`suggestionsSource`/`recentItemsTrackerDeps`, both already re-read live on every use — see
-  // `SuggestionsSource.maxItems` and `registerRecentItemsTracker`'s `deps.maxItems`) rather than a
-  // captured local, so `registerSuggestionsMaxItemsLiveReload` (#102) can push a freshly configured
-  // value into both without either consumer needing its own live-reload logic.
-  const suggestionsMaxItems = normalizeMaxItems(
-    vscode.workspace.getConfiguration().get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT)
-  );
-  const suggestionsSource: SuggestionsSource = {
-    getRecentItems: () => loadRecentItems(context.workspaceState),
-    maxItems: suggestionsMaxItems
-  };
-  const recentlyViewedSource: RecentlyViewedSource = {
-    getUris: () => loadRecentlyViewed(context.workspaceState)
-  };
-  provider = new BookmarksTreeDataProvider(
-    store,
-    cache,
-    globalStore,
-    undefined,
-    suggestionsSource,
-    recentlyViewedSource,
-    context.workspaceState
-  );
+    const getAvailableRoots = () => {
+      const view = store.getView();
+      const unavailable = new Set(view.unavailableRoots);
+      return view.attached.filter(root => !unavailable.has(root.canonicalRootUri));
+    };
+    const getAttachedRoot: LiveMcpBridgeServiceOptions['getAttachedRoot'] = canonicalRootUri => {
+      const root = getAvailableRoots().find(value => value.canonicalRootUri === canonicalRootUri);
+      return root ? { rootUri: root.rootUri, canonicalRootUri: root.canonicalRootUri,
+        owner: { kind: 'partition', partitionId: root.partitionId } } : undefined;
+    };
+    const trusted = (mcpDeps.isWorkspaceTrusted ?? (() => vscode.workspace.isTrusted))();
+    if (trusted) {
+      try {
+        runtime.bridge = await (mcpDeps.startLiveBridge ?? LiveMcpBridgeService.start)({
+          workspaceStore: store, globalStore, output, getAttachedRoot,
+          editorSessionId: vscode.env.sessionId, extensionId: context.extension.id
+        });
+        context.subscriptions.push(store.onDidChangePartitions(() => runtime.bridge?.refreshAvailableRoots()));
+      } catch {
+        output.appendLine('Bookmarks Plus: live MCP bridge startup failed.');
+      }
+    }
 
-  const treeView = vscode.window.createTreeView('bookmarksView', {
-    treeDataProvider: provider,
-    dragAndDropController: provider,
-    showCollapseAll: true
-  });
-  // Store and mirror disposal belongs to async deactivate, after bridge requests drain.
-  context.subscriptions.push(
-    output,
-    treeView
-  );
-
-  const mcpProvider = trusted ? registerBookmarksMcpProvider(context.subscriptions, {
-    ...mcpDeps,
-    getAttachedRoots: () => getAvailableRoots().map(root => ({ uri: vscode.Uri.parse(root.rootUri), name: root.label })),
-    isBridgeReady: () => !runtime.stopping && runtime.bridge !== undefined,
-    issueGrant: (rootUri, scopes) => {
-      if (runtime.stopping || !runtime.bridge) throw new Error('bridge-unavailable');
-      return runtime.bridge.issueGrant(rootUri, scopes);
-    },
-    onDidChangePartitions: listener => store.onDidChangePartitions(listener),
-    extensionUri: context.extensionUri,
-    extensionVersion: String(context.extension.packageJSON.version),
-    output
-  }) : undefined;
-  // VS Code has no public API for tests to enumerate registered MCP definitions. Expose the
-  // definition only inside the packaged test host, after the real registration path succeeds.
-  if (process.env.BOOKMARKS_PACKAGED_MCP_TEST === '1' && mcpProvider) {
-    context.subscriptions.push(
-      vscode.commands.registerCommand(MCP_TEST_DEFINITIONS_COMMAND, async () => {
-        const cancellation = new vscode.CancellationTokenSource();
-        try {
-          return await mcpProvider.provideMcpServerDefinitions(cancellation.token);
-        } finally {
-          cancellation.dispose();
-        }
-      }),
-      vscode.commands.registerCommand(MCP_TEST_RESOLVE_COMMAND, async (rootUri: string) => {
-        const cancellation = new vscode.CancellationTokenSource();
-        try {
-          const definitions = await mcpProvider.provideMcpServerDefinitions(cancellation.token);
-          const definition = definitions?.find(value => value.env.BOOKMARKS_PLUS_ROOT_URI === rootUri);
-          return definition ? await mcpProvider.resolveMcpServerDefinition!(definition, cancellation.token) : undefined;
-        } finally {
-          cancellation.dispose();
-        }
-      }),
-      vscode.commands.registerCommand(MCP_TEST_STATE_COMMAND, (rootUri: string) => {
-        const root = getAttachedRoot(rootUri);
-        return root ? { workspace: store.getOwnerData(root.owner), global: globalStore.getAll() } : undefined;
-      })
+    let provider: BookmarksTreeDataProvider | undefined = undefined;
+    const getGitApi = createGitApiFactory(
+      () => vscode.extensions.getExtension<GitExtensionExports>('vscode.git'),
+      () => provider?.refresh()
     );
+    const cache = new FsGitCache(createCacheResolver(getGitApi));
+    // Read once at activation, normalized (CodeRabbit: maxItems config normalization) so both
+    // consumers below receive an already-clamped-and-floored value rather than a raw, possibly
+    // negative/fractional setting. Held as a mutable field on each consumer's own DI object
+    // (`suggestionsSource`/`recentItemsTrackerDeps`, both already re-read live on every use — see
+    // `SuggestionsSource.maxItems` and `registerRecentItemsTracker`'s `deps.maxItems`) rather than a
+    // captured local, so `registerSuggestionsMaxItemsLiveReload` (#102) can push a freshly configured
+    // value into both without either consumer needing its own live-reload logic.
+    const suggestionsMaxItems = normalizeMaxItems(
+      vscode.workspace.getConfiguration().get<number>(SUGGESTIONS_MAX_ITEMS_KEY, SUGGESTIONS_MAX_ITEMS_DEFAULT)
+    );
+    const suggestionsSource: SuggestionsSource = {
+      getRecentItems: () => loadRecentItems(context.workspaceState),
+      maxItems: suggestionsMaxItems
+    };
+    const recentlyViewedSource: RecentlyViewedSource = {
+      getUris: () => loadRecentlyViewed(context.workspaceState)
+    };
+    provider = new BookmarksTreeDataProvider(
+      store,
+      cache,
+      globalStore,
+      undefined,
+      suggestionsSource,
+      recentlyViewedSource,
+      context.workspaceState
+    );
+
+    const treeView = vscode.window.createTreeView('bookmarksView', {
+      treeDataProvider: provider,
+      dragAndDropController: provider,
+      showCollapseAll: true
+    });
+    // Store and mirror disposal belongs to async deactivate, after bridge requests drain.
+    context.subscriptions.push(
+      treeView
+    );
+
+    const mcpProvider = trusted ? registerBookmarksMcpProvider(context.subscriptions, {
+      ...mcpDeps,
+      getAttachedRoots: () => getAvailableRoots().map(root => ({ uri: vscode.Uri.parse(root.rootUri), name: root.label })),
+      isBridgeReady: () => !runtime.stopping && runtime.bridge !== undefined,
+      issueGrant: (rootUri, scopes) => {
+        if (runtime.stopping || !runtime.bridge) throw new Error('bridge-unavailable');
+        return runtime.bridge.issueGrant(rootUri, scopes);
+      },
+      onDidChangePartitions: listener => store.onDidChangePartitions(listener),
+      extensionUri: context.extensionUri,
+      extensionVersion: String(context.extension.packageJSON.version),
+      output
+    }) : undefined;
+    // VS Code has no public API for tests to enumerate registered MCP definitions. Expose the
+    // definition only inside the packaged test host, after the real registration path succeeds.
+    if (process.env.BOOKMARKS_PACKAGED_MCP_TEST === '1' && mcpProvider) {
+      context.subscriptions.push(
+        vscode.commands.registerCommand(MCP_TEST_DEFINITIONS_COMMAND, async () => {
+          const cancellation = new vscode.CancellationTokenSource();
+          try {
+            return await mcpProvider.provideMcpServerDefinitions(cancellation.token);
+          } finally {
+            cancellation.dispose();
+          }
+        }),
+        vscode.commands.registerCommand(MCP_TEST_RESOLVE_COMMAND, async (rootUri: string) => {
+          const cancellation = new vscode.CancellationTokenSource();
+          try {
+            const definitions = await mcpProvider.provideMcpServerDefinitions(cancellation.token);
+            const definition = definitions?.find(value => value.env.BOOKMARKS_PLUS_ROOT_URI === rootUri);
+            return definition ? await mcpProvider.resolveMcpServerDefinition!(definition, cancellation.token) : undefined;
+          } finally {
+            cancellation.dispose();
+          }
+        }),
+        vscode.commands.registerCommand(MCP_TEST_STATE_COMMAND, (rootUri: string) => {
+          const root = getAttachedRoot(rootUri);
+          return root ? { workspace: store.getOwnerData(root.owner), global: globalStore.getAll() } : undefined;
+        })
+      );
+    }
+
+    registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
+      getConfiguration: () => vscode.workspace.getConfiguration(),
+      registerFileDecorationProvider: (decorationProvider) =>
+        vscode.window.registerFileDecorationProvider(decorationProvider),
+      onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
+    });
+
+    // #114: keeps BOOKMARKED_RESOURCE_CONTEXT_KEY current so the Explorer/editor context menus can
+    // show "Remove Bookmark" instead of "Add Bookmark" for an already-bookmarked resource.
+    // #120: also keeps the per-scope workspace/global context keys current, so "Add Bookmark" and
+    // "Add Bookmark (Global)" visibility each depend only on that scope's own bookmark state, not
+    // the merged union `wire()` publishes.
+    const contextKeyManager = new BookmarkContextKeyManager({
+      setContext: (key, value) => vscode.commands.executeCommand('setContext', key, value)
+    });
+    contextKeyManager.wire([store, globalStore]);
+    contextKeyManager.wireScoped({ workspace: store, global: globalStore });
+
+    const recentItemsTrackerDeps = {
+      getTabGroups: () => vscode.window.tabGroups,
+      maxItems: suggestionsMaxItems,
+      onDidChange: () => provider?.refresh()
+    };
+    registerRecentItemsTracker(context.workspaceState, context.subscriptions, recentItemsTrackerDeps);
+    registerRecentlyViewedTracker(context.workspaceState, context.subscriptions, {
+      getTabGroups: () => vscode.window.tabGroups,
+      onDidChange: () => provider?.refresh()
+    });
+
+    registerSuggestionsMaxItemsLiveReload(context.subscriptions, {
+      getConfiguration: () => vscode.workspace.getConfiguration(),
+      onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener),
+      setTrackerMaxItems: (maxItems) => {
+        recentItemsTrackerDeps.maxItems = maxItems;
+      },
+      setSuggestionsMaxItems: (maxItems) => {
+        suggestionsSource.maxItems = maxItems;
+      },
+      refresh: () => provider?.refresh()
+    });
+
+    context.subscriptions.push(
+      store.onDidChangePartitions(() => provider?.refresh())
+    );
+    (mcpDeps.registerCommands ?? registerCommands)(context, stores, provider, mirrorCoordinator, output);
+
+    void getGitApi().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      output.appendLine(`Git integration unavailable: ${message}`);
+    });
+  } catch (error) {
+    try { await shutdownRuntime(runtime); }
+    catch { output.appendLine('Bookmarks Plus: activation runtime shutdown failed.'); }
+    finally {
+      if (activeRuntime === runtime) activeRuntime = undefined;
+      for (const resource of context.subscriptions.splice(subscriptionStart).reverse()) {
+        try { resource.dispose(); }
+        catch { output.appendLine('Bookmarks Plus: activation registration disposal failed.'); }
+      }
+    }
+    throw error;
   }
-
-  registerBookmarkDecorationProvider([store, globalStore], context.subscriptions, {
-    getConfiguration: () => vscode.workspace.getConfiguration(),
-    registerFileDecorationProvider: (decorationProvider) =>
-      vscode.window.registerFileDecorationProvider(decorationProvider),
-    onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener)
-  });
-
-  // #114: keeps BOOKMARKED_RESOURCE_CONTEXT_KEY current so the Explorer/editor context menus can
-  // show "Remove Bookmark" instead of "Add Bookmark" for an already-bookmarked resource.
-  // #120: also keeps the per-scope workspace/global context keys current, so "Add Bookmark" and
-  // "Add Bookmark (Global)" visibility each depend only on that scope's own bookmark state, not
-  // the merged union `wire()` publishes.
-  const contextKeyManager = new BookmarkContextKeyManager({
-    setContext: (key, value) => vscode.commands.executeCommand('setContext', key, value)
-  });
-  contextKeyManager.wire([store, globalStore]);
-  contextKeyManager.wireScoped({ workspace: store, global: globalStore });
-
-  const recentItemsTrackerDeps = {
-    getTabGroups: () => vscode.window.tabGroups,
-    maxItems: suggestionsMaxItems,
-    onDidChange: () => provider?.refresh()
-  };
-  registerRecentItemsTracker(context.workspaceState, context.subscriptions, recentItemsTrackerDeps);
-  registerRecentlyViewedTracker(context.workspaceState, context.subscriptions, {
-    getTabGroups: () => vscode.window.tabGroups,
-    onDidChange: () => provider?.refresh()
-  });
-
-  registerSuggestionsMaxItemsLiveReload(context.subscriptions, {
-    getConfiguration: () => vscode.workspace.getConfiguration(),
-    onDidChangeConfiguration: (listener) => vscode.workspace.onDidChangeConfiguration(listener),
-    setTrackerMaxItems: (maxItems) => {
-      recentItemsTrackerDeps.maxItems = maxItems;
-    },
-    setSuggestionsMaxItems: (maxItems) => {
-      suggestionsSource.maxItems = maxItems;
-    },
-    refresh: () => provider?.refresh()
-  });
-
-  context.subscriptions.push(
-    store.onDidChangePartitions(() => provider?.refresh())
-  );
-  (mcpDeps.registerCommands ?? registerCommands)(context, stores, provider, mirrorCoordinator, output);
-
-  void getGitApi().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    output.appendLine(`Git integration unavailable: ${message}`);
-  });
 }
 
 /** Registers UI commands with explicit workspace and Global owners. */
@@ -517,17 +533,28 @@ function createPartitionMirrorResources(root: vscode.Uri): PartitionMirrorResour
 }
 
 /** Stops live access, drains admitted store work, then flushes and disposes owned resources. */
-export async function deactivate(): Promise<void> {
+export function deactivate(): Promise<void> {
   const runtime = activeRuntime;
-  activeRuntime = undefined;
-  if (!runtime) return;
+  return runtime ? shutdownRuntime(runtime) : lastShutdown;
+}
+
+/** Retires the specified runtime, including one whose activation never completed. */
+function shutdownRuntime(runtime: NonNullable<typeof activeRuntime>): Promise<void> {
+  if (runtime.shutdown) return runtime.shutdown;
   runtime.stopping = true;
-  await runtime.pending;
-  await runtime.bridge?.stop();
-  try { await runtime.mirrors.drainAndFlush(); }
-  catch { runtime.output.appendLine('Bookmarks Plus: workspace mirror flush failed.'); }
-  for (const resource of [runtime.mirrors, runtime.store, runtime.globalStore]) {
-    try { resource.dispose(); }
-    catch { runtime.output.appendLine('Bookmarks Plus: workspace resource disposal failed.'); }
-  }
+  runtime.shutdown = Promise.resolve().then(async () => {
+    await runtime.pending;
+    try { await runtime.bridge?.stop(); }
+    catch { runtime.output.appendLine('Bookmarks Plus: live MCP bridge shutdown failed.'); }
+    try { await runtime.mirrors.drainAndFlush(); }
+    catch { runtime.output.appendLine('Bookmarks Plus: workspace mirror flush failed.'); }
+    for (const resource of [runtime.mirrors, runtime.store, runtime.globalStore]) {
+      try { resource.dispose(); }
+      catch { runtime.output.appendLine('Bookmarks Plus: workspace resource disposal failed.'); }
+    }
+  }).finally(() => {
+    if (activeRuntime === runtime) activeRuntime = undefined;
+  });
+  if (activeRuntime === runtime) lastShutdown = runtime.shutdown;
+  return runtime.shutdown;
 }

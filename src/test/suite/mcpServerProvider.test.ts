@@ -408,21 +408,18 @@ suite('MCP server definitions (#126)', () => {
     process.env.BOOKMARKS_PACKAGED_MCP_TEST = '1';
 
     try {
-      try {
-        await activate(context as unknown as vscode.ExtensionContext, {
-          isWorkspaceTrusted: () => true,
-          startLiveBridge: async () => { throw new Error('no listener required for enumeration'); },
-          getWorkspaceFolders: () => [{ uri: workspaceUri, name: 'activation-project', index: 0 }],
-          registerProvider: (id: string, provider: vscode.McpServerDefinitionProvider) => {
-            registeredId = id;
-            registeredProvider = provider;
-            return new vscode.Disposable(() => undefined);
-          },
-          onDidChangeWorkspaceFolders: () => new vscode.Disposable(() => undefined)
-        });
-      } catch (error: unknown) {
-        assert.match(String(error), /command '.*' already exists/);
-      }
+      await activate(context as unknown as vscode.ExtensionContext, {
+        registerCommands: () => undefined,
+        isWorkspaceTrusted: () => true,
+        startLiveBridge: async () => { throw new Error('no listener required for enumeration'); },
+        getWorkspaceFolders: () => [{ uri: workspaceUri, name: 'activation-project', index: 0 }],
+        registerProvider: (id: string, provider: vscode.McpServerDefinitionProvider) => {
+          registeredId = id;
+          registeredProvider = provider;
+          return new vscode.Disposable(() => undefined);
+        },
+        onDidChangeWorkspaceFolders: () => new vscode.Disposable(() => undefined)
+      });
 
       assert.strictEqual(registeredId, 'bookmarks-plus.mcp');
       assert.ok(registeredProvider);

@@ -105,6 +105,95 @@ async function connectLive(f: ReturnType<typeof activationFixture>, root = 'file
 }
 
 suite('Extension - partitioned activation (#62)', () => {
+  test('failed activation retires its runtime once and permits a clean activation retry', async () => {
+    const f = activationFixture(['a']);
+    const retry = activationFixture(['a']);
+    const order: string[] = [];
+    const capture = f.deps.registerCommands;
+    const failure = new Error('registration failed after bridge startup');
+    let endpoint = '';
+    f.deps.registerCommands = (...args) => {
+      capture(...args);
+      endpoint = f.bridge.issueGrant('file:///a', ['workspace']).endpoint;
+      const bridgeStop = f.bridge.stop.bind(f.bridge);
+      f.bridge.stop = () => { order.push('bridge'); return bridgeStop(); };
+      const drain = f.coordinator.drainAndFlush.bind(f.coordinator);
+      f.coordinator.drainAndFlush = () => { order.push('drain'); return drain(); };
+      for (const [name, resource] of [['mirrors', f.coordinator], ['workspace', f.stores.workspace], ['global', f.stores.global]] as const) {
+        const dispose = resource.dispose.bind(resource);
+        resource.dispose = () => { order.push(name); dispose(); };
+      }
+      throw failure;
+    };
+    try {
+      await assert.rejects(f.start(), error => error === failure);
+      assert.deepStrictEqual(order, ['bridge', 'drain', 'mirrors', 'workspace', 'global']);
+      assert.throws(() => f.bridge.issueGrant('file:///a', ['workspace']), /bridge-unavailable/);
+      const socket = net.createConnection(endpoint);
+      await assert.rejects(once(socket, 'connect'));
+      assert.ok(f.resources.get('file:///a')!.disposed);
+      assert.strictEqual(f.context.subscriptions.length, 0, 'partial registrations must be retired before retry');
+      await retry.start();
+      const client = await connectLive(retry);
+      client.socket.destroy();
+      await deactivate();
+      assert.deepStrictEqual(order, ['bridge', 'drain', 'mirrors', 'workspace', 'global']);
+      await assert.rejects(f.stores.global.addItem({ type: 'file', uri: 'file:///outside' }), /disposed/);
+    } finally { await retry.stop(); await f.stop(); }
+  });
+
+  test('shutdown shares completion and still persists and disposes once when bridge cleanup rejects', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let client: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let outcomes: Promise<PromiseSettledResult<void>[]> | undefined;
+    let originalStop: (() => Promise<void>) | undefined;
+    try {
+      await f.start(); client = await connectLive(f);
+      const order: string[] = [];
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => {
+        await gate.wait(); await update(key, value); order.push('commit');
+      };
+      originalStop = f.bridge.stop.bind(f.bridge);
+      f.bridge.stop = async () => {
+        order.push('bridge'); await originalStop!(); order.push('bridge-error');
+        throw new Error('EPERM: private endpoint path');
+      };
+      const drain = f.coordinator.drainAndFlush.bind(f.coordinator);
+      f.coordinator.drainAndFlush = () => { order.push('drain'); return drain(); };
+      for (const [name, resource] of [['mirrors', f.coordinator], ['workspace', f.stores.workspace], ['global', f.stores.global]] as const) {
+        const dispose = resource.dispose.bind(resource);
+        resource.dispose = () => { order.push(name); dispose(); };
+      }
+      client.socket.write(JSON.stringify({ kind: 'request', id: 'persist-before-error', sessionId: client.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'add', params: { type: 'file', uri: 'file:///a/retained' } }) + '\n');
+      await gate.entered;
+      const first = deactivate(), concurrent = deactivate();
+      outcomes = Promise.allSettled([first, concurrent]);
+      assert.strictEqual(first, concurrent, 'concurrent callers must share the shutdown operation');
+      let finished = false;
+      void concurrent.then(() => { finished = true; });
+      await client.closed;
+      assert.strictEqual(finished, false, 'shutdown cannot settle before admitted work finishes');
+      gate.release();
+      assert.deepStrictEqual((await outcomes).map(result => result.status), ['fulfilled', 'fulfilled']);
+      assert.ok(order.indexOf('commit') < order.indexOf('bridge-error'));
+      assert.deepStrictEqual(order.filter(value => value !== 'commit'), ['bridge', 'bridge-error', 'drain', 'mirrors', 'workspace', 'global']);
+      assert.strictEqual(deactivate(), first, 'later callers must observe the completed operation');
+      await deactivate();
+      assert.strictEqual(order.filter(value => value === 'bridge').length, 1);
+      assert.strictEqual(JSON.parse(f.resources.get('file:///a')!.port.content!).items[0].uri, 'file:///a/retained');
+      assert.strictEqual(f.output.lines.filter(line => /bridge.*shutdown failed/i.test(line)).length, 1);
+      assert.ok(f.output.lines.every(line => !line.includes('private endpoint path')));
+    } finally {
+      gate.release(); client?.socket.destroy(); await outcomes;
+      if (originalStop) f.bridge.stop = originalStop;
+      await f.stop();
+      f.coordinator.dispose(); f.stores.workspace.dispose(); f.stores.global.dispose();
+    }
+  });
+
   test('trusted activation starts the bridge after store initialization and before provider registration', async () => {
     const f = activationFixture(['a']);
     try {
