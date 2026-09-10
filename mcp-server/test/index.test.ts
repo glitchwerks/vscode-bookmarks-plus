@@ -10,6 +10,9 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createServer } from '../src/index.js';
 import type { BookmarkBackend } from '../src/backend.js';
+import net from 'node:net';
+import { once } from 'node:events';
+import { LIVE_BRIDGE_HANDSHAKE_TIMEOUT_MS } from '../src/liveBridgeClient.js';
 
 // Same import.meta.url -> directory pattern established in contract.test.ts
 // / add.test.ts / schemaDrift.test.ts, for the same reason: import.meta.dirname
@@ -18,6 +21,214 @@ import type { BookmarkBackend } from '../src/backend.js';
 // dist/src sits one directory above it (sibling of dist/test) and the
 // package.json root two directories above it.
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+const liveInitialize = {
+  jsonrpc: '2.0', id: 101, method: 'initialize',
+  params: {
+    protocolVersion: '2024-11-05', capabilities: {},
+    clientInfo: { name: 'live-startup-test', version: '1' },
+  },
+};
+
+/** Runs the compiled entrypoint with real stdio and an optional internal deadline override. */
+function spawnLive(endpoint: string, override: NodeJS.ProcessEnv = {}, timeoutMs?: number) {
+  const entrypoint = path.join(here, '..', 'src', 'index.js');
+  const args = timeoutMs === undefined ? [entrypoint] : [
+    '--input-type=module', '-e',
+    `const { runServer } = await import(${JSON.stringify(pathToFileURL(entrypoint).href)});` +
+      `await runServer(process.argv, process.env, { handshakeTimeoutMs: ${timeoutMs} });`,
+  ];
+  const child = spawn(process.execPath, args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      BOOKMARKS_PLUS_LIVE_MODE: '1', BOOKMARKS_PLUS_ROOT_URI: 'file:///workspace',
+      BOOKMARKS_PLUS_BRIDGE_ENDPOINT: endpoint, BOOKMARKS_PLUS_BRIDGE_PROTOCOL: '1',
+      BOOKMARKS_PLUS_BRIDGE_GENERATION: 'generation', BOOKMARKS_PLUS_BRIDGE_TOKEN: 'private-token',
+      ...override,
+    },
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+  const closed = once(child, 'close');
+  return { child, closed, stdout: () => stdout, stderr: () => stderr };
+}
+
+/** Owns a local IPC endpoint and cleans every accepted socket after the test. */
+async function fakeBridge(onConnection: (socket: net.Socket) => void) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'bookmarks-init-'));
+  const endpoint = process.platform === 'win32'
+    ? `\\\\.\\pipe\\bookmarks-init-${process.pid}-${path.basename(directory)}`
+    : path.join(directory, 'bridge.sock');
+  const sockets = new Set<net.Socket>();
+  const listener = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.once('close', () => sockets.delete(socket));
+    onConnection(socket);
+  });
+  listener.listen(endpoint);
+  await once(listener, 'listening');
+  return {
+    endpoint,
+    close: async () => {
+      for (const socket of sockets) { socket.destroy(); }
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+      await fs.rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+const readyFrame = JSON.stringify({
+  kind: 'ready', version: 1, sessionId: 'session', workspaceFolderUri: 'file:///workspace',
+  grantedScopes: ['workspace', 'global'],
+}) + '\n';
+
+test('production live handshake deadline remains ten seconds', () => {
+  assert.equal(LIVE_BRIDGE_HANDSHAKE_TIMEOUT_MS, 10_000);
+});
+
+for (const behavior of ['silent', 'trickled', 'late-ready'] as const) {
+  test(`compiled live startup fails once and closes stdio for a ${behavior} bridge`, async () => {
+    let helloSeen = false;
+    let socketClosed = false;
+    let lateReadyTimer: ReturnType<typeof setTimeout> | undefined;
+    let lateReadyAttempt: Promise<void> | undefined;
+    const bridge = await fakeBridge((socket) => {
+      socket.once('data', () => { helloSeen = true; });
+      socket.once('close', () => { socketClosed = true; });
+      if (behavior === 'trickled') {
+        const timer = setInterval(() => socket.write(' '), 15);
+        socket.once('close', () => clearInterval(timer));
+      }
+      if (behavior === 'late-ready') {
+        lateReadyAttempt = new Promise<void>((resolve) => {
+          lateReadyTimer = setTimeout(() => { socket.write(readyFrame); resolve(); }, 350);
+        });
+      }
+    });
+    const run = spawnLive(bridge.endpoint, {}, 120);
+    const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+    try {
+      run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+      run.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 102, method: 'tools/list' }) + '\n');
+      const [code, signal] = await run.closed;
+      assert.equal(signal, null, run.stderr());
+      assert.equal(code, 1, run.stderr());
+      assert.equal(helloSeen, true, 'the compiled entrypoint must attempt authentication');
+      assert.equal(socketClosed, true);
+      await lateReadyAttempt;
+      const responses = run.stdout().trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      assert.equal(responses.length, 1, run.stdout());
+      assert.deepEqual(responses[0], {
+        jsonrpc: '2.0', id: 101,
+        error: {
+          code: -32000, message: 'The live bridge is unavailable.',
+          data: { bookmarksPlusCode: 'bridge-unavailable' },
+        },
+      });
+      assert.equal(run.child.stdout.readableEnded, true);
+      assert.ok(!run.stderr().includes('private-token'));
+    } finally {
+      clearTimeout(ceiling);
+      clearTimeout(lateReadyTimer);
+      run.child.kill('SIGKILL');
+      await bridge.close();
+    }
+  });
+}
+
+test('compiled live entrypoint buffers discovery until ready and closes the bridge on stdin EOF', async () => {
+  let authenticate!: () => void;
+  let helloResolve!: () => void;
+  let closeResolve!: () => void;
+  const hello = new Promise<void>((resolve) => { helloResolve = resolve; });
+  const socketClosed = new Promise<void>((resolve) => { closeResolve = resolve; });
+  const bridge = await fakeBridge((socket) => {
+    authenticate = () => { socket.write(readyFrame); };
+    socket.once('data', () => helloResolve());
+    socket.once('close', () => closeResolve());
+  });
+  // A hostile-looking timeout env value must not alter the production deadline.
+  const run = spawnLive(bridge.endpoint, { BOOKMARKS_PLUS_BRIDGE_HANDSHAKE_TIMEOUT_MS: '1' });
+  const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+  try {
+    run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+    run.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 102, method: 'tools/list' }) + '\n');
+    await Promise.race([hello, run.closed.then(() => assert.fail('entrypoint exited before authentication'))]);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(run.stdout(), '', 'initialize and discovery must stay behind authentication');
+    const initialized = collectJsonRpcResponse(run.child, 101);
+    const discovery = collectJsonRpcResponse(run.child, 102);
+    authenticate();
+    assert.ok((await initialized)?.result);
+    const toolResponse = await discovery;
+    assert.deepEqual((toolResponse?.result as { tools: { name: string }[] }).tools.map((tool) => tool.name),
+      ['list_bookmarks', 'add_bookmark']);
+    run.child.stdin.end();
+    const [code, signal] = await run.closed;
+    assert.equal(signal, null);
+    assert.equal(code, 0, run.stderr());
+    await socketClosed;
+  } finally {
+    clearTimeout(ceiling);
+    run.child.kill('SIGKILL');
+    await bridge.close();
+  }
+});
+
+test('malformed live configuration returns an initialize error without creating a mirror', async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'bookmarks-no-fallback-'));
+  const run = spawnLive('unused', {
+    BOOKMARKS_PLUS_BRIDGE_TOKEN: '', BOOKMARKS_PLUS_WORKSPACE: workspace,
+  });
+  const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+  try {
+    run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+    const [code, signal] = await run.closed;
+    assert.equal(signal, null);
+    assert.equal(code, 1);
+    const responses = run.stdout().trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0].error.data.bookmarksPlusCode, 'bridge-unavailable');
+    assert.deepEqual(await fs.readdir(workspace), []);
+  } finally {
+    clearTimeout(ceiling);
+    run.child.kill('SIGKILL');
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('stdin EOF during authentication cancels the bridge immediately and exits normally', async () => {
+  let helloResolve!: () => void;
+  let closeResolve!: () => void;
+  const hello = new Promise<void>((resolve) => { helloResolve = resolve; });
+  const socketClosed = new Promise<void>((resolve) => { closeResolve = resolve; });
+  const bridge = await fakeBridge((socket) => {
+    socket.once('data', () => helloResolve());
+    socket.once('close', () => closeResolve());
+  });
+  const run = spawnLive(bridge.endpoint, {}, 1500);
+  const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+  try {
+    run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+    await Promise.race([hello, run.closed.then(() => assert.fail('entrypoint exited before authentication'))]);
+    const start = performance.now();
+    run.child.stdin.end();
+    const [code, signal] = await run.closed;
+    assert.equal(signal, null);
+    assert.equal(code, 0, run.stderr());
+    assert.ok(performance.now() - start < 750, 'EOF must cancel rather than wait for the handshake deadline');
+    await socketClosed;
+    assert.equal(run.stdout(), '', 'consumer closure does not emit a startup failure');
+  } finally {
+    clearTimeout(ceiling);
+    run.child.kill('SIGKILL');
+    await bridge.close();
+  }
+});
 
 // createServer must never itself read or write the mirror file — tool
 // registration only closes over `config`, it does not perform I/O — so an

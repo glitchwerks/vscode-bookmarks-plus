@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { once } from 'node:events';
+import { getEventListeners, once } from 'node:events';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +55,73 @@ async function peer(t: TestContext, receive: (message: Record<string, unknown>, 
 function send(socket: net.Socket, message: unknown): void {
   socket.write(`${JSON.stringify(message)}\n`);
 }
+
+test('an already aborted handshake never opens an IPC connection', async (t) => {
+  let hellos = 0;
+  const config = await peer(t, (_, socket) => { hellos++; send(socket, ready); });
+  const controller = new AbortController();
+  controller.abort();
+  const options = { signal: controller.signal, handshakeTimeoutMs: 500 };
+  const connecting = LiveMcpBridgeClient.connect(config, options).then((client) => {
+    t.after(() => client.close());
+    return client;
+  });
+  await assert.rejects(connecting, { name: 'LiveBridgeStartupError', code: 'bridge-unavailable' });
+  assert.equal(hellos, 0);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('aborting authentication destroys its socket, rejects once, and ignores a later ready frame', async (t) => {
+  let accepted!: net.Socket;
+  let observedHello!: () => void;
+  const hello = new Promise<void>((resolve) => { observedHello = resolve; });
+  const config = await peer(t, (_, socket) => { accepted = socket; observedHello(); });
+  const controller = new AbortController();
+  const options = { signal: controller.signal, handshakeTimeoutMs: 500 };
+  let settlements = 0;
+  const outcome = LiveMcpBridgeClient.connect(config, options).then((client) => {
+    settlements++;
+    t.after(() => client.close());
+    return { status: 'fulfilled', error: undefined };
+  }, (error: unknown) => {
+    settlements++;
+    return { status: 'rejected', error };
+  });
+  await hello;
+  const closed = new Promise<void>((resolve) => accepted.once('close', () => resolve()));
+  controller.abort();
+  send(accepted, ready);
+  const result = await outcome;
+  assert.equal(result.status, 'rejected');
+  assert.ok(result.error instanceof LiveBridgeStartupError);
+  assert.equal(result.error.code, 'bridge-unavailable');
+  await closed;
+  send(accepted, ready);
+  await delay(20);
+  assert.equal(settlements, 1);
+  assert.equal(accepted.destroyed, true);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('successful authentication removes its abort listener and later abort cannot kill the session', async (t) => {
+  const config = await peer(t, (message, socket) => send(socket,
+    message.kind === 'hello' ? ready : { kind: 'response', id: message.id, result: 'still ready' }));
+  const controller = new AbortController();
+  const options = { signal: controller.signal, handshakeTimeoutMs: 500 };
+  const client = await LiveMcpBridgeClient.connect(config, options);
+  t.after(() => client.close());
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  controller.abort();
+  assert.equal(await client.request('list', {}), 'still ready');
+});
+
+test('failed authentication removes the pending abort listener', async (t) => {
+  const config = await peer(t, (_, socket) => socket.end());
+  const controller = new AbortController();
+  const options = { signal: controller.signal, handshakeTimeoutMs: 500 };
+  await assert.rejects(LiveMcpBridgeClient.connect(config, options), { code: 'bridge-unavailable' });
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
 
 test('connect sends the configured hello before any request and pins subsequent requests', async (t) => {
   const messages: Record<string, unknown>[] = [];

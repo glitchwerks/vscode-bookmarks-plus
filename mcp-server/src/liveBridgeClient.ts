@@ -53,18 +53,26 @@ export class LiveMcpBridgeClient {
   private resolveStartup?: (client: LiveMcpBridgeClient) => void;
   private rejectStartup?: (error: LiveBridgeStartupError) => void;
   private socketClosed: Promise<void> = Promise.resolve();
+  private removeAbortListener?: () => void;
 
   private constructor(readonly workspaceFolderUri: string) {}
 
   /** Authenticates within one absolute deadline covering connection and all handshake traffic. */
   static connect(
     config: LiveBridgeConfig,
-    options: { handshakeTimeoutMs?: number } = {},
+    options: { handshakeTimeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<LiveMcpBridgeClient> {
     const client = new LiveMcpBridgeClient(config.workspaceFolderUri);
     return new Promise((resolve, reject) => {
       client.resolveStartup = resolve;
       client.rejectStartup = reject;
+      const signal = options.signal;
+      if (signal?.aborted) { client.terminate(); return; }
+      if (signal) {
+        const onAbort = (): void => client.terminate();
+        client.removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
       client.start({ ...config }, options.handshakeTimeoutMs ?? LIVE_BRIDGE_HANDSHAKE_TIMEOUT_MS);
     });
   }
@@ -151,6 +159,7 @@ export class LiveMcpBridgeClient {
           this.state = 'ready';
           clearTimeout(this.timer);
           this.timer = undefined;
+          this.releaseAbortListener();
           this.resolveStartup?.(this);
           this.resolveStartup = undefined;
           this.rejectStartup = undefined;
@@ -180,6 +189,12 @@ export class LiveMcpBridgeClient {
     return this.state === 'closed';
   }
 
+  /** Cancellation only owns the pending handshake, never an authenticated session. */
+  private releaseAbortListener(): void {
+    this.removeAbortListener?.();
+    this.removeAbortListener = undefined;
+  }
+
   /** Performs the only terminal transition, retiring all callbacks and destroying the owned socket. */
   private terminate(startupError = new LiveBridgeStartupError('bridge-unavailable', 'The live bridge is unavailable.')): void {
     if (this.state === 'closed') { return; }
@@ -187,6 +202,7 @@ export class LiveMcpBridgeClient {
     this.session = undefined;
     clearTimeout(this.timer);
     this.timer = undefined;
+    this.releaseAbortListener();
     this.rejectStartup?.(startupError);
     this.resolveStartup = undefined;
     this.rejectStartup = undefined;

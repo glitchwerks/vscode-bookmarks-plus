@@ -6,8 +6,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { type BookmarkBackend } from './backend.js';
-import { resolveWorkspaceState, type WorkspaceState } from './config.js';
 import { MirrorBookmarkBackend } from './mirrorBackend.js';
+import { InitializationGate } from './initializationGate.js';
+import { LiveBookmarkBackend, LiveBridgeStartupError, LiveMcpBridgeClient } from './liveBridgeClient.js';
+import { resolveRuntimeMode, type RuntimeMode } from './runtimeMode.js';
 import { createAddHandler } from './tools/add.js';
 import { createListHandler } from './tools/list.js';
 
@@ -74,21 +76,98 @@ export function createServer(
   return server;
 }
 
-async function main(): Promise<void> {
-  let state: WorkspaceState;
+/** Starts the selected runtime; the deadline override is an internal test dependency only. */
+export async function runServer(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  dependencies: { handshakeTimeoutMs?: number } = {},
+): Promise<void> {
+  let mode: RuntimeMode | undefined;
+  let configurationError: LiveBridgeStartupError | undefined;
   try {
-    state = resolveWorkspaceState(process.argv, process.env);
+    mode = resolveRuntimeMode(argv, env);
   } catch (error: unknown) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    if (error instanceof LiveBridgeStartupError) {
+      configurationError = error;
+    } else {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  if (mode && mode.kind !== 'live') {
+    const server = mode.kind === 'mirror'
+      ? createServer(new MirrorBookmarkBackend(mode.config))
+      : createServer(undefined, { disabledReason: mode.reason });
+    await server.connect(new StdioServerTransport());
     return;
   }
 
-  const server =
-    state.kind === 'ok'
-      ? createServer(new MirrorBookmarkBackend(state.config))
-      : createServer(undefined, { disabledReason: state.reason });
-  await server.connect(new StdioServerTransport());
+  const gate = new InitializationGate(new StdioServerTransport());
+  const authentication = new AbortController();
+  let client: LiveMcpBridgeClient | undefined;
+  let backend: LiveBookmarkBackend | undefined;
+  let closed = false;
+  let inputEnded = false;
+  let cleanup: Promise<void> | undefined;
+
+  /** Releases live resources and the process-owned stdio after the final write. */
+  const releaseResources = (): Promise<void> => {
+    if (cleanup) { return cleanup; }
+    closed = true;
+    cleanup = Promise.resolve().then(async () => {
+      process.stdin.off('end', onInputEnd);
+      process.stdin.off('close', onInputEnd);
+      try {
+        if (backend) { await backend.close(); }
+        else { await client?.close(); }
+      } finally {
+        process.stdin.destroy();
+        await new Promise<void>((resolve) => process.stdout.end(resolve));
+      }
+    });
+    return cleanup;
+  };
+  const onInputEnd = (): void => {
+    inputEnded = true;
+    authentication.abort();
+    void gate.close().then(releaseResources).catch(() => { process.exitCode = 1; });
+  };
+  gate.onclose = () => { void releaseResources().catch(() => { process.exitCode = 1; }); };
+  process.stdin.once('end', onInputEnd);
+  process.stdin.once('close', onInputEnd);
+
+  try {
+    await gate.start();
+    if (configurationError) { throw configurationError; }
+    if (!mode || mode.kind !== 'live') { throw new Error('Missing live runtime.'); }
+    client = await LiveMcpBridgeClient.connect(mode.config, {
+      handshakeTimeoutMs: dependencies.handshakeTimeoutMs, signal: authentication.signal,
+    });
+    // EOF can arrive during authentication; never create or expose a server after closure.
+    if (closed) { await client.close(); return; }
+    backend = new LiveBookmarkBackend(client);
+    const server = createServer(backend);
+    await server.connect(gate);
+    gate.open();
+  } catch (error: unknown) {
+    if (inputEnded) {
+      await gate.close();
+      await releaseResources();
+      return;
+    }
+    process.exitCode = 1;
+    const code = error instanceof LiveBridgeStartupError ? error.code : 'bridge-unavailable';
+    try {
+      // Producer exceptions and transport diagnostics may contain private bootstrap details.
+      await gate.fail(code, 'The live bridge is unavailable.');
+    } catch {
+      // A broken output stream cannot receive a second response; cleanup still owns shutdown.
+    } finally {
+      await releaseResources();
+    }
+  }
 }
 
 function isEntrypoint(): boolean {
@@ -105,5 +184,5 @@ function isEntrypoint(): boolean {
 }
 
 if (isEntrypoint()) {
-  void main();
+  void runServer(process.argv, process.env);
 }
