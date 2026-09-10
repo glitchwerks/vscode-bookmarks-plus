@@ -109,13 +109,13 @@ export async function runServer(
   let client: LiveMcpBridgeClient | undefined;
   let backend: LiveBookmarkBackend | undefined;
   let closed = false;
-  let inputEnded = false;
   let cleanup: Promise<void> | undefined;
 
   /** Releases live resources and the process-owned stdio after the final write. */
   const releaseResources = (): Promise<void> => {
     if (cleanup) { return cleanup; }
     closed = true;
+    authentication.abort();
     cleanup = Promise.resolve().then(async () => {
       process.stdin.off('end', onInputEnd);
       process.stdin.off('close', onInputEnd);
@@ -130,8 +130,6 @@ export async function runServer(
     return cleanup;
   };
   const onInputEnd = (): void => {
-    inputEnded = true;
-    authentication.abort();
     void gate.close().then(releaseResources).catch(() => { process.exitCode = 1; });
   };
   gate.onclose = () => { void releaseResources().catch(() => { process.exitCode = 1; }); };
@@ -152,7 +150,7 @@ export async function runServer(
     await server.connect(gate);
     gate.open();
   } catch (error: unknown) {
-    if (inputEnded) {
+    if (closed) {
       await gate.close();
       await releaseResources();
       return;

@@ -31,11 +31,11 @@ const liveInitialize = {
 };
 
 /** Runs the compiled entrypoint with real stdio and an optional internal deadline override. */
-function spawnLive(endpoint: string, override: NodeJS.ProcessEnv = {}, timeoutMs?: number) {
+function spawnLive(endpoint: string, override: NodeJS.ProcessEnv = {}, timeoutMs?: number, beforeStart = '') {
   const entrypoint = path.join(here, '..', 'src', 'index.js');
   const args = timeoutMs === undefined ? [entrypoint] : [
     '--input-type=module', '-e',
-    `const { runServer } = await import(${JSON.stringify(pathToFileURL(entrypoint).href)});` +
+    beforeStart + `const { runServer } = await import(${JSON.stringify(pathToFileURL(entrypoint).href)});` +
       `await runServer(process.argv, process.env, { handshakeTimeoutMs: ${timeoutMs} });`,
   ];
   const child = spawn(process.execPath, args, {
@@ -223,6 +223,43 @@ test('stdin EOF during authentication cancels the bridge immediately and exits n
     assert.ok(performance.now() - start < 750, 'EOF must cancel rather than wait for the handshake deadline');
     await socketClosed;
     assert.equal(run.stdout(), '', 'consumer closure does not emit a startup failure');
+  } finally {
+    clearTimeout(ceiling);
+    run.child.kill('SIGKILL');
+    await bridge.close();
+  }
+});
+
+test('inner transport closure during authentication cancels the socket and exits normally', async () => {
+  let helloResolve!: () => void;
+  let closeResolve!: () => void;
+  const hello = new Promise<void>((resolve) => { helloResolve = resolve; });
+  const socketClosed = new Promise<void>((resolve) => { closeResolve = resolve; });
+  const bridge = await fakeBridge((socket) => {
+    socket.once('data', () => helloResolve());
+    socket.once('close', () => closeResolve());
+  });
+  const stdioUrl = pathToFileURL(path.join(here, '..', '..', 'node_modules',
+    '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'server', 'stdio.js')).href;
+  // Keep the real start/close side effects and control only the moment transport closure happens.
+  const beforeStart = `const { StdioServerTransport } = await import(${JSON.stringify(stdioUrl)});` +
+    'const start = StdioServerTransport.prototype.start;' +
+    'StdioServerTransport.prototype.start = async function() {' +
+    'await start.call(this); setTimeout(() => { void this.close(); }, 100); };';
+  const run = spawnLive(bridge.endpoint, {}, 1500, beforeStart);
+  const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+  try {
+    run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+    await Promise.race([hello, run.closed.then(() => assert.fail('entrypoint exited before authentication'))]);
+    const start = performance.now();
+    await socketClosed;
+    assert.ok(performance.now() - start < 750,
+      'transport closure must cancel the pending socket before its 1500 ms deadline');
+    const [code, signal] = await run.closed;
+    assert.equal(signal, null);
+    assert.equal(code, 0, run.stderr());
+    assert.equal(run.stdout(), '', 'transport closure must not produce a startup error');
+    assert.equal(run.child.stdout.readableEnded, true);
   } finally {
     clearTimeout(ceiling);
     run.child.kill('SIGKILL');
