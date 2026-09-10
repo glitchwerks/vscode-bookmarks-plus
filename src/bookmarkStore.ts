@@ -43,12 +43,22 @@ export class DuplicateBookmarkError extends Error {
   }
 }
 
+/** Raised when a queued mutation targets a collection that no longer exists in its scope. */
+export class CollectionNotFoundError extends Error {
+  constructor(readonly collectionId: string) {
+    super('Bookmark collection was not found.');
+    this.name = 'CollectionNotFoundError';
+  }
+}
+
 const noopOutput: OutputSink = { appendLine: () => {} };
 
 
 export class BookmarkStore implements BookmarkContentReader {
   private data: BookmarkData;
   private operationTail: Promise<void> = Promise.resolve();
+  private shutdownPromise: Promise<void> | undefined;
+  private acceptingMutations = true;
   private disposed = false;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
   readonly onBookmarksChanged: vscode.Event<void> = this._onBookmarksChanged.event;
@@ -113,6 +123,9 @@ export class BookmarkStore implements BookmarkContentReader {
   addItem(input: AddItemInput): Promise<BookmarkItem> {
     return this.enqueue((draft) => {
       const collectionId = input.collectionId ?? null;
+      if (collectionId !== null && !draft.collections.some((collection) => collection.id === collectionId)) {
+        throw new CollectionNotFoundError(collectionId);
+      }
       if (this.hasDuplicateBookmark(draft, input.uri, collectionId)) {
         throw new DuplicateBookmarkError(input.uri, collectionId);
       }
@@ -257,13 +270,31 @@ export class BookmarkStore implements BookmarkContentReader {
     });
   }
 
-  /** Releases content-change listeners when the Global store is retired. */
+  /** Fences new work, drains every admitted mutation, then releases store resources. */
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
+    }
+    this.acceptingMutations = false;
+    const admittedTail = this.operationTail;
+    this.shutdownPromise = admittedTail.then(() => this.dispose());
+    return this.shutdownPromise;
+  }
+
+  /** Immediately retires the store, including mutations still waiting in its queue. */
   dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.acceptingMutations = false;
     this.disposed = true;
     this._onBookmarksChanged.dispose();
   }
 
   private enqueue<T>(operation: (draft: BookmarkData) => { value: T; changed: boolean }): Promise<T> {
+    if (!this.acceptingMutations) {
+      return Promise.reject(new Error('Global bookmark store is disposed.'));
+    }
     const run = this.operationTail.then(async () => {
       this.assertAvailable();
       const draft = cloneData(this.data);

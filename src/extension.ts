@@ -542,16 +542,24 @@ export function deactivate(): Promise<void> {
 function shutdownRuntime(runtime: NonNullable<typeof activeRuntime>): Promise<void> {
   if (runtime.shutdown) return runtime.shutdown;
   runtime.stopping = true;
+  let stoppingBridge: Promise<void> | undefined;
+  try { stoppingBridge = runtime.bridge?.stop(); }
+  catch { runtime.output.appendLine('Bookmarks Plus: live MCP bridge shutdown failed.'); }
+  // Attach failure handling now: bridge cleanup may reject while reconciliation is still pending.
+  const bridgeStopped = stoppingBridge?.catch(() => {
+    runtime.output.appendLine('Bookmarks Plus: live MCP bridge shutdown failed.');
+  });
   runtime.shutdown = Promise.resolve().then(async () => {
     await runtime.pending;
-    try { await runtime.bridge?.stop(); }
-    catch { runtime.output.appendLine('Bookmarks Plus: live MCP bridge shutdown failed.'); }
+    await bridgeStopped;
     try { await runtime.mirrors.drainAndFlush(); }
     catch { runtime.output.appendLine('Bookmarks Plus: workspace mirror flush failed.'); }
-    for (const resource of [runtime.mirrors, runtime.store, runtime.globalStore]) {
+    for (const resource of [runtime.mirrors, runtime.store]) {
       try { resource.dispose(); }
       catch { runtime.output.appendLine('Bookmarks Plus: workspace resource disposal failed.'); }
     }
+    try { await runtime.globalStore.shutdown(); }
+    catch { runtime.output.appendLine('Bookmarks Plus: Global store shutdown failed.'); }
   }).finally(() => {
     if (activeRuntime === runtime) activeRuntime = undefined;
   });

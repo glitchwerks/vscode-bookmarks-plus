@@ -73,13 +73,15 @@ suite('LiveMcpBridgeService authentication', () => {
   let now: number;
   let tempDirectory: string;
   let globalState: FakeMemento;
+  let workspaceState: FakeMemento;
   const clients: net.Socket[] = [];
 
   setup(async () => {
     now = 1_000;
     tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bp-'));
+    workspaceState = new FakeMemento();
     workspaceStore = await WorkspaceBookmarkStore.create({
-      state: new FakeMemento(), output: new FakeOutput(),
+      state: workspaceState, output: new FakeOutput(),
       roots: [{ id: 'a', label: 'A', uri: vscode.Uri.parse(ROOT) }]
     });
     globalState = new FakeMemento();
@@ -179,6 +181,76 @@ suite('LiveMcpBridgeService authentication', () => {
       scope: 'global', uri: ROOT + '/named', type: 'folder', collectionName: 'Global collection'
     });
     assert.strictEqual((named.result as { collection: { id: string } }).collection.id, collection.id);
+  });
+
+  test('maps a collection deleted after resolution to collection-not-found without a dangling Global item', async () => {
+    const collection = await globalStore.addCollection('Removed');
+    const { socket, sessionId } = await client(['global']);
+    const update = globalState.update.bind(globalState);
+    let signalDeleteStarted!: () => void;
+    let releaseDelete!: () => void;
+    let signalCollectionRead!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => { signalDeleteStarted = resolve; });
+    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    const collectionRead = new Promise<void>((resolve) => { signalCollectionRead = resolve; });
+    globalState.update = async (key, value) => {
+      signalDeleteStarted();
+      await deleteGate;
+      await update(key, value);
+    };
+    const read = globalStore.getAll.bind(globalStore);
+    globalStore.getAll = () => {
+      const value = read();
+      signalCollectionRead();
+      return value;
+    };
+
+    const deletion = globalStore.deleteCollection(collection.id);
+    await deleteStarted;
+    const response = request(socket, sessionId, 'add', {
+      scope: 'global', uri: 'file:///dangling', type: 'file', collectionId: collection.id
+    });
+    await collectionRead;
+    releaseDelete();
+    await deletion;
+
+    assert.strictEqual((await response).error?.code, 'collection-not-found');
+    assert.deepStrictEqual(globalStore.getAll().items, []);
+  });
+
+  test('maps a Workspace collection deleted after resolution to collection-not-found', async () => {
+    const owner = currentRoot!.owner;
+    const collection = await workspaceStore.addCollection(owner, 'Removed');
+    const { socket, sessionId } = await client(['workspace']);
+    const update = workspaceState.update.bind(workspaceState);
+    let signalDeleteStarted!: () => void;
+    let releaseDelete!: () => void;
+    let signalCollectionRead!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => { signalDeleteStarted = resolve; });
+    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    const collectionRead = new Promise<void>((resolve) => { signalCollectionRead = resolve; });
+    workspaceState.update = async (key, value) => {
+      signalDeleteStarted();
+      await deleteGate;
+      await update(key, value);
+    };
+    const read = workspaceStore.getOwnerData.bind(workspaceStore);
+    workspaceStore.getOwnerData = (selectedOwner) => {
+      const value = read(selectedOwner);
+      signalCollectionRead();
+      return value;
+    };
+    const deletion = workspaceStore.deleteCollection(owner, collection.id);
+    await deleteStarted;
+    const response = request(socket, sessionId, 'add', {
+      scope: 'workspace', uri: `${ROOT}/dangling`, type: 'file', collectionId: collection.id
+    });
+    await collectionRead;
+    releaseDelete();
+    await deletion;
+
+    assert.strictEqual((await response).error?.code, 'collection-not-found');
+    assert.deepStrictEqual(workspaceStore.getOwnerData(owner)!.items, []);
   });
 
   test('rejects unavailable scopes and unknown collections without mutations', async () => {

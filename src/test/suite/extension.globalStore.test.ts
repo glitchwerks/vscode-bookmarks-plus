@@ -194,6 +194,78 @@ suite('Extension - partitioned activation (#62)', () => {
     }
   });
 
+  test('shutdown drains direct Global mutations without an active bridge request', async () => {
+    const f = activationFixture([]);
+    const gate = barrier();
+    let stopping: Promise<void> | undefined;
+    let additions: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await f.start();
+      const update = f.context.globalState.update.bind(f.context.globalState);
+      f.context.globalState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      const first = f.stores.global.addItem({ type: 'file', uri: 'file:///direct-first' });
+      await gate.entered;
+      const second = f.stores.global.addItem({ type: 'file', uri: 'file:///direct-second' });
+      additions = Promise.allSettled([first, second]);
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(finished, false, 'shutdown must wait for direct Global writes');
+      gate.release();
+      await stopping;
+      assert.deepStrictEqual((await additions).map(result => result.status), ['fulfilled', 'fulfilled']);
+      assert.deepStrictEqual(f.context.globalState.get<BookmarkData>('bookmarks.data')!.items.map(item => item.uri),
+        ['file:///direct-first', 'file:///direct-second']);
+      await assert.rejects(f.stores.global.addItem({ type: 'file', uri: 'file:///too-late' }), /disposed/);
+    } finally { gate.release(); await additions; await stopping; await f.stop(); }
+  });
+
+  test('shutdown fences issued grants and existing sessions while reconciliation is held', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let client: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let pendingSocket: net.Socket | undefined;
+    let transition: Promise<void> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      await f.start();
+      client = await connectLive(f);
+      const grant = f.bridge.issueGrant('file:///a', ['global']);
+      pendingSocket = net.createConnection(grant.endpoint);
+      pendingSocket.on('error', () => {});
+      await once(pendingSocket, 'connect');
+      const pending = pendingSocket;
+      const authentication = new Promise<string>(resolve => {
+        let buffer = '';
+        pending.on('data', chunk => {
+          buffer += chunk.toString();
+          if (buffer.includes('\n')) resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n'))).kind);
+        });
+        pending.once('close', () => resolve('closed'));
+      });
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      transition = f.change(['a', 'b']);
+      await gate.entered;
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      assert.throws(() => f.bridge.issueGrant('file:///a', ['global']), /bridge-unavailable/,
+        'bridge admission must be fenced synchronously, before yielding to reconciliation');
+      pending.write(JSON.stringify({ kind: 'hello', version: 1, generation: grant.generation, token: grant.token }) + '\n');
+      const request = client.exchange({ kind: 'request', id: 'after-stop', sessionId: client.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'add',
+        params: { scope: 'global', type: 'file', uri: 'file:///must-not-be-admitted' } });
+      const requestOutcome = request.then(result => result.kind, () => 'closed');
+      assert.strictEqual(await authentication, 'closed', 'an issued grant must not authenticate during shutdown');
+      assert.strictEqual(await requestOutcome, 'closed', 'an existing session must not admit more requests');
+      assert.deepStrictEqual(f.stores.global.getAll().items, []);
+      assert.strictEqual(finished, false, 'reconciliation remains held during the admission assertions');
+    } finally {
+      gate.release(); client?.socket.destroy(); pendingSocket?.destroy();
+      await transition; await stopping; await f.stop();
+    }
+  });
+
   test('trusted activation starts the bridge after store initialization and before provider registration', async () => {
     const f = activationFixture(['a']);
     try {

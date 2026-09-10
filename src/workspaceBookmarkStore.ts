@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import {
   AddItemInput,
   BookmarkContentReader,
+  CollectionNotFoundError,
   DuplicateBookmarkError,
   OutputSink
 } from './bookmarkStore';
@@ -381,7 +382,7 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       const data = partition.data;
       const collectionId = input.collectionId ?? null;
       if (collectionId !== null && !data.collections.some((collection) => collection.id === collectionId)) {
-        throw new WorkspaceSnapshotInvariantError('Bookmark collection is not owned by the selected partition.');
+        throw new CollectionNotFoundError(collectionId);
       }
       if (hasDuplicateBookmark(data, input.uri, collectionId)) {
         throw new DuplicateBookmarkError(input.uri, collectionId);

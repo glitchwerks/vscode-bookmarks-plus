@@ -87,11 +87,39 @@ suite('BookmarkStore - load and core CRUD', () => {
     const memento = new FakeMemento();
     const store = new BookmarkStore(memento);
     await store.addItem({ type: 'file', uri: 'file:///root.txt' });
-    const collectionId = 'col-1';
+    const collectionId = (await store.addCollection('Work')).id;
     const first = await store.addItem({ type: 'file', uri: 'file:///a.txt', collectionId });
     const second = await store.addItem({ type: 'file', uri: 'file:///b.txt', collectionId });
     assert.strictEqual(first.order, 0);
     assert.strictEqual(second.order, 1);
+  });
+
+  test('addItem revalidates its collection after an earlier queued deletion commits', async () => {
+    const state = new FakeMemento();
+    const store = new BookmarkStore(state);
+    const collection = await store.addCollection('Removed');
+    const update = state.update.bind(state);
+    let signalDeleteStarted!: () => void;
+    let releaseDelete!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => { signalDeleteStarted = resolve; });
+    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    state.update = async (key, value) => {
+      signalDeleteStarted();
+      await deleteGate;
+      await update(key, value);
+    };
+
+    const deletion = store.deleteCollection(collection.id);
+    await deleteStarted;
+    const addition = store.addItem({
+      type: 'file', uri: 'file:///dangling', collectionId: collection.id
+    });
+    releaseDelete();
+    await deletion;
+
+    await assert.rejects(addition, /collection.*not found/i);
+    assert.deepStrictEqual(store.getAll().items, []);
+    assert.deepStrictEqual(state.get<BookmarkData>('bookmarks.data')?.items, []);
   });
 
   test('addItem rejects a duplicate uri in the root collection without adding another item', async () => {
@@ -254,6 +282,52 @@ suite('BookmarkStore - load and core CRUD', () => {
 
     assert.strictEqual(state.updateCallCount, 0);
     assert.strictEqual(events, 0);
+  });
+
+  test('shutdown fences new mutations while draining every mutation already admitted', async () => {
+    const state = new DeferredFirstGlobalUpdateMemento();
+    const store = new BookmarkStore(state);
+    const firstAdd = store.addItem({ type: 'file', uri: 'file:///first' });
+    await state.firstGlobalUpdateStarted;
+    const secondAdd = store.addItem({ type: 'file', uri: 'file:///second' });
+
+    const shutdown = store.shutdown();
+    assert.strictEqual(store.shutdown(), shutdown, 'concurrent shutdown callers must share completion');
+    await assert.rejects(
+      store.addItem({ type: 'file', uri: 'file:///too-late' }),
+      /Global bookmark store is disposed/
+    );
+    let finished = false;
+    void shutdown.then(() => { finished = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.strictEqual(finished, false, 'shutdown must wait for the held and queued mutations');
+
+    state.releaseFirstGlobalUpdate();
+    await Promise.all([firstAdd, secondAdd, shutdown]);
+    assert.deepStrictEqual(store.getAll().items.map((item) => item.uri), [
+      'file:///first', 'file:///second'
+    ]);
+    assert.deepStrictEqual(state.get<BookmarkData>('bookmarks.data')?.items.map((item) => item.uri), [
+      'file:///first', 'file:///second'
+    ]);
+    await assert.rejects(
+      store.addItem({ type: 'file', uri: 'file:///after-shutdown' }),
+      /Global bookmark store is disposed/
+    );
+  });
+
+  test('dispose remains a hard stop for a mutation queued behind an in-flight write', async () => {
+    const state = new DeferredFirstGlobalUpdateMemento();
+    const store = new BookmarkStore(state);
+    const firstAdd = store.addItem({ type: 'file', uri: 'file:///in-flight' });
+    await state.firstGlobalUpdateStarted;
+    const queuedAdd = store.addItem({ type: 'file', uri: 'file:///queued' });
+
+    store.dispose();
+    state.releaseFirstGlobalUpdate();
+    await firstAdd;
+    await assert.rejects(queuedAdd, /Global bookmark store is disposed/);
+    assert.deepStrictEqual(store.getAll().items.map((item) => item.uri), ['file:///in-flight']);
   });
 });
 

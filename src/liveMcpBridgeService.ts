@@ -5,7 +5,13 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { DuplicateBookmarkError, type AddItemInput, type BookmarkStore, type OutputSink } from './bookmarkStore';
+import {
+  CollectionNotFoundError,
+  DuplicateBookmarkError,
+  type AddItemInput,
+  type BookmarkStore,
+  type OutputSink
+} from './bookmarkStore';
 import { PartitionBoundaryError, WorkspaceDataUnavailableError, type WorkspaceBookmarkStore } from './workspaceBookmarkStore';
 import type { WorkspaceOwnerRef } from './workspacePartitionTypes';
 import { CURRENT_SCHEMA_VERSION, type BookmarkCollection, type BookmarkData, type BookmarkItem, type BookmarkScope } from './types';
@@ -235,6 +241,7 @@ export class LiveMcpBridgeService {
       } catch (error) {
         const code = error instanceof BridgeProtocolError ? error.code
           : error instanceof DuplicateBookmarkError ? 'duplicate-bookmark'
+          : error instanceof CollectionNotFoundError ? 'collection-not-found'
           : error instanceof PartitionBoundaryError ? 'bookmark-outside-root'
           : error instanceof WorkspaceDataUnavailableError
             || (error instanceof Error && error.message === 'Global bookmark store is disposed.') ? 'store-unavailable'
