@@ -168,6 +168,28 @@ test('connect accepts the exact scopes in either order', async (t) => {
   await client.close();
 });
 
+for (const source of ['producer', 'consumer'] as const) {
+  test(`closed notification settles after ${source} shutdown and remains observable later`, { timeout: 2500 }, async (t) => {
+    let socket!: net.Socket;
+    const config = await peer(t, (_, accepted) => { socket = accepted; send(accepted, ready); });
+    const client = await LiveMcpBridgeClient.connect(config);
+    t.after(() => client.close());
+    const closed = client.closed;
+    assert.ok(closed instanceof Promise, 'authenticated callers need a terminal notification');
+    let notified = false;
+    const observed = closed.then(() => { notified = true; });
+    await Promise.resolve();
+    assert.equal(notified, false, 'an active connection must not report closure');
+    if (source === 'producer') socket.end();
+    else await client.close();
+    await observed;
+    await assert.rejects(client.request('list', {}), { code: 'invalid-session' });
+    await closed;
+    await client.close();
+    assert.equal(notified, true);
+  });
+}
+
 for (const code of ['bootstrap-expired', 'bootstrap-consumed', 'producer-restarted',
   'workspace-folder-unavailable', 'scope-unavailable', 'bridge-unavailable']) {
   test(`connect preserves producer startup classification ${code}`, async (t) => {

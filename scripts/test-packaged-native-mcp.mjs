@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -104,12 +105,18 @@ async function main() {
   const packageDir = join(tempRoot, 'package');
   const extractDir = join(tempRoot, 'extracted');
   const workspaceDir = join(tempRoot, 'workspace');
+  const anchorDir = join(tempRoot, 'anchor');
+  const workspaceFile = join(tempRoot, 'live-mcp.code-workspace');
   const vsixPath = join(packageDir, 'bookmarks-plus.vsix');
   const extensionPath = join(extractDir, 'extension');
 
   try {
     mkdirSync(packageDir, { recursive: true });
     mkdirSync(workspaceDir, { recursive: true });
+    mkdirSync(anchorDir, { recursive: true });
+    writeFileSync(workspaceFile, JSON.stringify({ folders: [
+      { name: 'anchor', path: anchorDir }, { name: 'workspace', path: workspaceDir },
+    ] }));
 
     execFileSync(process.execPath, ['esbuild.js', '--production'], {
       cwd: repoRoot,
@@ -144,7 +151,7 @@ async function main() {
         BOOKMARKS_PACKAGED_MCP_TEST: '1',
       },
       launchArgs: [
-        workspaceDir,
+        workspaceFile,
         '--disable-extensions',
         '--disable-workspace-trust',
         '--skip-welcome',

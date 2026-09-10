@@ -179,6 +179,35 @@ test('compiled live entrypoint buffers discovery until ready and closes the brid
   }
 });
 
+for (const shutdown of ['end', 'reset', 'end-with-stdin-EOF'] as const) {
+  test(`authenticated producer ${shutdown} closes MCP stdout and exits normally`, async () => {
+    let accepted!: net.Socket;
+    const bridge = await fakeBridge((socket) => {
+      accepted = socket;
+      socket.once('data', () => socket.write(readyFrame));
+    });
+    const run = spawnLive(bridge.endpoint);
+    const ceiling = setTimeout(() => run.child.kill('SIGKILL'), 4000);
+    try {
+      const initialized = collectJsonRpcResponse(run.child, 101);
+      run.child.stdin.write(JSON.stringify(liveInitialize) + '\n');
+      assert.ok((await initialized)?.result);
+      if (shutdown === 'reset') accepted.destroy();
+      else accepted.end();
+      if (shutdown === 'end-with-stdin-EOF') run.child.stdin.end();
+      const [code, signal] = await run.closed;
+      assert.equal(signal, null, 'producer termination must not require killing the child');
+      assert.equal(code, 0, run.stderr());
+      assert.equal(run.child.stdout.readableEnded, true);
+      const responses = run.stdout().trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      assert.equal(responses.length, 1, 'post-authentication closure must not emit an initialization error');
+      assert.ok(responses[0].result);
+    } finally {
+      clearTimeout(ceiling); run.child.kill('SIGKILL'); await bridge.close();
+    }
+  });
+}
+
 test('malformed live configuration returns an initialize error without creating a mirror', async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'bookmarks-no-fallback-'));
   const run = spawnLive('unused', {

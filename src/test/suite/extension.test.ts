@@ -18,6 +18,14 @@ import { loadRecentlyViewed } from '../../recentlyViewed';
 import { FakeMemento, fakeTab, FakeOutput } from './fixtures';
 
 suite('Extension activation', () => {
+  test('normal activation returns no public API and exposes no packaged state commands', async () => {
+    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus')!;
+    assert.strictEqual(await ext.activate(), undefined);
+    const commands = await vscode.commands.getCommands(true);
+    for (const command of ['bookmarks.test.resolveMcpServerDefinition', 'bookmarks.test.getScopedBookmarkState']) {
+      assert.strictEqual(commands.includes(command), false);
+    }
+  });
   test('extension is present and activates', async () => {
     const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus');
     assert.ok(ext, 'extension not found — check "publisher"/"name" in package.json');

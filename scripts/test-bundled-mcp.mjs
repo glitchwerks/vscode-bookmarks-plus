@@ -163,6 +163,24 @@ test('isolated MCP bundle initializes with its own version and lists both tools'
       toolsResponse.result.tools.map(({ name }) => name).sort(),
       ['add_bookmark', 'list_bookmarks'],
     );
+    const listed = await client.request('tools/call', { name: 'list_bookmarks', arguments: {} });
+    assert.deepEqual(listed.result.structuredContent, {
+      workspacePath: workspaceDir,
+      mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+      version: 1, collections: [], items: [],
+    });
+    const added = await client.request('tools/call', {
+      name: 'add_bookmark', arguments: { type: 'file', uri: 'file:///standalone-target' },
+    });
+    const payload = added.result.structuredContent;
+    assert.equal(typeof payload.id, 'string');
+    assert.deepEqual(payload, {
+      id: payload.id, scope: 'workspace', collection: null,
+      mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+    });
+    const afterAdd = await client.request('tools/call', { name: 'list_bookmarks', arguments: {} });
+    assert.deepEqual(afterAdd.result.structuredContent.items.map(item => [item.id, item.uri, item.scope]),
+      [[payload.id, 'file:///standalone-target', 'workspace']]);
     client.assertNoStdoutNoise();
   } finally {
     await client.stop();

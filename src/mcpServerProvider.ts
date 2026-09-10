@@ -20,8 +20,8 @@ interface McpProviderDependencies {
     provider: vscode.McpServerDefinitionProvider
   ) => vscode.Disposable;
   onDidChangePartitions: (listener: () => void) => vscode.Disposable;
-  isBridgeReady?: () => boolean;
-  issueGrant?: (
+  isBridgeReady: () => boolean;
+  issueGrant: (
     rootUri: string,
     scopes: readonly BookmarkScope[]
   ) => IssuedLiveBridgeGrant;
@@ -109,7 +109,7 @@ export function registerBookmarksMcpProvider(
       ),
     resolveMcpServerDefinition: (definition, token) => {
       const rootUri = resolveAttachedRoot(definition, deps.getAttachedRoots);
-      if (!rootUri || !deps.isBridgeReady?.() || !deps.issueGrant) {
+      if (!rootUri || !deps.isBridgeReady()) {
         return undefined;
       }
 

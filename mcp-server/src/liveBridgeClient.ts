@@ -98,6 +98,11 @@ export class LiveMcpBridgeClient {
     await this.socketClosed;
   }
 
+  /** Settles once the authenticated connection has closed and released its socket listeners. */
+  get closed(): Promise<void> {
+    return this.socketClosed;
+  }
+
   /** Installs the one-shot deadline before initiating connection establishment. */
   private start(config: LiveBridgeConfig, timeoutMs: number): void {
     this.deadline = performance.now() + timeoutMs;

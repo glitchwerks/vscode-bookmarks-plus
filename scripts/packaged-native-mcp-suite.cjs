@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { existsSync, readFileSync, realpathSync, writeFileSync } = require('node:fs');
+const { existsSync, realpathSync, writeFileSync } = require('node:fs');
 const path = require('node:path');
 const vscode = require('vscode');
 
@@ -10,16 +10,12 @@ const { createJsonRpcClient } = require('./mcp-json-rpc.cjs');
 
 const EXTENSION_ID = 'cbeaulieu-gt.vscode-bookmarks-plus';
 const MCP_TEST_DEFINITIONS_COMMAND = 'bookmarks.test.getMcpServerDefinitions';
-const MIRROR_RELATIVE_PATH = path.join('.vscode', 'bookmarks.json');
-const MIRROR_ADOPTION_WINDOW_MS = 1_000;
+const MCP_TEST_RESOLVE_COMMAND = 'bookmarks.test.resolveMcpServerDefinition';
+const MCP_TEST_STATE_COMMAND = 'bookmarks.test.getScopedBookmarkState';
 
 function canonicalPath(value) {
   const resolved = realpathSync(value);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
-}
-
-function readMirror(mirrorPath) {
-  return JSON.parse(readFileSync(mirrorPath, 'utf8'));
 }
 
 function toolPayload(response) {
@@ -84,25 +80,29 @@ async function run() {
     'VS Code must load the extension extracted from the packaged VSIX',
   );
 
-  await extension.activate();
+  assert.equal(await extension.activate(), undefined, 'activation must expose no public API');
 
   const folders = vscode.workspace.workspaceFolders;
-  assert.equal(folders?.length, 1, 'the packaged MCP test requires one workspace folder');
-  assert.equal(canonicalPath(folders[0].uri.fsPath), canonicalPath(expectedWorkspacePath));
+  assert.equal(folders?.length, 2, 'an anchor folder keeps the host alive when the selected folder is removed');
+  assert.equal(canonicalPath(folders[1].uri.fsPath), canonicalPath(expectedWorkspacePath));
 
-  const workspacePath = folders[0].uri.fsPath;
-  const mirrorPath = path.join(workspacePath, MIRROR_RELATIVE_PATH);
+  const workspacePath = folders[1].uri.fsPath;
   const targetPath = path.join(workspacePath, 'packaged-mcp-target.txt');
   const targetUri = vscode.Uri.file(targetPath);
   const definitions = await vscode.commands.executeCommand(MCP_TEST_DEFINITIONS_COMMAND);
   assert.ok(Array.isArray(definitions), 'normal activation must expose registered MCP definitions');
-  assert.equal(definitions.length, 1, 'a single-root workspace must register one MCP server');
-  const definition = definitions[0];
+  assert.equal(definitions.length, 2, 'each attached root must register one MCP server');
+  assert.ok(definitions.every(value => value.env.BOOKMARKS_PLUS_BRIDGE_TOKEN === undefined));
+  const selected = definitions.find(value => canonicalPath(value.args[1]) === canonicalPath(workspacePath));
+  assert.ok(selected, 'enumeration must identify the selected workspace');
+  const rootUri = selected.env.BOOKMARKS_PLUS_ROOT_URI;
+  const definition = await vscode.commands.executeCommand(MCP_TEST_RESOLVE_COMMAND, rootUri);
+  assert.ok(definition, 'native launch must resolve a fresh bridge grant');
   assert.ok(
     definition instanceof vscode.McpStdioServerDefinition,
     'the registered MCP server must use stdio',
   );
-  assert.equal(definition.label, 'Bookmarks Plus');
+  assert.equal(definition.label, 'Bookmarks Plus (workspace)');
   assert.equal(definition.version, extension.packageJSON.version);
 
   const [bundlePath, definedWorkspacePath] = definition.args;
@@ -110,21 +110,18 @@ async function run() {
   assert.equal(canonicalPath(definedWorkspacePath), canonicalPath(workspacePath));
   writeFileSync(targetPath, 'packaged MCP integration target\n');
 
-  await waitUntil('the packaged extension mirror initialization', () => existsSync(mirrorPath));
-
-  const childEnv = { ...process.env };
-  for (const [key, value] of Object.entries(definition.env)) {
-    if (value === null) {
-      delete childEnv[key];
-    } else {
-      childEnv[key] = String(value);
+  const launch = (resolved) => {
+    const childEnv = { ...process.env };
+    for (const [key, value] of Object.entries(resolved.env)) {
+      if (value === null) delete childEnv[key];
+      else childEnv[key] = String(value);
     }
-  }
-  const child = spawn(definition.command, definition.args, {
-    cwd: definition.cwd?.fsPath ?? extension.extensionPath,
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+    return spawn(resolved.command, resolved.args, {
+      cwd: resolved.cwd?.fsPath ?? extension.extensionPath,
+      env: childEnv, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  };
+  const child = launch(definition);
   const client = createJsonRpcClient(child, { timeoutMs: 15_000 });
 
   try {
@@ -152,6 +149,8 @@ async function run() {
       arguments: {},
     }));
     assert.deepEqual(initialList.items, []);
+    assert.deepEqual(initialList.grantedScopes, ['workspace', 'global']);
+    assert.equal(Object.hasOwn(initialList, 'mirrorPath'), false);
 
     const added = toolPayload(await client.request('tools/call', {
       name: 'add_bookmark',
@@ -162,19 +161,22 @@ async function run() {
       },
     }));
     assert.equal(typeof added.id, 'string');
-
-    await waitUntil('the MCP-written bookmark to appear in the mirror', () =>
-      readMirror(mirrorPath).items.some((item) => item.id === added.id),
-    );
-
-    // The store is closure-private, so there is no supported readiness signal for watcher
-    // adoption. Allow filesystem delivery plus the 150 ms debounce to settle, then mutate once;
-    // a missed adoption must fail instead of being masked by repeated remove commands.
-    await new Promise((resolve) => setTimeout(resolve, MIRROR_ADOPTION_WINDOW_MS));
+    assert.equal(added.scope, 'workspace');
+    assert.equal(Object.hasOwn(added, 'mirrorPath'), false);
+    const globalUri = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'global-target.txt'));
+    const globalAdded = toolPayload(await client.request('tools/call', {
+      name: 'add_bookmark', arguments: { uri: globalUri.toString(), type: 'file', scope: 'global' },
+    }));
+    assert.equal(globalAdded.scope, 'global');
+    assert.equal(Object.hasOwn(globalAdded, 'mirrorPath'), false);
+    const state = await vscode.commands.executeCommand(MCP_TEST_STATE_COMMAND, rootUri);
+    assert.deepEqual(state.workspace.items.map(item => item.id), [added.id]);
+    assert.deepEqual(state.global.items.map(item => item.id), [globalAdded.id]);
+    const populated = toolPayload(await client.request('tools/call', { name: 'list_bookmarks', arguments: {} }));
+    assert.deepEqual(populated.items.map(item => [item.id, item.scope]), [[added.id, 'workspace'], [globalAdded.id, 'global']]);
+    assert.equal(Object.hasOwn(populated, 'mirrorPath'), false);
     await vscode.commands.executeCommand('bookmarks.remove', targetUri);
-    await waitUntil('the packaged extension removal to reach the mirror', () =>
-      !readMirror(mirrorPath).items.some((item) => item.id === added.id),
-    );
+    await vscode.commands.executeCommand('bookmarks.remove', globalUri);
 
     const finalList = toolPayload(await client.request('tools/call', {
       name: 'list_bookmarks',
@@ -182,6 +184,36 @@ async function run() {
     }));
     assert.deepEqual(finalList.items, []);
     client.assertNoStdoutNoise();
+
+    assert.equal(vscode.workspace.updateWorkspaceFolders(1, 1), true);
+    await waitUntil('VS Code to remove the selected root', () => vscode.workspace.workspaceFolders.length === 1);
+    await waitUntil('selected-root reconciliation', async () =>
+      (await vscode.commands.executeCommand(MCP_TEST_DEFINITIONS_COMMAND)).length === 1);
+    await waitUntil('selected-root removal to close the native child', () => child.exitCode !== null && child.stdout.readableEnded);
+    assert.equal(child.exitCode, 0);
+    client.assertNoStdoutNoise();
+
+    // Use the packaged module's existing lifecycle export; no extra production test command.
+    const remaining = (await vscode.commands.executeCommand(MCP_TEST_DEFINITIONS_COMMAND))[0];
+    const retained = await vscode.commands.executeCommand(MCP_TEST_RESOLVE_COMMAND, remaining.env.BOOKMARKS_PLUS_ROOT_URI);
+    assert.ok(retained, 'capture an unused live grant before shutdown');
+    const loadedExtension = Object.values(require.cache).find(module =>
+      module.filename.endsWith(`${path.sep}dist${path.sep}extension.js`) &&
+      canonicalPath(module.filename) === canonicalPath(path.join(extension.extensionPath, 'dist', 'extension.js')));
+    assert.ok(loadedExtension, 'the packaged extension must already be present in the module cache');
+    await loadedExtension.exports.deactivate();
+    const stoppedDefinition = await vscode.commands.executeCommand(MCP_TEST_RESOLVE_COMMAND, remaining.env.BOOKMARKS_PLUS_ROOT_URI);
+    assert.ok(stoppedDefinition === undefined, 'resolution must fail after stopping the active extension bridge');
+    const unavailableChild = launch(retained);
+    const unavailable = createJsonRpcClient(unavailableChild, { timeoutMs: 15_000 });
+    try {
+      await assert.rejects(unavailable.request('initialize', {
+        protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'closed-bridge-test', version: '1.0.0' },
+      }), error => error.data?.bookmarksPlusCode === 'bridge-unavailable');
+      await waitUntil('unavailable native startup to exit', () => unavailableChild.exitCode !== null);
+      assert.notEqual(unavailableChild.exitCode, 0);
+      unavailable.assertNoStdoutNoise();
+    } finally { await unavailable.stop(); }
   } catch (error) {
     const stderr = client.getStderr().trim();
     if (stderr.length > 0 && error instanceof Error && !error.message.includes('stderr:')) {

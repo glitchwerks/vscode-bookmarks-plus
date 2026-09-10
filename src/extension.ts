@@ -27,6 +27,7 @@ import {
   GitExtensionExports
 } from './gitInfo';
 import { registerBookmarksMcpProvider } from './mcpServerProvider';
+import { LiveMcpBridgeService, LiveMcpBridgeServiceOptions } from './liveMcpBridgeService';
 import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
 import {
   loadRecentlyViewed,
@@ -43,9 +44,12 @@ const EXPLORER_DECORATION_ENABLED_KEY = 'bookmarksPlus.explorerDecoration.enable
 const SUGGESTIONS_MAX_ITEMS_KEY = 'bookmarksPlus.suggestions.maxItems';
 const SUGGESTIONS_MAX_ITEMS_DEFAULT = 10;
 const MCP_TEST_DEFINITIONS_COMMAND = 'bookmarks.test.getMcpServerDefinitions';
+const MCP_TEST_RESOLVE_COMMAND = 'bookmarks.test.resolveMcpServerDefinition';
+const MCP_TEST_STATE_COMMAND = 'bookmarks.test.getScopedBookmarkState';
 
 let activeRuntime: {
   store: WorkspaceBookmarkStore; globalStore: BookmarkStore; mirrors: WorkspaceMirrorCoordinator;
+  bridge?: LiveMcpBridgeService;
   output: OutputSink; pending: Promise<void>; stopping: boolean;
 } | undefined;
 
@@ -59,6 +63,8 @@ export interface McpActivationDependencies {
   createOutputChannel?: () => vscode.OutputChannel;
   createMirrorResources?: (root: vscode.Uri) => PartitionMirrorResources;
   registerCommands?: typeof registerCommands;
+  isWorkspaceTrusted?: () => boolean;
+  startLiveBridge?: (options: LiveMcpBridgeServiceOptions) => Promise<LiveMcpBridgeService>;
 }
 
 function createCacheResolver(getGitApi: GitApiFactory): ResolveFn {
@@ -297,7 +303,9 @@ export async function activate(
   const mirrorCoordinator = new WorkspaceMirrorCoordinator({
     store, output, createResources: mcpDeps.createMirrorResources ?? createPartitionMirrorResources
   });
-  const runtime = { store, globalStore, mirrors: mirrorCoordinator, output, pending: Promise.resolve(), stopping: false };
+  const runtime: NonNullable<typeof activeRuntime> = {
+    store, globalStore, mirrors: mirrorCoordinator, output, pending: Promise.resolve(), stopping: false
+  };
   activeRuntime = runtime;
   if (store.getView().kind === 'ready') {
     await store.reconcileRoots(toRootCandidates(folders));
@@ -314,6 +322,29 @@ export async function activate(
   }
   // No await between draining the buffer and switching to the live listener.
   initializing = false;
+
+  const getAvailableRoots = () => {
+    const view = store.getView();
+    const unavailable = new Set(view.unavailableRoots);
+    return view.attached.filter(root => !unavailable.has(root.canonicalRootUri));
+  };
+  const getAttachedRoot: LiveMcpBridgeServiceOptions['getAttachedRoot'] = canonicalRootUri => {
+    const root = getAvailableRoots().find(value => value.canonicalRootUri === canonicalRootUri);
+    return root ? { rootUri: root.rootUri, canonicalRootUri: root.canonicalRootUri,
+      owner: { kind: 'partition', partitionId: root.partitionId } } : undefined;
+  };
+  const trusted = (mcpDeps.isWorkspaceTrusted ?? (() => vscode.workspace.isTrusted))();
+  if (trusted) {
+    try {
+      runtime.bridge = await (mcpDeps.startLiveBridge ?? LiveMcpBridgeService.start)({
+        workspaceStore: store, globalStore, output, getAttachedRoot,
+        editorSessionId: vscode.env.sessionId, extensionId: context.extension.id
+      });
+      context.subscriptions.push(store.onDidChangePartitions(() => runtime.bridge?.refreshAvailableRoots()));
+    } catch {
+      output.appendLine('Bookmarks Plus: live MCP bridge startup failed.');
+    }
+  }
 
   let provider: BookmarksTreeDataProvider | undefined = undefined;
   const getGitApi = createGitApiFactory(
@@ -353,26 +384,25 @@ export async function activate(
     dragAndDropController: provider,
     showCollapseAll: true
   });
+  // Store and mirror disposal belongs to async deactivate, after bridge requests drain.
   context.subscriptions.push(
     output,
-    treeView,
-    { dispose: () => store.dispose() },
-    { dispose: () => globalStore.dispose() }
+    treeView
   );
 
-  const mcpProvider = registerBookmarksMcpProvider(context.subscriptions, {
+  const mcpProvider = trusted ? registerBookmarksMcpProvider(context.subscriptions, {
     ...mcpDeps,
-    getAttachedRoots: () => {
-      const view = store.getView();
-      const unavailable = new Set(view.unavailableRoots);
-      return view.attached.filter(root => !unavailable.has(root.canonicalRootUri))
-        .map(root => ({ uri: vscode.Uri.parse(root.rootUri), name: root.label }));
+    getAttachedRoots: () => getAvailableRoots().map(root => ({ uri: vscode.Uri.parse(root.rootUri), name: root.label })),
+    isBridgeReady: () => !runtime.stopping && runtime.bridge !== undefined,
+    issueGrant: (rootUri, scopes) => {
+      if (runtime.stopping || !runtime.bridge) throw new Error('bridge-unavailable');
+      return runtime.bridge.issueGrant(rootUri, scopes);
     },
     onDidChangePartitions: listener => store.onDidChangePartitions(listener),
     extensionUri: context.extensionUri,
     extensionVersion: String(context.extension.packageJSON.version),
     output
-  });
+  }) : undefined;
   // VS Code has no public API for tests to enumerate registered MCP definitions. Expose the
   // definition only inside the packaged test host, after the real registration path succeeds.
   if (process.env.BOOKMARKS_PACKAGED_MCP_TEST === '1' && mcpProvider) {
@@ -384,6 +414,20 @@ export async function activate(
         } finally {
           cancellation.dispose();
         }
+      }),
+      vscode.commands.registerCommand(MCP_TEST_RESOLVE_COMMAND, async (rootUri: string) => {
+        const cancellation = new vscode.CancellationTokenSource();
+        try {
+          const definitions = await mcpProvider.provideMcpServerDefinitions(cancellation.token);
+          const definition = definitions?.find(value => value.env.BOOKMARKS_PLUS_ROOT_URI === rootUri);
+          return definition ? await mcpProvider.resolveMcpServerDefinition!(definition, cancellation.token) : undefined;
+        } finally {
+          cancellation.dispose();
+        }
+      }),
+      vscode.commands.registerCommand(MCP_TEST_STATE_COMMAND, (rootUri: string) => {
+        const root = getAttachedRoot(rootUri);
+        return root ? { workspace: store.getOwnerData(root.owner), global: globalStore.getAll() } : undefined;
       })
     );
   }
@@ -430,7 +474,6 @@ export async function activate(
   });
 
   context.subscriptions.push(
-    mirrorCoordinator,
     store.onDidChangePartitions(() => provider?.refresh())
   );
   (mcpDeps.registerCommands ?? registerCommands)(context, stores, provider, mirrorCoordinator, output);
@@ -473,13 +516,14 @@ function createPartitionMirrorResources(root: vscode.Uri): PartitionMirrorResour
   };
 }
 
-/** Flushes every root before retiring the active workspace and Global resources. */
+/** Stops live access, drains admitted store work, then flushes and disposes owned resources. */
 export async function deactivate(): Promise<void> {
   const runtime = activeRuntime;
   activeRuntime = undefined;
   if (!runtime) return;
   runtime.stopping = true;
   await runtime.pending;
+  await runtime.bridge?.stop();
   try { await runtime.mirrors.drainAndFlush(); }
   catch { runtime.output.appendLine('Bookmarks Plus: workspace mirror flush failed.'); }
   for (const resource of [runtime.mirrors, runtime.store, runtime.globalStore]) {

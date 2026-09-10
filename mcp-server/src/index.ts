@@ -145,6 +145,8 @@ export async function runServer(
     });
     // EOF can arrive during authentication; never create or expose a server after closure.
     if (closed) { await client.close(); return; }
+    // Only authenticated clients reach this subscription; startup failures keep their error path.
+    void client.closed.then(onInputEnd);
     backend = new LiveBookmarkBackend(client);
     const server = createServer(backend);
     await server.connect(gate);

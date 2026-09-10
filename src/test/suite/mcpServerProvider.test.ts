@@ -4,7 +4,7 @@ import {
   buildMcpServerDefinitions,
   registerBookmarksMcpProvider
 } from '../../mcpServerProvider';
-import { activate } from '../../extension';
+import { activate, deactivate } from '../../extension';
 import { createFakeExtensionContext, FakeOutput } from './fixtures';
 
 const NO_CANCELLATION = { isCancellationRequested: false } as vscode.CancellationToken;
@@ -275,6 +275,15 @@ suite('MCP server definitions (#126)', () => {
     assert.strictEqual(fixture.revokeCount, 0);
   });
 
+  test('revokes exactly once when copying a definition fails after grant issuance', async () => {
+    const fixture = createLiveProviderFixture();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(NO_CANCELLATION))![0];
+    Object.defineProperty(enumerated, 'args', { get() { throw new Error('cannot read args'); } });
+    assert.strictEqual(await fixture.provider.resolveMcpServerDefinition!(enumerated, NO_CANCELLATION), undefined);
+    assert.strictEqual(fixture.grants.length, 1);
+    assert.strictEqual(fixture.revokeCount, 1);
+  });
+
   test('registration publishes definitions, refreshes on workspace changes, and owns its resources', async () => {
     const subscriptions: vscode.Disposable[] = [];
     const output = new FakeOutput();
@@ -288,6 +297,8 @@ suite('MCP server definitions (#126)', () => {
     let listenerDisposeCount = 0;
 
     const registered = registerBookmarksMcpProvider(subscriptions, {
+      isBridgeReady: () => false,
+      issueGrant: () => { throw new Error('bridge-unavailable'); },
       getAttachedRoots: () => folders,
       extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
       extensionVersion: '1.3.0',
@@ -362,6 +373,8 @@ suite('MCP server definitions (#126)', () => {
     let registered: vscode.McpServerDefinitionProvider | undefined;
     assert.doesNotThrow(() => {
       registered = registerBookmarksMcpProvider(subscriptions, {
+        isBridgeReady: () => false,
+        issueGrant: () => { throw new Error('bridge-unavailable'); },
         getAttachedRoots: () => [{ uri: vscode.Uri.file('/workspaces/project') }],
         extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
         extensionVersion: '1.3.0',
@@ -397,6 +410,8 @@ suite('MCP server definitions (#126)', () => {
     try {
       try {
         await activate(context as unknown as vscode.ExtensionContext, {
+          isWorkspaceTrusted: () => true,
+          startLiveBridge: async () => { throw new Error('no listener required for enumeration'); },
           getWorkspaceFolders: () => [{ uri: workspaceUri, name: 'activation-project', index: 0 }],
           registerProvider: (id: string, provider: vscode.McpServerDefinitionProvider) => {
             registeredId = id;
@@ -428,6 +443,7 @@ suite('MCP server definitions (#126)', () => {
       >('bookmarks.test.getMcpServerDefinitions');
       assert.deepStrictEqual(observedDefinitions, definitions);
     } finally {
+      await deactivate();
       context.subscriptions.forEach((subscription) => subscription.dispose());
       if (previousPackagedTest === undefined) {
         delete process.env.BOOKMARKS_PACKAGED_MCP_TEST;
