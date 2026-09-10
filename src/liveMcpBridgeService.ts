@@ -191,6 +191,12 @@ export class LiveMcpBridgeService {
           const message = decodeClientBridgeMessage(JSON.parse(frame));
           const session = this.sessions.get(socket);
           if (message.kind === 'request' && session) {
+            // UTF-8 replacement can expand a decoded ID beyond the raw inbound frame budget.
+            if (encodeSizeError(message.id) === undefined) {
+              terminal = true;
+              socket.destroy();
+              return;
+            }
             const duplicate = requestIds.has(message.id) || message.id.trim().length === 0;
             requestIds.add(message.id);
             this.admitRequest(socket, session, message, duplicate);
@@ -239,15 +245,20 @@ export class LiveMcpBridgeService {
         }
       }
       if (!socket.destroyed && socket.writable) {
-        const frame = encodeBridgeMessage(response);
-        socket.write(Buffer.byteLength(frame, 'utf8') - 1 > MAX_LIVE_BRIDGE_FRAME_BYTES
-          ? encodeBridgeMessage({ kind: 'response', id: request.id,
-            error: { code: 'payload-too-large', message: 'payload-too-large' } })
-          : frame);
+        let frame: string | undefined = encodeBridgeMessage(response);
+        if (Buffer.byteLength(frame, 'utf8') - 1 > MAX_LIVE_BRIDGE_FRAME_BYTES) {
+          frame = encodeSizeError(request.id);
+        }
+        if (frame === undefined) { socket.destroy(); return; }
+        socket.write(frame);
       }
+    }).catch(() => {
+      // Encoding, writing, or even the diagnostic sink may fail. Settle this tail so
+      // already admitted operations still execute and shutdown can drain their commits.
+      socket.destroy();
     });
     this.requestTails.set(socket, tail);
-    void tail.finally(() => {
+    void tail.then(() => {
       if (this.requestTails.get(socket) === tail) { this.requestTails.delete(socket); }
     });
   }
@@ -419,6 +430,13 @@ function validateAddParams(params: Record<string, unknown>): AddItemInput & { sc
   try { vscode.Uri.parse(params.uri, true); }
   catch { throw new BridgeProtocolError('invalid-request', 'Invalid bookmark URI.'); }
   return params as unknown as AddItemInput & { scope?: BookmarkScope; collectionName?: string };
+}
+
+/** Encodes a correlated fallback only if its complete UTF-8 frame fits the protocol limit. */
+function encodeSizeError(id: string): string | undefined {
+  const frame = encodeBridgeMessage({ kind: 'response', id,
+    error: { code: 'payload-too-large', message: 'payload-too-large' } });
+  return Buffer.byteLength(frame, 'utf8') - 1 <= MAX_LIVE_BRIDGE_FRAME_BYTES ? frame : undefined;
 }
 
 /** Narrows filesystem and socket errors without exposing their paths in diagnostics. */

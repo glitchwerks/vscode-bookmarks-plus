@@ -47,10 +47,14 @@ async function hello(grant: IssuedLiveBridgeGrant, overrides: Record<string, unk
   const response = new Promise<Partial<Omit<BridgeReady, 'kind'>> & { kind?: string; error?: BridgeResponse['error'] }>((resolve, reject) => {
     let buffer = '';
     socket.on('error', reject);
-    socket.on('data', chunk => {
+    const onData = (chunk: Buffer) => {
       buffer += chunk.toString();
-      if (buffer.includes('\n')) { resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n')))); }
-    });
+      if (buffer.includes('\n')) {
+        socket.off('data', onData);
+        resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n'))));
+      }
+    };
+    socket.on('data', onData);
     socket.on('end', () => reject(new Error('Bridge ended before responding')));
   });
   socket.on('connect', () => socket.write(JSON.stringify({
@@ -316,6 +320,125 @@ suite('LiveMcpBridgeService authentication', () => {
     assert.strictEqual(response.error?.code, 'payload-too-large');
     assert.strictEqual(response.result, undefined);
     assert.strictEqual((await request(socket, sessionId, 'add', { uri: ROOT + '/small', type: 'file' })).error, undefined);
+  });
+
+  for (const fault of ['encoding', 'writing', 'diagnostics'] as const) {
+    test(`contains response ${fault} failures while draining admitted work without unhandled rejections`, async () => {
+      const bridge = await LiveMcpBridgeService.start({ ...options, editorSessionId: randomUUID() });
+      const { socket, message } = await authenticate(bridge.issueGrant(ROOT, ['global']));
+      const serverSocket = [...(bridge as unknown as { sockets: Set<net.Socket> }).sockets][0];
+      const originalRead = globalStore.getAll.bind(globalStore);
+      const originalWrite = serverSocket.write;
+      const originalLog = options.output.appendLine;
+      const update = globalState.update.bind(globalState);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let signalFault!: () => void;
+      const faultReached = new Promise<void>(resolve => { signalFault = resolve; });
+      const unhandled: unknown[] = [];
+      const recordRejection = (reason: unknown) => { unhandled.push(reason); };
+      process.on('unhandledRejection', recordRejection);
+      const fail = () => { signalFault(); throw new Error('injected response fault'); };
+      if (fault === 'encoding') {
+        const collection = { id: 'poison', name: 'Encoding fault', order: 0, toJSON: fail };
+        globalStore.getAll = () => ({ ...originalRead(), collections: [collection] });
+      } else if (fault === 'writing') {
+        serverSocket.write = fail;
+      } else {
+        let firstRead = true;
+        globalStore.getAll = () => {
+          if (firstRead) { firstRead = false; throw new Error('injected store fault'); }
+          return originalRead();
+        };
+        options.output.appendLine = fail;
+      }
+      globalState.update = async (key, value) => { await gate; await update(key, value); };
+      try {
+        // One chunk admits both frames before either queued callback can run.
+        const envelope = { kind: 'request', sessionId: message.sessionId, workspaceFolderUri: ROOT };
+        socket.write([
+          JSON.stringify({ ...envelope, id: 'first', method: 'list', params: {} }),
+          JSON.stringify({ ...envelope, id: 'second', method: 'add', params: { type: 'file', uri: ROOT + '/after-fault' } })
+        ].join('\n') + '\n');
+        await faultReached;
+        await new Promise(resolve => setTimeout(resolve, 25));
+        assert.ok(socket.destroyed, 'response failure must close its connection before stop is called');
+        const stopping = bridge.stop();
+        assert.strictEqual(bridge.stop(), stopping);
+        let settled = false;
+        // Install both handlers immediately so a rejected stop is observed, not unhandled by the test.
+        const outcome = stopping.then(() => { settled = true; return undefined; }, error => { settled = true; return error; });
+        await new Promise(resolve => setTimeout(resolve, 25));
+        assert.strictEqual(settled, false, 'stop must await the second admitted persistence');
+        release();
+        assert.strictEqual(await outcome, undefined, 'stop must complete successfully');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(originalRead().items.map(item => item.uri), [ROOT + '/after-fault']);
+        assert.deepStrictEqual(unhandled, []);
+        await bridge.stop();
+      } finally {
+        release();
+        serverSocket.write = originalWrite;
+        options.output.appendLine = originalLog;
+        globalStore.getAll = originalRead;
+        globalState.update = update;
+        socket.destroy();
+        await bridge.stop().catch(() => {});
+        await new Promise(resolve => setImmediate(resolve));
+        process.off('unhandledRejection', recordRejection);
+      }
+    });
+  }
+
+  test('rejects expanded encoded request IDs before admission without emitting an oversized fallback', async () => {
+    const originalRead = globalStore.getAll.bind(globalStore);
+    let reads = 0;
+    globalStore.getAll = () => { reads++; return originalRead(); };
+    const overhead = Buffer.byteLength('{"kind":"response","id":"","error":{"code":"payload-too-large","message":"payload-too-large"}}');
+    // Cover the reported six-to-eighteen MiB expansion and the exact one-byte-over boundary.
+    for (const decodedBytes of [18 * 1024 * 1024, MAX_LIVE_BRIDGE_FRAME_BYTES - overhead + 1]) {
+      const { socket, sessionId } = await client(['global']);
+      const observed = new Promise<'closed' | 'response'>(resolve => {
+        socket.once('close', () => resolve('closed'));
+        socket.once('data', () => resolve('response'));
+      });
+      const raw = Buffer.concat([
+        Buffer.from('{"kind":"request","id":"'), Buffer.alloc(Math.floor(decodedBytes / 3), 0x80),
+        Buffer.from('a'.repeat(decodedBytes % 3)),
+        Buffer.from(`","sessionId":${JSON.stringify(sessionId)},"workspaceFolderUri":${JSON.stringify(ROOT)},"method":"list","params":{}}\n`)
+      ]);
+      assert.ok(raw.length < MAX_LIVE_BRIDGE_FRAME_BYTES);
+      socket.write(raw);
+      assert.strictEqual(await observed, 'closed');
+      assert.strictEqual(reads, 0, 'an ID which cannot fit a correlated response must never reach stores');
+    }
+  });
+
+  test('accepts an expanded request ID whose correlated fallback is exactly the frame limit', async () => {
+    const { socket, sessionId } = await client(['global']);
+    const overhead = Buffer.byteLength('{"kind":"response","id":"","error":{"code":"payload-too-large","message":"payload-too-large"}}');
+    const idBytes = MAX_LIVE_BRIDGE_FRAME_BYTES - overhead;
+    const invalidBytes = Math.floor(idBytes / 3);
+    const suffix = 'a'.repeat(idBytes % 3);
+    let bytes = 0;
+    const chunks: Buffer[] = [];
+    const received = new Promise<BridgeResponse>((resolve, reject) => {
+      socket.once('close', () => reject(new Error('Exact-limit response was disconnected')));
+      socket.on('data', chunk => {
+        bytes += chunk.length; chunks.push(chunk);
+        if (chunk[chunk.length - 1] === 0x0a) { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+      });
+    });
+    socket.write(Buffer.concat([
+      Buffer.from('{"kind":"request","id":"'), Buffer.alloc(invalidBytes, 0x80), Buffer.from(suffix),
+      Buffer.from(`","sessionId":${JSON.stringify(sessionId)},"workspaceFolderUri":${JSON.stringify(ROOT)},"method":"list","params":{}}\n`)
+    ]));
+    const response = await received;
+    assert.strictEqual(response.error?.code, 'payload-too-large');
+    assert.strictEqual(bytes - 1, MAX_LIVE_BRIDGE_FRAME_BYTES);
+    assert.strictEqual(response.id.length, invalidBytes + suffix.length);
+    assert.ok(response.id.startsWith('\uFFFD'));
+    assert.strictEqual(response.result, undefined);
   });
 
   test('malformed envelopes close only their connection before touching stores', async () => {
