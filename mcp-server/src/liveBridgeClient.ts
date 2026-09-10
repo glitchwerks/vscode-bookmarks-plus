@@ -191,8 +191,9 @@ export class LiveMcpBridgeClient {
     this.resolveStartup = undefined;
     this.rejectStartup = undefined;
     const error = new BackendError('invalid-session', 'The live bridge session is closed.');
-    for (const pending of this.pending.values()) { pending.reject(error); }
+    const pendingRequests = [...this.pending.values()];
     this.pending.clear();
+    for (const pending of pendingRequests) { pending.reject(error); }
     this.socket?.removeAllListeners('connect');
     this.socket?.removeAllListeners('data');
     this.socket?.removeAllListeners('end');
