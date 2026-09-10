@@ -43,3 +43,8 @@ test('a disabled list handler returns its configured reason', async () => {
   assert.equal(result.isError, true);
   assert.equal((result.content[0] as { text: string }).text, 'No folder.');
 });
+
+test('list_bookmarks exposes no workspace-selecting input schema', () => {
+  const list = createListHandler(fakeBackend());
+  assert.deepEqual(Object.keys(list.inputSchema), []);
+});

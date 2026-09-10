@@ -97,7 +97,15 @@ export class MirrorBookmarkBackend implements BookmarkBackend {
     if (!first.survived) {
       const second = await this.addOnce(input);
       if (second instanceof BackendError) {
-        const retry = await this.readData();
+        let retry: BookmarkData;
+        try {
+          retry = await this.readData();
+        } catch (error: unknown) {
+          if (error instanceof BackendError && error.code === 'internal-error') {
+            throw second;
+          }
+          throw error;
+        }
         if (retry.items.some((item) => item.id === first.item.id)) {
           successful = { ...first, survived: true };
         } else {
@@ -122,7 +130,15 @@ export class MirrorBookmarkBackend implements BookmarkBackend {
   async close(): Promise<void> {}
 
   private async addOnce(input: AddBookmarkInput): Promise<{ item: BookmarkItem; collection: BookmarkCollection | null; survived: boolean } | BackendError> {
-    const data = await this.readData();
+    let data: BookmarkData;
+    try {
+      data = await this.readData();
+    } catch (error: unknown) {
+      if (error instanceof BackendError && error.code === 'internal-error') {
+        return error;
+      }
+      throw error;
+    }
     const collection = this.resolveCollection(input, data.collections);
     if (collection instanceof BackendError) {
       return collection;
@@ -144,8 +160,15 @@ export class MirrorBookmarkBackend implements BookmarkBackend {
       return { item, collection, survived: true };
     }
     await this.deps.sleep(this.config.verifyDelayMs);
-    const verification = await this.readData();
-    return { item, collection, survived: verification.items.some((candidate) => candidate.id === item.id) };
+    try {
+      const verification = await this.readData();
+      return { item, collection, survived: verification.items.some((candidate) => candidate.id === item.id) };
+    } catch (error: unknown) {
+      if (error instanceof BackendError && error.code === 'internal-error') {
+        return { item, collection, survived: false };
+      }
+      throw error;
+    }
   }
 
   private async readData(): Promise<BookmarkData> {
