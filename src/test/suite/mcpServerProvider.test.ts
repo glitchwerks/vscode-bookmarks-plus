@@ -7,6 +7,75 @@ import {
 import { activate } from '../../extension';
 import { createFakeExtensionContext, FakeOutput } from './fixtures';
 
+const NO_CANCELLATION = { isCancellationRequested: false } as vscode.CancellationToken;
+
+interface TestGrant {
+  readonly endpoint: string;
+  readonly protocolVersion: 1;
+  readonly generation: string;
+  readonly token: string;
+  revoke(): void;
+}
+
+interface LiveProviderFixture {
+  provider: vscode.McpServerDefinitionProvider<vscode.McpStdioServerDefinition>;
+  readonly root: vscode.Uri;
+  readonly grants: TestGrant[];
+  readonly issueRequests: { rootUri: string; scopes: readonly string[] }[];
+  roots: readonly { uri: vscode.Uri; name?: string }[] | undefined;
+  ready: boolean;
+  throwOnIssue: boolean;
+  revokeCount: number;
+  onIssueGrant?: () => void;
+}
+
+/** Registers a provider whose grant source mimics the bridge boundary without opening IPC. */
+function createLiveProviderFixture(): LiveProviderFixture {
+  const root = vscode.Uri.file('/workspaces/project');
+  const grants: TestGrant[] = [];
+  const fixture: LiveProviderFixture = {
+    provider: undefined!,
+    root,
+    grants,
+    issueRequests: [],
+    roots: [{ uri: root }],
+    ready: true,
+    throwOnIssue: false,
+    revokeCount: 0
+  };
+  let nextToken = 1;
+  const dependencies = {
+    getAttachedRoots: () => fixture.roots,
+    extensionUri: vscode.Uri.file('/extensions/bookmarks-plus'),
+    extensionVersion: '1.3.0',
+    output: new FakeOutput(),
+    registerProvider: (_id: string, provider: vscode.McpServerDefinitionProvider) => {
+      fixture.provider = provider as vscode.McpServerDefinitionProvider<vscode.McpStdioServerDefinition>;
+      return new vscode.Disposable(() => undefined);
+    },
+    onDidChangePartitions: () => new vscode.Disposable(() => undefined),
+    isBridgeReady: () => fixture.ready,
+    issueGrant: (rootUri: string, scopes: readonly string[]) => {
+      if (fixture.throwOnIssue) {
+        throw new Error('bridge-unavailable');
+      }
+      fixture.issueRequests.push({ rootUri, scopes: [...scopes] });
+      const grant: TestGrant = {
+        endpoint: 'bridge-endpoint',
+        protocolVersion: 1,
+        generation: 'bridge-generation',
+        token: `token-${nextToken++}`,
+        revoke: () => fixture.revokeCount++
+      };
+      grants.push(grant);
+      fixture.onIssueGrant?.();
+      return grant;
+    }
+  };
+  fixture.provider = registerBookmarksMcpProvider([], dependencies)!;
+  return fixture;
+}
+
 suite('MCP server definitions (#126)', () => {
   test('a single-root workspace launches the bundled server with an explicit workspace path', () => {
     const extensionUri = vscode.Uri.file('/extensions/bookmarks-plus');
@@ -28,7 +97,11 @@ suite('MCP server definitions (#126)', () => {
       vscode.Uri.joinPath(extensionUri, 'dist', 'bookmarks-plus-mcp.mjs').fsPath,
       workspaceUri.fsPath
     ]);
-    assert.deepStrictEqual(definition.env, { ELECTRON_RUN_AS_NODE: '1' });
+    assert.deepStrictEqual(definition.env, {
+      ELECTRON_RUN_AS_NODE: '1',
+      BOOKMARKS_PLUS_LIVE_MODE: '1',
+      BOOKMARKS_PLUS_ROOT_URI: 'file:///workspaces/project'
+    });
     assert.strictEqual(definition.version, '1.3.0');
   });
 
@@ -84,6 +157,122 @@ suite('MCP server definitions (#126)', () => {
     const labels = ['Bookmarks Plus (Shared — file:///alpha/shared)', 'Bookmarks Plus (Shared — file:///beta/shared)'];
     assert.deepStrictEqual(build(roots).map(value => value.label), labels);
     assert.deepStrictEqual(build([...roots].reverse()).map(value => value.label), [...labels].reverse());
+  });
+
+  test('enumerates a token-free definition and resolves fresh isolated bridge credentials', async () => {
+    const fixture = createLiveProviderFixture();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(
+      NO_CANCELLATION
+    ))![0];
+    enumerated.cwd = vscode.Uri.file('/workspaces');
+    const originalArgs = [...enumerated.args];
+    const originalEnv = { ...enumerated.env };
+    const resolve = fixture.provider.resolveMcpServerDefinition!;
+
+    const first = await resolve(enumerated, NO_CANCELLATION);
+    const second = await resolve(enumerated, NO_CANCELLATION);
+
+    assert.deepStrictEqual(enumerated.env, {
+      ELECTRON_RUN_AS_NODE: '1',
+      BOOKMARKS_PLUS_LIVE_MODE: '1',
+      BOOKMARKS_PLUS_ROOT_URI: 'file:///workspaces/project'
+    });
+    assert.deepStrictEqual(enumerated.args, originalArgs);
+    assert.notStrictEqual(first, enumerated);
+    assert.notStrictEqual(second, enumerated);
+    assert.notStrictEqual(first, second);
+    assert.ok(first instanceof vscode.McpStdioServerDefinition);
+    assert.ok(second instanceof vscode.McpStdioServerDefinition);
+    assert.strictEqual(first?.label, enumerated.label);
+    assert.strictEqual(first?.command, enumerated.command);
+    assert.strictEqual(first?.version, enumerated.version);
+    assert.strictEqual(first?.cwd, enumerated.cwd);
+    assert.notStrictEqual(first?.args, enumerated.args);
+    assert.notStrictEqual(second?.args, first?.args);
+    assert.notStrictEqual(first?.env, enumerated.env);
+    assert.notStrictEqual(second?.env, first?.env);
+    assert.deepStrictEqual(first?.env, {
+      ...originalEnv,
+      BOOKMARKS_PLUS_BRIDGE_ENDPOINT: 'bridge-endpoint',
+      BOOKMARKS_PLUS_BRIDGE_PROTOCOL: '1',
+      BOOKMARKS_PLUS_BRIDGE_GENERATION: 'bridge-generation',
+      BOOKMARKS_PLUS_BRIDGE_TOKEN: 'token-1'
+    });
+    assert.strictEqual(second?.env.BOOKMARKS_PLUS_BRIDGE_TOKEN, 'token-2');
+    assert.deepStrictEqual(fixture.issueRequests, [
+      { rootUri: 'file:///workspaces/project', scopes: ['workspace', 'global'] },
+      { rootUri: 'file:///workspaces/project', scopes: ['workspace', 'global'] }
+    ]);
+    second!.args.push('--mutated');
+    second!.env.MUTATED = 'yes';
+    assert.deepStrictEqual(first?.args, originalArgs);
+    assert.strictEqual((first!.env as Record<string, string | number | null>).MUTATED, undefined);
+  });
+
+  test('does not issue a grant when the enumerated root is no longer attached', async () => {
+    const fixture = createLiveProviderFixture();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(
+      NO_CANCELLATION
+    ))![0];
+    fixture.roots = [];
+
+    const resolved = await fixture.provider.resolveMcpServerDefinition!(
+      enumerated,
+      NO_CANCELLATION
+    );
+
+    assert.strictEqual(resolved, undefined);
+    assert.deepStrictEqual(fixture.grants, []);
+  });
+
+  test('fails closed when bridge readiness or grant issuance fails', async () => {
+    const fixture = createLiveProviderFixture();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(
+      NO_CANCELLATION
+    ))![0];
+    fixture.ready = false;
+    assert.strictEqual(
+      await fixture.provider.resolveMcpServerDefinition!(enumerated, NO_CANCELLATION),
+      undefined
+    );
+    assert.deepStrictEqual(fixture.grants, []);
+
+    fixture.ready = true;
+    fixture.throwOnIssue = true;
+    assert.strictEqual(
+      await fixture.provider.resolveMcpServerDefinition!(enumerated, NO_CANCELLATION),
+      undefined
+    );
+    assert.deepStrictEqual(fixture.grants, []);
+  });
+
+  test('revokes an issued grant when cancellation becomes observable before return', async () => {
+    const fixture = createLiveProviderFixture();
+    const cancellation = new vscode.CancellationTokenSource();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(
+      NO_CANCELLATION
+    ))![0];
+    fixture.onIssueGrant = () => cancellation.cancel();
+
+    const resolved = await fixture.provider.resolveMcpServerDefinition!(enumerated, cancellation.token);
+
+    assert.strictEqual(resolved, undefined);
+    assert.strictEqual(fixture.revokeCount, 1);
+    cancellation.dispose();
+  });
+
+  test('does not revoke a successfully returned unused grant', async () => {
+    const fixture = createLiveProviderFixture();
+    const enumerated = (await fixture.provider.provideMcpServerDefinitions(
+      NO_CANCELLATION
+    ))![0];
+    const resolved = await fixture.provider.resolveMcpServerDefinition!(
+      enumerated,
+      NO_CANCELLATION
+    );
+
+    assert.ok(resolved);
+    assert.strictEqual(fixture.revokeCount, 0);
   });
 
   test('registration publishes definitions, refreshes on workspace changes, and owns its resources', async () => {
