@@ -10,11 +10,36 @@ import { once } from 'node:events';
 import { BookmarkStore } from '../../bookmarkStore';
 import { WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
 import { LiveMcpBridgeService, IssuedLiveBridgeGrant, LiveMcpBridgeServiceOptions } from '../../liveMcpBridgeService';
-import { BookmarkScope } from '../../types';
-import { BridgeReady, BridgeResponse } from '../../liveMcpBridgeProtocol';
+import { BookmarkData, BookmarkScope } from '../../types';
+import { BridgeReady, BridgeResponse, MAX_LIVE_BRIDGE_FRAME_BYTES } from '../../liveMcpBridgeProtocol';
 import { FakeMemento, FakeOutput } from './fixtures';
 
 const ROOT = 'file:///workspace/a';
+
+/** Reads one correlated response, rejecting a silent disconnect rather than timing out. */
+function request(socket: net.Socket, sessionId: string, method = 'list',
+  params: Record<string, unknown> = {}, overrides: Record<string, unknown> = {}): Promise<BridgeResponse> {
+  const envelope = { kind: 'request', id: randomUUID(), sessionId, workspaceFolderUri: ROOT, method, params, ...overrides };
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const cleanup = () => {
+      clearTimeout(timer); socket.off('data', onData); socket.off('close', onClose);
+    };
+    const onClose = () => { cleanup(); reject(new Error('Bridge closed without a request response')); };
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const message = JSON.parse(buffer.slice(0, newline)) as BridgeResponse;
+        buffer = buffer.slice(newline + 1);
+        if (message.id === envelope.id) { cleanup(); resolve(message); return; }
+      }
+    };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Missing bridge response')); }, 2_000);
+    socket.on('data', onData); socket.once('close', onClose);
+    socket.write(JSON.stringify(envelope) + '\n');
+  });
+}
 
 /** Sends a real IPC hello and reads its first complete response. */
 async function hello(grant: IssuedLiveBridgeGrant, overrides: Record<string, unknown> = {}) {
@@ -43,6 +68,7 @@ suite('LiveMcpBridgeService authentication', () => {
   let currentRoot: ReturnType<LiveMcpBridgeServiceOptions['getAttachedRoot']>;
   let now: number;
   let tempDirectory: string;
+  let globalState: FakeMemento;
   const clients: net.Socket[] = [];
 
   setup(async () => {
@@ -52,7 +78,8 @@ suite('LiveMcpBridgeService authentication', () => {
       state: new FakeMemento(), output: new FakeOutput(),
       roots: [{ id: 'a', label: 'A', uri: vscode.Uri.parse(ROOT) }]
     });
-    globalStore = new BookmarkStore(new FakeMemento());
+    globalState = new FakeMemento();
+    globalStore = new BookmarkStore(globalState);
     currentRoot = { rootUri: ROOT, canonicalRootUri: ROOT,
       owner: { kind: 'partition', partitionId: workspaceStore.getView().attached[0].partitionId } };
     let randomSequence = 0;
@@ -79,6 +106,280 @@ suite('LiveMcpBridgeService authentication', () => {
     clients.push(result.socket);
     return result;
   }
+
+  /** Opens an authenticated client over the production listener. */
+  async function client(scopes: BookmarkScope[] = ['workspace', 'global']) {
+    const { socket, message } = await authenticate(service.issueGrant(ROOT, scopes));
+    assert.ok(message.sessionId);
+    return { socket, sessionId: message.sessionId };
+  }
+
+  test('lists workspace before global, preserving store order and decorating only granted records', async () => {
+    const owner = currentRoot!.owner;
+    await workspaceStore.addCollection(owner, 'Workspace first');
+    await workspaceStore.addCollection(owner, 'Workspace second');
+    await globalStore.addCollection('Global first');
+    await workspaceStore.addItem(owner, { type: 'file', uri: ROOT + '/first' });
+    await workspaceStore.addItem(owner, { type: 'file', uri: ROOT + '/second' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///outside/global' });
+    for (const scopes of [['global', 'workspace'], ['workspace'], ['global']] as BookmarkScope[][]) {
+      const { socket, sessionId } = await client(scopes);
+      const response = await request(socket, sessionId);
+      assert.strictEqual(response.error, undefined);
+      const result = response.result as BookmarkData & { grantedScopes: BookmarkScope[]; workspaceFolderUri: string };
+      assert.strictEqual(result.version, 2);
+      assert.strictEqual(result.workspaceFolderUri, ROOT);
+      assert.deepStrictEqual(result.grantedScopes, scopes);
+      const expectedScopes = scopes.length === 2 ? ['workspace', 'workspace', 'global']
+        : scopes[0] === 'workspace' ? ['workspace', 'workspace'] : ['global'];
+      assert.deepStrictEqual(result.collections.map(value => (value as unknown as { scope: string }).scope), expectedScopes);
+      assert.deepStrictEqual(result.items.map(value => (value as unknown as { scope: string }).scope), expectedScopes);
+      assert.deepStrictEqual(result.items.map(value => value.uri), scopes.length === 2
+        ? [ROOT + '/first', ROOT + '/second', 'file:///outside/global']
+        : scopes[0] === 'workspace' ? [ROOT + '/first', ROOT + '/second'] : ['file:///outside/global']);
+      assert.ok(!('workspacePath' in result)); assert.ok(!('mirrorPath' in result));
+    }
+  });
+
+  test('defaults omitted scope to workspace for both grants and to the sole granted scope', async () => {
+    for (const [index, scopes] of ([['workspace', 'global'], ['workspace'], ['global']] as BookmarkScope[][]).entries()) {
+      const { socket, sessionId } = await client(scopes);
+      const response = await request(socket, sessionId, 'add', { uri: ROOT + '/' + index, type: 'file', description: '  note  ' });
+      const result = response.result as { id: string; scope: string; collection: null };
+      assert.strictEqual(response.error, undefined);
+      assert.strictEqual(result.scope, scopes.length === 1 ? scopes[0] : 'workspace');
+      assert.strictEqual(result.collection, null);
+      assert.ok(!('mirrorPath' in result));
+      const data = result.scope === 'workspace' ? workspaceStore.getOwnerData(currentRoot!.owner)! : globalStore.getAll();
+      assert.strictEqual(data.items.find(item => item.id === result.id)?.description, 'note');
+    }
+  });
+
+  test('resolves colliding collection IDs and names only in the selected scope', async () => {
+    const collection = await workspaceStore.addCollection(currentRoot!.owner, 'Workspace collection');
+    await globalState.update('bookmarks.data', { version: 2, collections: [{ ...collection, name: 'Global collection' }], items: [] });
+    globalStore.dispose(); globalStore = new BookmarkStore(globalState);
+    await service.stop(); service = await LiveMcpBridgeService.start({ ...options, globalStore });
+    const { socket, sessionId } = await client();
+    for (const scope of ['workspace', 'global']) {
+      const response = await request(socket, sessionId, 'add', { scope, uri: ROOT + '/item', type: 'file', collectionId: collection.id });
+      assert.deepStrictEqual(response.result, {
+        id: (response.result as { id: string }).id, scope,
+        collection: { ...collection, name: scope === 'workspace' ? 'Workspace collection' : 'Global collection', scope }
+      });
+    }
+    assert.strictEqual((await request(socket, sessionId, 'add', {
+      scope: 'workspace', uri: ROOT + '/other', type: 'file', collectionName: 'Global collection'
+    })).error?.code, 'collection-not-found');
+    const named = await request(socket, sessionId, 'add', {
+      scope: 'global', uri: ROOT + '/named', type: 'folder', collectionName: 'Global collection'
+    });
+    assert.strictEqual((named.result as { collection: { id: string } }).collection.id, collection.id);
+  });
+
+  test('rejects unavailable scopes and unknown collections without mutations', async () => {
+    const { socket, sessionId } = await client(['global']);
+    for (const [params, code] of [
+      [{ scope: 'workspace' }, 'scope-unavailable'],
+      [{ collectionId: 'missing' }, 'collection-not-found'],
+      [{ collectionName: 'missing' }, 'collection-not-found']
+    ] as const) {
+      assert.strictEqual((await request(socket, sessionId, 'add', { uri: ROOT + '/file', type: 'file', ...params })).error?.code, code);
+    }
+    assert.deepStrictEqual(globalStore.getAll().items, []);
+    assert.deepStrictEqual(workspaceStore.getOwnerData(currentRoot!.owner)!.items, []);
+  });
+
+  test('enforces the deepest workspace root while global URIs remain unrestricted', async () => {
+    await workspaceStore.reconcileRoots([
+      { id: 'a', label: 'A', uri: vscode.Uri.parse(ROOT) },
+      { id: 'nested', label: 'Nested', uri: vscode.Uri.parse(ROOT + '/nested') }
+    ]);
+    const { socket, sessionId } = await client();
+    for (const uri of ['file:///outside/file', ROOT + '/nested/file']) {
+      assert.strictEqual((await request(socket, sessionId, 'add', { scope: 'workspace', uri, type: 'file' })).error?.code, 'bookmark-outside-root');
+      assert.strictEqual((await request(socket, sessionId, 'add', { scope: 'global', uri, type: 'file' })).error, undefined);
+    }
+    assert.strictEqual(workspaceStore.getOwnerData(currentRoot!.owner)!.items.length, 0);
+    assert.strictEqual(globalStore.getAll().items.length, 2);
+  });
+
+  test('validates request identity and params before store access and preserves the session after errors', async () => {
+    const { socket, sessionId } = await client();
+    const read = globalStore.getAll.bind(globalStore);
+    let reads = 0;
+    globalStore.getAll = () => { reads++; return read(); };
+    for (const [overrides, params, code] of [
+      [{ sessionId: 'other' }, {}, 'invalid-session'],
+      [{ workspaceFolderUri: 'file:///other' }, {}, 'invalid-session'],
+      [{ id: '' }, {}, 'invalid-request'],
+      [{}, { scope: 'global' }, 'invalid-request']
+    ] as const) {
+      assert.strictEqual((await request(socket, sessionId, 'list', params, overrides)).error?.code, code);
+    }
+    for (const params of [
+      {}, { uri: '', type: 'file' }, { uri: 'relative', type: 'file' }, { uri: ROOT, type: 'bad' },
+      { uri: ROOT, type: 'file', scope: 'bad' }, { uri: ROOT, type: 'file', description: 3 },
+      { uri: ROOT, type: 'file', collectionId: null }, { uri: ROOT, type: 'file', extra: true }
+    ]) {
+      assert.strictEqual((await request(socket, sessionId, 'add', params)).error?.code, 'invalid-request');
+    }
+    assert.strictEqual(reads, 0);
+    assert.strictEqual((await request(socket, sessionId)).error, undefined);
+  });
+
+  test('rejects reused IDs without executing a second mutation', async () => {
+    const { socket, sessionId } = await client(['global']);
+    const params = { uri: ROOT + '/one', type: 'file' };
+    assert.strictEqual((await request(socket, sessionId, 'add', params, { id: 'same' })).error, undefined);
+    assert.strictEqual((await request(socket, sessionId, 'add', { ...params, uri: ROOT + '/two' }, { id: 'same' })).error?.code, 'invalid-request');
+    assert.strictEqual(globalStore.getAll().items.length, 1);
+  });
+
+  test('maps duplicate, missing store, and unexpected persistence errors to stable safe codes', async () => {
+    const { socket, sessionId } = await client();
+    const params = { uri: ROOT + '/private', type: 'file', description: 'private note', scope: 'global' };
+    await request(socket, sessionId, 'add', params);
+    assert.strictEqual((await request(socket, sessionId, 'add', params)).error?.code, 'duplicate-bookmark');
+    globalState.failUpdateForKey = 'bookmarks.data';
+    const failed = await request(socket, sessionId, 'add', { ...params, uri: ROOT + '/another-private' });
+    assert.strictEqual(failed.error?.code, 'internal-error');
+    assert.ok(!JSON.stringify(failed).includes('private'));
+    workspaceStore.getOwnerData = () => undefined;
+    assert.strictEqual((await request(socket, sessionId)).error?.code, 'store-unavailable');
+    assert.strictEqual((await request(socket, sessionId, 'add', { uri: ROOT + '/file', type: 'file' })).error?.code, 'store-unavailable');
+  });
+
+  test('revalidates selected root availability before each store operation', async () => {
+    const { socket, sessionId } = await client();
+    currentRoot = undefined;
+    assert.strictEqual((await request(socket, sessionId)).error?.code, 'workspace-folder-unavailable');
+    assert.deepStrictEqual(globalStore.getAll().items, []);
+  });
+
+  test('serializes a session read behind its earlier uncommitted add', async () => {
+    const { socket, sessionId } = await client(['global']);
+    const update = globalState.update.bind(globalState);
+    let release!: () => void;
+    let started!: () => void;
+    const admitted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    globalState.update = async (key, value) => { started(); await gate; await update(key, value); };
+    const add = request(socket, sessionId, 'add', { uri: ROOT + '/queued', type: 'file' });
+    const list = request(socket, sessionId);
+    let readFinished = false;
+    void list.then(() => { readFinished = true; }, () => {});
+    try {
+      await Promise.race([admitted, add.then(() => {})]);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.strictEqual(readFinished, false);
+      assert.strictEqual(globalStore.getAll().items.length, 0);
+    } finally { release(); }
+    assert.strictEqual((await add).error, undefined);
+    assert.strictEqual(((await list).result as BookmarkData).items.length, 1);
+  });
+
+  test('concurrent sessions retain both global commits through the shared store queue', async () => {
+    const first = await client(['global']); const second = await client(['global']);
+    const results = await Promise.all([first, second].map(({ socket, sessionId }, index) =>
+      request(socket, sessionId, 'add', { uri: ROOT + '/concurrent-' + index, type: 'file' })));
+    assert.ok(results.every(result => !result.error));
+    assert.deepStrictEqual(globalStore.getAll().items.map(item => item.uri).sort(), [ROOT + '/concurrent-0', ROOT + '/concurrent-1']);
+  });
+
+  test('stop is idempotent and awaits admitted request tails even after the socket closes', async () => {
+    const { socket, sessionId } = await client(['global']);
+    const update = globalState.update.bind(globalState);
+    let release!: () => void; let started!: () => void;
+    const admitted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    globalState.update = async (key, value) => { started(); await gate; await update(key, value); };
+    const add = request(socket, sessionId, 'add', { uri: ROOT + '/drain', type: 'file' });
+    void add.catch(() => {});
+    try {
+      await Promise.race([admitted, add.then(() => {})]);
+      socket.destroy(); await new Promise(resolve => setTimeout(resolve, 20));
+      const stopping = service.stop();
+      assert.strictEqual(service.stop(), stopping);
+      let stopped = false; void stopping.then(() => { stopped = true; });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.strictEqual(stopped, false);
+      release(); await stopping;
+      assert.strictEqual(globalStore.getAll().items.length, 1);
+    } finally { release(); }
+  });
+
+  test('returns payload-too-large when committed list data exceeds the frame limit', async () => {
+    await globalStore.addItem({ uri: ROOT + '/large', type: 'file', description: 'x'.repeat(MAX_LIVE_BRIDGE_FRAME_BYTES) });
+    const { socket, sessionId } = await client(['global']);
+    const response = await request(socket, sessionId);
+    assert.strictEqual(response.error?.code, 'payload-too-large');
+    assert.strictEqual(response.result, undefined);
+    assert.strictEqual((await request(socket, sessionId, 'add', { uri: ROOT + '/small', type: 'file' })).error, undefined);
+  });
+
+  test('malformed envelopes close only their connection before touching stores', async () => {
+    const survivor = await client(['global']);
+    const read = globalStore.getAll.bind(globalStore);
+    let reads = 0;
+    globalStore.getAll = () => { reads++; return read(); };
+    for (const overrides of [{ method: 'delete' }, { params: null }, { params: [] }, { extra: true }, { id: 3 }]) {
+      const { socket, sessionId } = await client(['global']);
+      const closed = once(socket, 'close');
+      socket.write(JSON.stringify({ kind: 'request', id: 'bad', sessionId, workspaceFolderUri: ROOT,
+        method: 'list', params: {}, ...overrides }) + '\n');
+      await closed;
+    }
+    assert.strictEqual(reads, 0);
+    assert.strictEqual((await request(survivor.socket, survivor.sessionId)).error, undefined);
+  });
+
+  test('oversized unterminated frames close only their connection', async () => {
+    const survivor = await client(['global']);
+    const { socket } = await client(['global']);
+    const closed = once(socket, 'close');
+    socket.write('x'.repeat(MAX_LIVE_BRIDGE_FRAME_BYTES + 1));
+    await closed;
+    assert.strictEqual((await request(survivor.socket, survivor.sessionId)).error, undefined);
+  });
+
+  test('maps disposed store mutations to store-unavailable', async () => {
+    const { socket, sessionId } = await client();
+    globalStore.dispose(); workspaceStore.dispose();
+    for (const scope of ['workspace', 'global']) {
+      assert.strictEqual((await request(socket, sessionId, 'add', { scope, uri: ROOT + '/file', type: 'file' })).error?.code, 'store-unavailable');
+    }
+  });
+
+  test('root reordering and addition preserve sessions past grant expiry; removal revokes only the selected root', async () => {
+    const rootB = 'file:///workspace/b';
+    const roots = [
+      { id: 'a', label: 'A', uri: vscode.Uri.parse(ROOT) },
+      { id: 'b', label: 'B', uri: vscode.Uri.parse(rootB) }
+    ];
+    await workspaceStore.reconcileRoots(roots);
+    const attached = new Map([ROOT, rootB].map(uri => {
+      const partition = workspaceStore.getView().attached.find(value => value.canonicalRootUri === uri)!;
+      return [uri, { rootUri: uri, canonicalRootUri: uri, owner: { kind: 'partition' as const, partitionId: partition.partitionId } }];
+    }));
+    await service.stop();
+    service = await LiveMcpBridgeService.start({ ...options, getAttachedRoot: uri => attached.get(uri) });
+    const activeA = await client();
+    const activeB = await authenticate(service.issueGrant(rootB, ['global']));
+    now += 600_000;
+    await workspaceStore.reconcileRoots([...roots].reverse().concat({ id: 'c', label: 'C', uri: vscode.Uri.parse('file:///workspace/c') }));
+    service.refreshAvailableRoots();
+    assert.strictEqual((await request(activeA.socket, activeA.sessionId)).error, undefined);
+    assert.strictEqual((await request(activeB.socket, activeB.message.sessionId!, 'list', {}, { workspaceFolderUri: rootB })).error, undefined);
+    const pendingA = service.issueGrant(ROOT, ['workspace']);
+    const pendingB = service.issueGrant(rootB, ['global']);
+    const closedA = once(activeA.socket, 'close');
+    attached.delete(ROOT);
+    service.refreshAvailableRoots(); await closedA;
+    assert.notStrictEqual((await authenticate(pendingA)).message.kind, 'ready');
+    assert.strictEqual((await authenticate(pendingB)).message.kind, 'ready');
+    assert.strictEqual((await request(activeB.socket, activeB.message.sessionId!, 'list', {}, { workspaceFolderUri: rootB })).error, undefined);
+  });
 
   test('uses a deterministic endpoint and a fresh generation after restart', async () => {
     const first = service.issueGrant(ROOT, ['workspace']);

@@ -5,14 +5,14 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { BookmarkStore, OutputSink } from './bookmarkStore';
-import type { WorkspaceBookmarkStore } from './workspaceBookmarkStore';
+import { DuplicateBookmarkError, type AddItemInput, type BookmarkStore, type OutputSink } from './bookmarkStore';
+import { PartitionBoundaryError, WorkspaceDataUnavailableError, type WorkspaceBookmarkStore } from './workspaceBookmarkStore';
 import type { WorkspaceOwnerRef } from './workspacePartitionTypes';
-import type { BookmarkScope } from './types';
+import { CURRENT_SCHEMA_VERSION, type BookmarkCollection, type BookmarkData, type BookmarkItem, type BookmarkScope } from './types';
 import { canonicalizeRootUri } from './rootUri';
 import {
-  BridgeHello, BridgeStartupCode, NdjsonFrameDecoder,
-  decodeClientBridgeMessage, encodeBridgeMessage
+  BridgeHello, BridgeStartupCode, BridgeRequest, BridgeResponse, BridgeProtocolError, NdjsonFrameDecoder,
+  decodeClientBridgeMessage, encodeBridgeMessage, MAX_LIVE_BRIDGE_FRAME_BYTES
 } from './liveMcpBridgeProtocol';
 
 export interface IssuedLiveBridgeGrant {
@@ -62,6 +62,7 @@ export class LiveMcpBridgeService {
   private readonly retiredGrants = new Map<string, RetiredBridgeGrant>();
   private readonly sockets = new Set<net.Socket>();
   private readonly sessions = new Map<net.Socket, ActiveBridgeSession>();
+  private readonly requestTails = new Map<net.Socket, Promise<void>>();
   private readonly server: net.Server;
   private readonly generation: string;
   private readonly now: () => number;
@@ -159,12 +160,13 @@ export class LiveMcpBridgeService {
     this.cleanupTimer = undefined;
     this.pendingGrants.clear();
     this.retiredGrants.clear();
+    const tails = [...this.requestTails.values()];
     this.stopPromise = new Promise<void>(resolve => {
       if (this.server.listening) { this.server.close(() => resolve()); }
       else { resolve(); }
       for (const socket of this.sockets) { socket.destroy(); }
       this.sessions.clear();
-    }).then(() => this.removeEmptyDirectory());
+    }).then(() => Promise.all(tails)).then(() => this.removeEmptyDirectory());
     return this.stopPromise;
   }
 
@@ -178,15 +180,23 @@ export class LiveMcpBridgeService {
     if (this.stopping) { socket.destroy(); return; }
     this.sockets.add(socket);
     const decoder = new NdjsonFrameDecoder();
+    const requestIds = new Set<string>();
     let terminal = false;
     socket.on('close', () => { this.sockets.delete(socket); this.sessions.delete(socket); });
     socket.on('error', () => socket.destroy());
     socket.on('data', chunk => {
-      if (terminal) { return; }
+      if (terminal || this.stopping) { return; }
       try {
         for (const frame of decoder.push(chunk)) {
           const message = decodeClientBridgeMessage(JSON.parse(frame));
-          if (message.kind !== 'hello' || this.sessions.has(socket)) {
+          const session = this.sessions.get(socket);
+          if (message.kind === 'request' && session) {
+            const duplicate = requestIds.has(message.id) || message.id.trim().length === 0;
+            requestIds.add(message.id);
+            this.admitRequest(socket, session, message, duplicate);
+            continue;
+          }
+          if (message.kind !== 'hello' || session) {
             terminal = true;
             socket.destroy();
             return;
@@ -206,6 +216,89 @@ export class LiveMcpBridgeService {
         socket.destroy();
       }
     });
+  }
+
+  /** Serializes each socket while retaining admitted work after disconnect for shutdown draining. */
+  private admitRequest(socket: net.Socket, session: ActiveBridgeSession, request: BridgeRequest, duplicate: boolean): void {
+    const previous = this.requestTails.get(socket) ?? Promise.resolve();
+    const tail = previous.then(async () => {
+      const response: BridgeResponse = { kind: 'response', id: request.id };
+      try {
+        if (duplicate) { throw new BridgeProtocolError('invalid-request', 'Invalid request identifier.'); }
+        response.result = await this.dispatch(session, request);
+      } catch (error) {
+        const code = error instanceof BridgeProtocolError ? error.code
+          : error instanceof DuplicateBookmarkError ? 'duplicate-bookmark'
+          : error instanceof PartitionBoundaryError ? 'bookmark-outside-root'
+          : error instanceof WorkspaceDataUnavailableError
+            || (error instanceof Error && error.message === 'Global bookmark store is disposed.') ? 'store-unavailable'
+          : 'internal-error';
+        response.error = { code, message: code };
+        if (code === 'internal-error') {
+          this.options.output.appendLine(`Live MCP bridge: internal-error; session=${session.sessionId}; partition=${session.owner.kind === 'partition' ? session.owner.partitionId : 'unassigned'}.`);
+        }
+      }
+      if (!socket.destroyed && socket.writable) {
+        const frame = encodeBridgeMessage(response);
+        socket.write(Buffer.byteLength(frame, 'utf8') - 1 > MAX_LIVE_BRIDGE_FRAME_BYTES
+          ? encodeBridgeMessage({ kind: 'response', id: request.id,
+            error: { code: 'payload-too-large', message: 'payload-too-large' } })
+          : frame);
+      }
+    });
+    this.requestTails.set(socket, tail);
+    void tail.finally(() => {
+      if (this.requestTails.get(socket) === tail) { this.requestTails.delete(socket); }
+    });
+  }
+
+  /** Validates session authority and operation inputs before reading or mutating any store. */
+  private async dispatch(session: ActiveBridgeSession, request: BridgeRequest): Promise<unknown> {
+    if (request.sessionId !== session.sessionId || request.workspaceFolderUri !== session.workspaceFolderUri) {
+      throw new BridgeProtocolError('invalid-session', 'Request does not match its session.');
+    }
+    const input = request.method === 'add' ? validateAddParams(request.params) : undefined;
+    if (request.method === 'list' && Object.keys(request.params).length !== 0) {
+      throw new BridgeProtocolError('invalid-request', 'List does not accept parameters.');
+    }
+    const scope = input?.scope ?? (session.scopes.length === 1 ? session.scopes[0] : 'workspace');
+    if (input && !session.scopes.includes(scope)) {
+      throw new BridgeProtocolError('scope-unavailable', 'Scope was not granted.');
+    }
+    if (!this.isAttached(session)) {
+      throw new BridgeProtocolError('workspace-folder-unavailable', 'Selected workspace folder is unavailable.');
+    }
+    if (!input) {
+      const collections: (BookmarkCollection & { scope: BookmarkScope })[] = [];
+      const items: (BookmarkItem & { scope: BookmarkScope })[] = [];
+      for (const granted of ['workspace', 'global'] as const) {
+        if (!session.scopes.includes(granted)) { continue; }
+        const data = this.readScope(session, granted);
+        collections.push(...data.collections.map(collection => ({ ...collection, scope: granted })));
+        items.push(...data.items.map(item => ({ ...item, scope: granted })));
+      }
+      return { version: CURRENT_SCHEMA_VERSION, workspaceFolderUri: session.workspaceFolderUri,
+        grantedScopes: [...session.scopes], collections, items };
+    }
+    const data = this.readScope(session, scope);
+    const collection = input.collectionId !== undefined
+      ? data.collections.find(value => value.id === input.collectionId)
+      : input.collectionName !== undefined ? data.collections.find(value => value.name === input.collectionName) : undefined;
+    if (!collection && (input.collectionId !== undefined || input.collectionName !== undefined)) {
+      throw new BridgeProtocolError('collection-not-found', 'Collection is unavailable in the selected scope.');
+    }
+    const add: AddItemInput = { type: input.type, uri: input.uri, collectionId: collection?.id ?? null,
+      description: input.description };
+    const item = scope === 'workspace' ? await this.options.workspaceStore.addItem(session.owner, add)
+      : await this.options.globalStore.addItem(add);
+    return { id: item.id, scope, collection: collection ? { ...collection, scope } : null };
+  }
+
+  /** Reads only committed content from the selected store; missing owners fail closed. */
+  private readScope(session: ActiveBridgeSession, scope: BookmarkScope): BookmarkData {
+    const data = scope === 'workspace' ? this.options.workspaceStore.getOwnerData(session.owner) : this.options.globalStore.getAll();
+    if (!data) { throw new BridgeProtocolError('store-unavailable', 'Bookmark store is unavailable.'); }
+    return data;
   }
 
   /** Consumes before any asynchronous work or callback can authenticate the same digest twice. */
@@ -311,6 +404,21 @@ function digestToken(token: string): string { return createHash('sha256').update
 function validScopes(scopes: readonly BookmarkScope[]): boolean {
   return Array.isArray(scopes) && scopes.length > 0 && scopes.length <= 2
     && new Set(scopes).size === scopes.length && scopes.every(scope => scope === 'workspace' || scope === 'global');
+}
+
+/** Validates the closed add contract, leaving collection lookup within the authorized scope. */
+function validateAddParams(params: Record<string, unknown>): AddItemInput & { scope?: BookmarkScope; collectionName?: string } {
+  const allowed = ['uri', 'type', 'scope', 'collectionId', 'collectionName', 'description'];
+  if (Object.keys(params).some(key => !allowed.includes(key))
+    || typeof params.uri !== 'string' || params.uri.trim().length === 0
+    || (params.type !== 'file' && params.type !== 'folder')
+    || (params.scope !== undefined && params.scope !== 'workspace' && params.scope !== 'global')
+    || ['collectionId', 'collectionName', 'description'].some(key => params[key] !== undefined && typeof params[key] !== 'string')) {
+    throw new BridgeProtocolError('invalid-request', 'Invalid add parameters.');
+  }
+  try { vscode.Uri.parse(params.uri, true); }
+  catch { throw new BridgeProtocolError('invalid-request', 'Invalid bookmark URI.'); }
+  return params as unknown as AddItemInput & { scope?: BookmarkScope; collectionName?: string };
 }
 
 /** Narrows filesystem and socket errors without exposing their paths in diagnostics. */
