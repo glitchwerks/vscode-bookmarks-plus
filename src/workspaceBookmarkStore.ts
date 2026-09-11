@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import {
   AddItemInput,
   BookmarkContentReader,
+  CollectionNotFoundError,
   DuplicateBookmarkError,
   OutputSink
 } from './bookmarkStore';
@@ -137,6 +138,8 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
   private snapshot: WorkspacePartitionSnapshot | undefined;
   private unavailableReason: string | undefined;
   private operationTail: Promise<void> = Promise.resolve();
+  private shutdownPromise: Promise<void> | undefined;
+  private acceptingMutations = true;
   private disposed = false;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
   readonly onBookmarksChanged: vscode.Event<void> = this._onBookmarksChanged.event;
@@ -381,17 +384,19 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
       const data = partition.data;
       const collectionId = input.collectionId ?? null;
       if (collectionId !== null && !data.collections.some((collection) => collection.id === collectionId)) {
-        throw new WorkspaceSnapshotInvariantError('Bookmark collection is not owned by the selected partition.');
+        throw new CollectionNotFoundError(collectionId);
       }
       if (hasDuplicateBookmark(data, input.uri, collectionId)) {
         throw new DuplicateBookmarkError(input.uri, collectionId);
       }
+      const description = normalizeDescription(input.description);
       const item: BookmarkItem = {
         id: this.allocateId(draft),
         type: input.type,
         uri: input.uri,
         collectionId,
-        order: data.items.filter((candidate) => candidate.collectionId === collectionId).length
+        order: data.items.filter((candidate) => candidate.collectionId === collectionId).length,
+        ...(description === undefined ? {} : { description })
       };
       data.items.push(item);
       markContentMutation(partition);
@@ -544,6 +549,9 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
    * against the last committed content; it must never await operations on this store's queue.
    */
   reconcileRoots(roots: readonly RootCandidate[], beforeCommit?: () => void): Promise<RootReconcileResult> {
+    if (!this.acceptingMutations) {
+      return Promise.reject(new WorkspaceDataUnavailableError('Workspace bookmark store is disposed.'));
+    }
     const run = this.operationTail.then(async () => {
       this.assertReady();
       const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);
@@ -704,8 +712,18 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     } while (tail !== this.operationTail);
   }
 
-  /** Disposes the change event emitter; workspace state itself remains untouched. */
+  /** Fences new work, drains every admitted mutation, then releases store resources. */
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) { return this.shutdownPromise; }
+    this.acceptingMutations = false;
+    this.shutdownPromise = this.operationTail.then(() => this.dispose());
+    return this.shutdownPromise;
+  }
+
+  /** Immediately retires the store, including mutations still waiting in its queue. */
   dispose(): void {
+    if (this.disposed) { return; }
+    this.acceptingMutations = false;
     this.disposed = true;
     this._onBookmarksChanged.dispose();
     this._onDidChangePartitions.dispose();
@@ -855,6 +873,9 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
   }
 
   private enqueue<T>(operation: (draft: WorkspacePartitionSnapshot) => MutationResult<T>): Promise<T> {
+    if (!this.acceptingMutations) {
+      return Promise.reject(new WorkspaceDataUnavailableError('Workspace bookmark store is disposed.'));
+    }
     const run = this.operationTail.then(async () => {
       this.assertReady();
       const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);

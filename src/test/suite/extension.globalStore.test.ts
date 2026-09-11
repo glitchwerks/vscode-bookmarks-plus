@@ -1,5 +1,10 @@
 import * as assert from 'assert';
+import * as net from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import * as vscode from 'vscode';
+import { LiveMcpBridgeService, LiveMcpBridgeServiceOptions } from '../../liveMcpBridgeService';
+import { BookmarkData } from '../../types';
 import { activate, deactivate } from '../../extension';
 import { createRemoveHandler, ScopedStores } from '../../commands';
 import { RecoveryConflictError, WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
@@ -21,9 +26,19 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
   let provider: BookmarksTreeDataProvider | undefined;
   let coordinator: WorkspaceMirrorCoordinator | undefined;
   let mcp: vscode.McpServerDefinitionProvider | undefined;
+  let bridge: LiveMcpBridgeService | undefined;
+  const lifecycle: string[] = [];
   const deps = {
+    isWorkspaceTrusted: () => true,
+    startLiveBridge: async (options: LiveMcpBridgeServiceOptions) => {
+      assert.ok(options.workspaceStore instanceof WorkspaceBookmarkStore);
+      assert.deepStrictEqual(options.globalStore.getAll().items, []);
+      lifecycle.push('bridge');
+      bridge = await LiveMcpBridgeService.start({ ...options, editorSessionId: randomUUID(), extensionId: 'activation-test' });
+      return bridge;
+    },
     getWorkspaceFolders: () => folders,
-    registerProvider: (_id: string, value: vscode.McpServerDefinitionProvider) => { mcp = value; return new vscode.Disposable(() => {}); },
+    registerProvider: (_id: string, value: vscode.McpServerDefinitionProvider) => { lifecycle.push('provider'); mcp = value; return new vscode.Disposable(() => {}); },
     onDidChangeWorkspaceFolders: (listener: () => void | Promise<void>) => { changed = listener; return new vscode.Disposable(() => { changed = undefined; }); },
     createOutputChannel: () => output,
     createMirrorResources: (root: vscode.Uri) => {
@@ -36,7 +51,9 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
     }
   };
   return {
-    context, output, resources, deps,
+    context, output, resources, deps, lifecycle,
+    get bridge() { assert.ok(bridge, 'activation must start the live bridge'); return bridge; },
+    get registeredMcp() { return mcp; },
     get stores() { assert.ok(stores); return stores; },
     get provider() { assert.ok(provider); return provider; },
     get coordinator() { assert.ok(coordinator); return coordinator; },
@@ -46,7 +63,7 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
       folders = names.map((name, index) => ({ name, index, uri: vscode.Uri.parse('file:///' + name) }));
       await changed?.();
     },
-    async stop() { await deactivate(); context.subscriptions.forEach(value => value.dispose()); }
+    async stop() { await deactivate(); await bridge?.stop(); context.subscriptions.forEach(value => value.dispose()); }
   };
 }
 
@@ -58,7 +75,355 @@ function barrier() {
   return { entered, release, async wait() { enter(); await blocked; } };
 }
 
+/** Connects through the actual provider grant and reads complete protocol frames. */
+async function connectLive(f: ReturnType<typeof activationFixture>, root = 'file:///a') {
+  const token = { isCancellationRequested: false } as vscode.CancellationToken;
+  const definitions = await f.mcp.provideMcpServerDefinitions(token) as vscode.McpStdioServerDefinition[];
+  const definition = definitions.find(value => value.env.BOOKMARKS_PLUS_ROOT_URI === root)!;
+  const resolved = await f.mcp.resolveMcpServerDefinition!(definition, token) as vscode.McpStdioServerDefinition;
+  assert.ok(resolved, 'activation must supply a usable live grant');
+  const socket = net.createConnection(String(resolved.env.BOOKMARKS_PLUS_BRIDGE_ENDPOINT));
+  const closed = new Promise<void>(resolve => socket.once('close', () => resolve()));
+  socket.on('error', () => {});
+  const exchange = (message: object): Promise<{ kind: string; sessionId: string }> => new Promise((resolve, reject) => {
+    let buffer = '';
+    const cleanup = () => { socket.off('data', data); socket.off('close', fail); clearTimeout(timer); };
+    const fail = () => { cleanup(); reject(new Error('live bridge closed before response')); };
+    const data = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      if (buffer.includes('\n')) { cleanup(); resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n')))); }
+    };
+    const timer = setTimeout(fail, 2_000);
+    socket.on('data', data); socket.once('close', fail);
+    socket.write(JSON.stringify(message) + '\n');
+  });
+  await once(socket, 'connect');
+  const ready = await exchange({ kind: 'hello', version: 1,
+    generation: resolved.env.BOOKMARKS_PLUS_BRIDGE_GENERATION, token: resolved.env.BOOKMARKS_PLUS_BRIDGE_TOKEN });
+  assert.strictEqual(ready.kind, 'ready');
+  return { socket, closed, exchange, sessionId: ready.sessionId };
+}
+
 suite('Extension - partitioned activation (#62)', () => {
+  test('failed activation retires its runtime once and permits a clean activation retry', async () => {
+    const f = activationFixture(['a']);
+    const retry = activationFixture(['a']);
+    const order: string[] = [];
+    const capture = f.deps.registerCommands;
+    const failure = new Error('registration failed after bridge startup');
+    let endpoint = '';
+    f.deps.registerCommands = (...args) => {
+      capture(...args);
+      endpoint = f.bridge.issueGrant('file:///a', ['workspace']).endpoint;
+      const bridgeStop = f.bridge.stop.bind(f.bridge);
+      f.bridge.stop = () => { order.push('bridge'); return bridgeStop(); };
+      const drain = f.coordinator.drainAndFlush.bind(f.coordinator);
+      f.coordinator.drainAndFlush = () => { order.push('drain'); return drain(); };
+      for (const [name, resource] of [['mirrors', f.coordinator], ['workspace', f.stores.workspace], ['global', f.stores.global]] as const) {
+        const dispose = resource.dispose.bind(resource);
+        resource.dispose = () => { order.push(name); dispose(); };
+      }
+      throw failure;
+    };
+    try {
+      await assert.rejects(f.start(), error => error === failure);
+      assert.deepStrictEqual(order, ['bridge', 'drain', 'mirrors', 'workspace', 'global']);
+      assert.throws(() => f.bridge.issueGrant('file:///a', ['workspace']), /bridge-unavailable/);
+      const socket = net.createConnection(endpoint);
+      await assert.rejects(once(socket, 'connect'));
+      assert.ok(f.resources.get('file:///a')!.disposed);
+      assert.strictEqual(f.context.subscriptions.length, 0, 'partial registrations must be retired before retry');
+      await retry.start();
+      const client = await connectLive(retry);
+      client.socket.destroy();
+      await deactivate();
+      assert.deepStrictEqual(order, ['bridge', 'drain', 'mirrors', 'workspace', 'global']);
+      await assert.rejects(f.stores.global.addItem({ type: 'file', uri: 'file:///outside' }), /disposed/);
+    } finally { await retry.stop(); await f.stop(); }
+  });
+
+  test('shutdown shares completion and still persists and disposes once when bridge cleanup rejects', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let client: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let outcomes: Promise<PromiseSettledResult<void>[]> | undefined;
+    let originalStop: (() => Promise<void>) | undefined;
+    try {
+      await f.start(); client = await connectLive(f);
+      const order: string[] = [];
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => {
+        await gate.wait(); await update(key, value); order.push('commit');
+      };
+      originalStop = f.bridge.stop.bind(f.bridge);
+      f.bridge.stop = async () => {
+        order.push('bridge'); await originalStop!(); order.push('bridge-error');
+        throw new Error('EPERM: private endpoint path');
+      };
+      const drain = f.coordinator.drainAndFlush.bind(f.coordinator);
+      f.coordinator.drainAndFlush = () => { order.push('drain'); return drain(); };
+      for (const [name, resource] of [['mirrors', f.coordinator], ['workspace', f.stores.workspace], ['global', f.stores.global]] as const) {
+        const dispose = resource.dispose.bind(resource);
+        resource.dispose = () => { order.push(name); dispose(); };
+      }
+      client.socket.write(JSON.stringify({ kind: 'request', id: 'persist-before-error', sessionId: client.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'add', params: { type: 'file', uri: 'file:///a/retained' } }) + '\n');
+      await gate.entered;
+      const first = deactivate(), concurrent = deactivate();
+      outcomes = Promise.allSettled([first, concurrent]);
+      assert.strictEqual(first, concurrent, 'concurrent callers must share the shutdown operation');
+      let finished = false;
+      void concurrent.then(() => { finished = true; });
+      await client.closed;
+      assert.strictEqual(finished, false, 'shutdown cannot settle before admitted work finishes');
+      gate.release();
+      assert.deepStrictEqual((await outcomes).map(result => result.status), ['fulfilled', 'fulfilled']);
+      assert.ok(order.indexOf('commit') < order.indexOf('bridge-error'));
+      assert.deepStrictEqual(order.filter(value => value !== 'commit'), ['bridge', 'bridge-error', 'drain', 'mirrors', 'workspace', 'global']);
+      assert.strictEqual(deactivate(), first, 'later callers must observe the completed operation');
+      await deactivate();
+      assert.strictEqual(order.filter(value => value === 'bridge').length, 1);
+      assert.strictEqual(JSON.parse(f.resources.get('file:///a')!.port.content!).items[0].uri, 'file:///a/retained');
+      assert.strictEqual(f.output.lines.filter(line => /bridge.*shutdown failed/i.test(line)).length, 1);
+      assert.ok(f.output.lines.every(line => !line.includes('private endpoint path')));
+    } finally {
+      gate.release(); client?.socket.destroy(); await outcomes;
+      if (originalStop) f.bridge.stop = originalStop;
+      await f.stop();
+      f.coordinator.dispose(); f.stores.workspace.dispose(); f.stores.global.dispose();
+    }
+  });
+
+  test('shutdown drains direct Global mutations without an active bridge request', async () => {
+    const f = activationFixture([]);
+    const gate = barrier();
+    let stopping: Promise<void> | undefined;
+    let additions: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await f.start();
+      const update = f.context.globalState.update.bind(f.context.globalState);
+      f.context.globalState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      const first = f.stores.global.addItem({ type: 'file', uri: 'file:///direct-first' });
+      await gate.entered;
+      const second = f.stores.global.addItem({ type: 'file', uri: 'file:///direct-second' });
+      additions = Promise.allSettled([first, second]);
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(finished, false, 'shutdown must wait for direct Global writes');
+      gate.release();
+      await stopping;
+      assert.deepStrictEqual((await additions).map(result => result.status), ['fulfilled', 'fulfilled']);
+      assert.deepStrictEqual(f.context.globalState.get<BookmarkData>('bookmarks.data')!.items.map(item => item.uri),
+        ['file:///direct-first', 'file:///direct-second']);
+      await assert.rejects(f.stores.global.addItem({ type: 'file', uri: 'file:///too-late' }), /disposed/);
+    } finally { gate.release(); await additions; await stopping; await f.stop(); }
+  });
+
+  test('shutdown drains queued workspace mutations with no active mirrors or bridge requests', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let stopping: Promise<void> | undefined;
+    let additions: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await f.start();
+      const owner = { kind: 'partition' as const, partitionId: f.stores.workspace.getView().attached[0].partitionId };
+      const item = await f.stores.workspace.addItem(owner, { type: 'file', uri: 'file:///a/original' });
+      await f.change([]);
+      // Isolate the store's shutdown contract from the coordinator's incidental queue drain.
+      f.coordinator.drainAndFlush = async () => {};
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      const first = f.stores.workspace.setItemDescription(owner, item.id, 'first');
+      await gate.entered;
+      const second = f.stores.workspace.setItemDescription(owner, item.id, 'second');
+      additions = Promise.allSettled([first, second]);
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(finished, false, 'workspace queue alone must keep shutdown pending');
+      gate.release();
+      await stopping;
+      assert.deepStrictEqual((await additions).map(result => result.status), ['fulfilled', 'fulfilled']);
+      const saved = f.context.workspaceState.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+      assert.strictEqual(saved.partitions[0].data.items[0].description, 'second');
+    } finally { gate.release(); await additions; await stopping; await f.stop(); }
+  });
+
+  test('shutdown fences issued grants and existing sessions while reconciliation is held', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let client: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let pendingSocket: net.Socket | undefined;
+    let transition: Promise<void> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      await f.start();
+      client = await connectLive(f);
+      const grant = f.bridge.issueGrant('file:///a', ['global']);
+      pendingSocket = net.createConnection(grant.endpoint);
+      pendingSocket.on('error', () => {});
+      await once(pendingSocket, 'connect');
+      const pending = pendingSocket;
+      const authentication = new Promise<string>(resolve => {
+        let buffer = '';
+        pending.on('data', chunk => {
+          buffer += chunk.toString();
+          if (buffer.includes('\n')) resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n'))).kind);
+        });
+        pending.once('close', () => resolve('closed'));
+      });
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      transition = f.change(['a', 'b']);
+      await gate.entered;
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      assert.throws(() => f.bridge.issueGrant('file:///a', ['global']), /bridge-unavailable/,
+        'bridge admission must be fenced synchronously, before yielding to reconciliation');
+      pending.write(JSON.stringify({ kind: 'hello', version: 1, generation: grant.generation, token: grant.token }) + '\n');
+      const request = client.exchange({ kind: 'request', id: 'after-stop', sessionId: client.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'add',
+        params: { scope: 'global', type: 'file', uri: 'file:///must-not-be-admitted' } });
+      const requestOutcome = request.then(result => result.kind, () => 'closed');
+      assert.strictEqual(await authentication, 'closed', 'an issued grant must not authenticate during shutdown');
+      assert.strictEqual(await requestOutcome, 'closed', 'an existing session must not admit more requests');
+      assert.deepStrictEqual(f.stores.global.getAll().items, []);
+      assert.strictEqual(finished, false, 'reconciliation remains held during the admission assertions');
+    } finally {
+      gate.release(); client?.socket.destroy(); pendingSocket?.destroy();
+      await transition; await stopping; await f.stop();
+    }
+  });
+
+  test('trusted activation starts the bridge after store initialization and before provider registration', async () => {
+    const f = activationFixture(['a']);
+    try {
+      await f.start();
+      assert.deepStrictEqual(f.lifecycle, ['bridge', 'provider']);
+      const token = { isCancellationRequested: false } as vscode.CancellationToken;
+      const definition = (await f.mcp.provideMcpServerDefinitions(token))![0];
+      const resolved = await f.mcp.resolveMcpServerDefinition!(definition, token) as vscode.McpStdioServerDefinition;
+      assert.ok(resolved?.env.BOOKMARKS_PLUS_BRIDGE_TOKEN, 'provider resolution must use the activation bridge issuer');
+    } finally { await f.stop(); }
+  });
+
+  test('untrusted activation opens no listener and registers no native provider', async () => {
+    const f = activationFixture(['a']);
+    f.deps.isWorkspaceTrusted = () => false;
+    try {
+      await f.start();
+      assert.deepStrictEqual(f.lifecycle, []);
+      assert.strictEqual(f.registeredMcp, undefined);
+      await f.stores.global.addItem({ type: 'file', uri: 'file:///global' });
+    } finally { await f.stop(); }
+  });
+
+  test('packaged commands resolve through the provider and return defensive owner-scoped snapshots', async () => {
+    const f = activationFixture();
+    const previous = process.env.BOOKMARKS_PACKAGED_MCP_TEST;
+    process.env.BOOKMARKS_PACKAGED_MCP_TEST = '1';
+    try {
+      await f.start();
+      const definitions = await vscode.commands.executeCommand<vscode.McpStdioServerDefinition[]>('bookmarks.test.getMcpServerDefinitions');
+      assert.ok(definitions);
+      const resolved = await vscode.commands.executeCommand<vscode.McpStdioServerDefinition>(
+        'bookmarks.test.resolveMcpServerDefinition', 'file:///a');
+      assert.ok(resolved?.env.BOOKMARKS_PLUS_BRIDGE_TOKEN);
+      assert.strictEqual(definitions[0].env.BOOKMARKS_PLUS_BRIDGE_TOKEN, undefined);
+      const owner = f.stores.workspace.resolveAttachedOwner(vscode.Uri.parse('file:///a/item'))!;
+      await f.stores.workspace.addItem(owner, { type: 'file', uri: 'file:///a/item' });
+      await f.stores.global.addItem({ type: 'file', uri: 'file:///global' });
+      const read = () => vscode.commands.executeCommand<{ workspace: BookmarkData; global: BookmarkData }>(
+        'bookmarks.test.getScopedBookmarkState', 'file:///a');
+      const state = (await read())!;
+      assert.deepStrictEqual(state.workspace.items.map(item => item.uri), ['file:///a/item']);
+      assert.deepStrictEqual(state.global.items.map(item => item.uri), ['file:///global']);
+      state.workspace.items[0].uri = 'file:///tampered'; state.global.items.length = 0;
+      assert.deepStrictEqual((await read())!.workspace.items.map(item => item.uri), ['file:///a/item']);
+      assert.strictEqual((await read())!.global.items.length, 1);
+      assert.strictEqual(await vscode.commands.executeCommand('bookmarks.test.getScopedBookmarkState', 'file:///missing'), undefined);
+    } finally {
+      await f.stop();
+      if (previous === undefined) delete process.env.BOOKMARKS_PACKAGED_MCP_TEST;
+      else process.env.BOOKMARKS_PACKAGED_MCP_TEST = previous;
+    }
+  });
+
+  test('listener startup failure leaves UI stores usable and native resolution unavailable', async () => {
+    const f = activationFixture(['a']);
+    f.deps.startLiveBridge = async () => { throw new Error('private endpoint'); };
+    try {
+      await f.start();
+      const token = {} as vscode.CancellationToken;
+      const definition = (await f.mcp.provideMcpServerDefinitions(token))![0];
+      assert.strictEqual(await f.mcp.resolveMcpServerDefinition!(definition, token), undefined);
+      await f.stores.global.addItem({ type: 'file', uri: 'file:///global' });
+      assert.ok(f.output.lines.some(line => /bridge.*failed/i.test(line)));
+      assert.ok(f.output.lines.every(line => !line.includes('private endpoint')));
+    } finally { await f.stop(); }
+  });
+
+  test('committed root changes refresh the bridge, retain unrelated sessions, and close the removed root', async () => {
+    const f = activationFixture();
+    let a: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let b: Awaited<ReturnType<typeof connectLive>> | undefined;
+    try {
+      await f.start();
+      a = await connectLive(f); b = await connectLive(f, 'file:///b');
+      const seen: string[][] = [];
+      const refresh = f.bridge.refreshAvailableRoots.bind(f.bridge);
+      f.bridge.refreshAvailableRoots = () => {
+        seen.push(f.stores.workspace.getView().attached.map(root => root.rootUri)); refresh();
+      };
+      await f.change(['b', 'a', 'c']);
+      assert.deepStrictEqual(seen, [['file:///b', 'file:///a', 'file:///c']]);
+      assert.strictEqual((await a.exchange({ kind: 'request', id: '1', sessionId: a.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'list', params: {} })).kind, 'response');
+      await f.change(['a', 'c']);
+      assert.deepStrictEqual(seen[1], ['file:///a', 'file:///c']);
+      await b.closed;
+      assert.strictEqual((await a.exchange({ kind: 'request', id: '2', sessionId: a.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'list', params: {} })).kind, 'response');
+    } finally { a?.socket.destroy(); b?.socket.destroy(); await f.stop(); }
+  });
+
+  test('shutdown fences resolution, closes bridge, drains an admitted mutation, then mirrors and stores', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let client: Awaited<ReturnType<typeof connectLive>> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      await f.start(); client = await connectLive(f);
+      const order: string[] = [];
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => {
+        await gate.wait(); await update(key, value); order.push('commit');
+      };
+      const stopBridge = f.bridge.stop.bind(f.bridge);
+      f.bridge.stop = () => { order.push('bridge-stop'); return stopBridge(); };
+      const drain = f.coordinator.drainAndFlush.bind(f.coordinator);
+      f.coordinator.drainAndFlush = () => { order.push('mirrors'); return drain(); };
+      for (const [name, store] of [['workspace', f.stores.workspace], ['global', f.stores.global]] as const) {
+        const dispose = store.dispose.bind(store);
+        store.dispose = () => { order.push(name); dispose(); };
+      }
+      client.socket.write(JSON.stringify({ kind: 'request', id: 'mutation', sessionId: client.sessionId,
+        workspaceFolderUri: 'file:///a', method: 'add', params: { type: 'file', uri: 'file:///a/admitted' } }) + '\n');
+      await gate.entered;
+      stopping = deactivate();
+      const token = {} as vscode.CancellationToken;
+      const definition = (await f.mcp.provideMcpServerDefinitions(token))![0];
+      assert.strictEqual(await f.mcp.resolveMcpServerDefinition!(definition, token), undefined);
+      await client.closed;
+      assert.deepStrictEqual(order, ['bridge-stop']);
+      assert.throws(() => f.bridge.issueGrant('file:///a', ['workspace']), /bridge-unavailable/);
+      gate.release(); await stopping;
+      assert.ok(order.indexOf('commit') < order.indexOf('mirrors'));
+      assert.deepStrictEqual(order.filter(value => value !== 'commit'), ['bridge-stop', 'mirrors', 'workspace', 'global']);
+      assert.strictEqual(JSON.parse(f.resources.get('file:///a')!.port.content!).items[0].uri, 'file:///a/admitted');
+    } finally { gate.release(); client?.socket.destroy(); await stopping; await f.stop(); }
+  });
   for (const owner of ['attached', 'detached', 'unassigned']) {
     test(`unsupported ${owner} content stays untouched with no workspace mirrors and Global available`, async () => {
       const f = activationFixture(['a']);

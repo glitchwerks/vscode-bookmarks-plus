@@ -15,8 +15,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
-// Issue #66 / T3 (plan `docs/superpowers/plans/2026-08-30-publish-mcp-server-to-npm.md`,
-// §6 T3, §4 E2): the automated form of E2, "the highest-severity check in this
+// Issue #66 / T3 (original implementation plan, §6 T3, §4 E2):
+// the automated form of E2, "the highest-severity check in this
 // plan". E2 was already run manually and passed (real `npm pack` -> real
 // `npm install` into a scratch dir -> npm's real generated shim -> `npx
 // bookmarks-plus-mcp <workspace>` -> `initialize` + `tools/list` over stdin ->
@@ -288,6 +288,30 @@ test(
     const packEntry = parsePackJson(packStdout);
     const tarballPath = join(packDestDir, packEntry.filename);
 
+    const packedPaths = packEntry.files.map(({ path }) => path);
+    for (const requiredPath of [
+      'dist/backend.js', 'dist/mirrorBackend.js', 'dist/liveBridgeClient.js',
+      'dist/initializationGate.js', 'dist/runtimeMode.js', 'dist/liveBridgeProtocol.js',
+      'dist/live-mcp-bridge-v1.schema.json',
+    ]) {
+      assert.ok(packedPaths.includes(requiredPath), `npm tarball is missing ${requiredPath}`);
+    }
+    assert.deepEqual(packedPaths.filter((path) =>
+      /(^|\/)(src|test|fixtures)\//.test(path) || /\.fixtures\.json$/.test(path)), []);
+
+    // These are public result examples, not snapshots of README wording.
+    // A stale example must fail against the real installed server below.
+    const documentedResults = ['README.md', 'mcp-server/README.md'].map((path) => {
+      const readme = readFileSync(join(mcpServerRoot, '..', path), 'utf8');
+      const examples = [...readme.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g)]
+        .map((match) => JSON.parse(match[1]) as Record<string, unknown>);
+      const list = examples.find((example) => example.workspacePath === '/workspace');
+      const add = examples.find((example) => example.id === 'new-bookmark-id');
+      assert.ok(list, `${path} must document the standalone list result`);
+      assert.ok(add, `${path} must document the standalone add result`);
+      return { list, add };
+    });
+
     assert.ok(
       readdirSync(packDestDir).includes(packEntry.filename),
       `expected npm pack to write ${packEntry.filename} into ${packDestDir}`,
@@ -396,6 +420,35 @@ test(
         toolNames.includes('add_bookmark'),
         `expected tools/list to include add_bookmark, got: ${JSON.stringify(toolNames)}`,
       );
+
+      const listPromise = collectJsonRpcResponse(child, 3);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call',
+        params: { name: 'list_bookmarks', arguments: {} } })}\n`);
+      const listResponse = await waitFor(listPromise, 30_000, 'installed list_bookmarks result');
+      const listResult = listResponse?.result as { structuredContent: Record<string, unknown> };
+      for (const example of documentedResults) {
+        assert.deepEqual(listResult.structuredContent, {
+          ...example.list,
+          workspacePath: workspaceDir,
+          mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+        });
+      }
+
+      const addPromise = collectJsonRpcResponse(child, 4);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call',
+        params: { name: 'add_bookmark', arguments: {
+          uri: 'file:///workspace/README.md', type: 'file', collectionId: 'collection-1',
+        } } })}\n`);
+      const addResponse = await waitFor(addPromise, 30_000, 'installed add_bookmark result');
+      const addResult = addResponse?.result as { structuredContent: Record<string, unknown> };
+      assert.equal(typeof addResult.structuredContent.id, 'string');
+      for (const example of documentedResults) {
+        assert.deepEqual(addResult.structuredContent, {
+          ...example.add,
+          id: addResult.structuredContent.id,
+          mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+        });
+      }
     } finally {
       // `child` is the shell (`shell: true`), not npx/node directly -- npx
       // and the real server process are its grandchildren. Closing stdin

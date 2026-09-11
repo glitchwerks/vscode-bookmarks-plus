@@ -97,9 +97,13 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     let moveFailed = false;
     if (envelope.scope === 'global') {
       if (!this.globalStore) return;
-      const data = this.globalStore.getAll();
       for (const id of envelope.ids) {
-        try { await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data)); }
+        const data = this.globalStore.getAll();
+        const movingItem = data.items.find(item => item.id === id);
+        let index = targetInfo.index(data);
+        // moveItem removes the source before inserting it, shifting a later sibling target left.
+        if (target?.kind === 'item' && movingItem?.collectionId === targetInfo.collectionId && movingItem.order < index) index--;
+        try { await this.globalStore.moveItem(id, targetInfo.collectionId, index); }
         catch { moveFailed = true; }
       }
     } else {
@@ -227,9 +231,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       if (target.scope !== scope || (scope === 'workspace' && (!sameOwner(owner, target.owner) || !this.isAttachedOwner(target.owner)))) return undefined;
       return {
         collectionId: target.item.collectionId,
-        index: (data) => scope === 'workspace'
-          ? data.items.find(item => item.id === target.item.id)?.order ?? target.item.order
-          : target.item.order
+        index: (data) => data.items.find(item => item.id === target.item.id)?.order ?? target.item.order
       };
     }
     return undefined;

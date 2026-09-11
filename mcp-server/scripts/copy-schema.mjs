@@ -15,13 +15,15 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const mcpServerRoot = join(here, '..');
 
-const schemaSrc = join(mcpServerRoot, '..', 'schemas', 'bookmarks.schema.json');
-const schemaDest = join(mcpServerRoot, 'dist', 'bookmarks.schema.json');
+const schemaNames = ['bookmarks.schema.json', 'live-mcp-bridge-v1.schema.json'];
 
-if (!existsSync(schemaSrc)) {
-  console.error(`copy-schema: schema source not found at ${schemaSrc}`);
-  process.exit(1);
+for (const schemaName of schemaNames) {
+  const schemaSrc = join(mcpServerRoot, '..', 'schemas', schemaName);
+  const schemaDest = join(mcpServerRoot, 'dist', schemaName);
+  if (!existsSync(schemaSrc)) {
+    console.error(`copy-schema: schema source not found at ${schemaSrc}`);
+    process.exit(1);
+  }
+  mkdirSync(dirname(schemaDest), { recursive: true });
+  copyFileSync(schemaSrc, schemaDest);
 }
-
-mkdirSync(dirname(schemaDest), { recursive: true });
-copyFileSync(schemaSrc, schemaDest);

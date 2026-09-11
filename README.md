@@ -116,16 +116,43 @@ To find and use it:
 3. Open Chat in Agent mode, select the tools button, and search for **Bookmarks Plus**. Its
    `list_bookmarks` and `add_bookmark` tools are available to the agent.
 
-The native server uses the same `.vscode/bookmarks.json` mirror described above. Its initial
-scope is intentionally limited:
+VS Code-native definitions use a live bridge to the extension-owned workspace and global stores.
+`list_bookmarks` reads current committed state and `add_bookmark` commits through those stores;
+the native server does not read or write the mirror directly. Workspace changes are still mirrored
+by the extension as described above.
 
-- Each attached root exposes one server with an explicit root path. Removing a root retires its
-  definition; unavailable or colliding roots expose no server. A no-folder window has no attached
-  mirror to expose.
-- It exposes only that root's mirrored bookmarks. Global-bookmark support requires the live bridge tracked
-  in [#129](https://github.com/glitchwerks/vscode-bookmarks-plus/issues/129).
-- It has the same last-write-wins behavior as the mirror and provides the same two tools as the
-  standalone server described below.
+- Each attached root exposes one server bound to that root. It lists the selected root's workspace
+  bookmarks followed by global bookmarks, preserving each store's order. Every item and collection
+  includes `scope: "workspace"` or `scope: "global"`.
+- `add_bookmark` accepts optional `scope`. When both scopes are granted, omission defaults to
+  workspace; with one granted scope, omission uses that scope. An ungranted scope is rejected.
+  Collections are resolved only within the selected scope. Workspace targets must belong to the
+  selected root; global targets may be outside it.
+- A successful add returns `id`, `scope`, and `collection` (or `null`). A returned collection has
+  the same scope as the added bookmark. Live results contain no `mirrorPath` or `workspacePath`.
+- Removing the selected root or reloading the extension closes its live sessions. Restart the MCP
+  server to obtain a fresh connection. Unrelated root changes leave other sessions active.
+  Unavailable or colliding roots expose no server; a no-folder window exposes none.
+- Native bridge failure blocks MCP initialization. The server reports an initialization error with
+  `data.bookmarksPlusCode`, closes, and exits unsuccessfully; it never falls back to mirror access.
+  A bridge that does not become ready within the absolute 10-second startup deadline fails with
+  `bridge-unavailable`. Restart the server after the extension and selected root are available.
+- Remote extension-host support is not claimed; it requires a real remote integration test.
+
+For example, a native `list_bookmarks` result is:
+
+```json
+{
+  "version": 2,
+  "workspaceFolderUri": "file:///workspace",
+  "grantedScopes": ["workspace", "global"],
+  "collections": [],
+  "items": [
+    { "id": "workspace-id", "type": "file", "uri": "file:///workspace/README.md", "collectionId": null, "order": 0, "scope": "workspace" },
+    { "id": "global-id", "type": "folder", "uri": "file:///shared", "collectionId": null, "order": 0, "scope": "global" }
+  ]
+}
+```
 
 See VS Code's [MCP server documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
 for the editor's server-management and trust controls.
@@ -136,8 +163,9 @@ for the editor's server-management and trust controls.
 `.vscode/bookmarks.json` mirror to Claude Desktop and Claude Code over the Model Context
 Protocol (stdio). It reads and writes the same mirror file described above — it has no other
 connection to the extension and works whether or not VS Code is running. Because the mirror only
-ever holds workspace-scoped bookmarks, the MCP server only ever sees those — global bookmarks are
-never visible to it.
+ever holds workspace-scoped bookmarks, direct npm/Claude launches remain workspace-mirror-only —
+global bookmarks are never visible to those launches. The native live bridge above is supplied
+by the extension when VS Code resolves its server definition; it is not standalone configuration.
 
 ### Build
 
@@ -263,6 +291,39 @@ way to pin a workspace under Claude Code.
   an exact duplicate `(uri, collection)` pair and assigns `order` the same way the extension
   does. It **cannot edit or remove** existing bookmarks or collections — that is out of scope
   for this server.
+
+Results are returned as both JSON text and MCP `structuredContent`. Standalone list results keep
+`workspacePath`, `mirrorPath`, `version` (for a nonempty mirror), `collections`, and `items`, with
+additive `scope: "workspace"` on every collection and item. This example reads a version-1 mirror;
+version-2 mirrors return `version: 2`:
+
+```json
+{
+  "workspacePath": "/workspace",
+  "mirrorPath": "/workspace/.vscode/bookmarks.json",
+  "version": 1,
+  "collections": [{ "id": "collection-1", "name": "Core", "order": 0, "scope": "workspace" }],
+  "items": [
+    { "id": "item-1", "type": "file", "uri": "file:///workspace/src/index.ts", "collectionId": "collection-1", "order": 0, "scope": "workspace" },
+    { "id": "item-2", "type": "folder", "uri": "file:///workspace/src/utils", "collectionId": null, "order": 0, "scope": "workspace" }
+  ]
+}
+```
+
+Adding `file:///workspace/README.md` to `collection-1` returns this shape (the ID is generated):
+
+```json
+{
+  "id": "new-bookmark-id",
+  "mirrorPath": "/workspace/.vscode/bookmarks.json",
+  "scope": "workspace",
+  "collection": { "id": "collection-1", "name": "Core", "order": 0, "scope": "workspace" }
+}
+```
+
+An uncollected add returns `collection: null`. Standalone adds accept omitted scope or
+`scope: "workspace"`; `scope: "global"` is rejected without a write. Live adds use the same
+`id`, `scope`, and `collection` fields with the selected scope, and omit `mirrorPath`.
 
 ### Limitations
 

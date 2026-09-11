@@ -10,7 +10,7 @@ import {
   readFileSync,
   writeFileSync,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,8 +25,8 @@ const mcpServerRoot = join(here, '..', '..');
 const repoRoot = join(mcpServerRoot, '..');
 
 // ---------------------------------------------------------------------------
-// Issue #66 / T2 (plan `docs/superpowers/plans/2026-08-30-publish-mcp-server-to-npm.md`,
-// §6 T2, constraint 3.1): mcp-server/scripts/verify-pack.mjs is a permanent,
+// Issue #66 / T2 (original implementation plan, §6 T2, constraint 3.1):
+// mcp-server/scripts/verify-pack.mjs is a permanent,
 // CI-invocable regression guard. It must run `npm pack --json` and assert
 // the resulting file list (a) contains dist/index.js and
 // dist/bookmarks.schema.json, and (b) excludes everything under dist/test.
@@ -132,6 +132,10 @@ function buildScratchTree(mutateManifest?: (pkg: PackageManifest) => void): {
     join(repoRoot, 'schemas', 'bookmarks.schema.json'),
     join(scratchRoot, 'schemas', 'bookmarks.schema.json'),
   );
+  cpSync(
+    join(repoRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+    join(scratchRoot, 'schemas', 'live-mcp-bridge-v1.schema.json'),
+  );
 
   for (const entry of ['scripts', 'src']) {
     cpSync(join(mcpServerRoot, entry), join(scratchMcpServerRoot, entry), { recursive: true });
@@ -221,6 +225,27 @@ test('verify-pack.mjs exits 0 against the current (post-T1) manifest, whose file
     'expected verify-pack.mjs to exit 0 against the unmodified, already-correct manifest ' +
       `(files: ${JSON.stringify(readRealManifest().files)}).\n--- combined output ---\n${result.output}`,
   );
+});
+
+test('npm pack ships the complete live and mirror runtimes without source or fixtures', () => {
+  const { scratchMcpServerRoot } = buildScratchTree();
+  const stdout = execSync('npm pack --json', {
+    cwd: scratchMcpServerRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+  const [packed] = JSON.parse(stdout.slice(stdout.search(/[[{]/))) as Array<{
+    files: Array<{ path: string }>;
+  }>;
+  const paths = packed.files.map(({ path }) => path);
+  for (const required of [
+    'dist/index.js', 'dist/backend.js', 'dist/mirrorBackend.js',
+    'dist/liveBridgeClient.js', 'dist/initializationGate.js', 'dist/runtimeMode.js',
+    'dist/liveBridgeProtocol.js', 'dist/live-mcp-bridge-v1.schema.json',
+    'dist/bookmarks.schema.json', 'README.md', 'LICENSE',
+  ]) {
+    assert.ok(paths.includes(required), `npm tarball is missing ${required}`);
+  }
+  assert.deepEqual(paths.filter((path) =>
+    /(^|\/)(src|test|fixtures)\//.test(path) || /\.fixtures\.json$/.test(path)), []);
 });
 
 // ---------------------------------------------------------------------------

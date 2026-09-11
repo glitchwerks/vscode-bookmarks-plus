@@ -51,6 +51,40 @@ async function readyStore() {
 }
 
 suite('WorkspaceBookmarkStore - move position regression (#62)', () => {
+  test('graceful shutdown fences mutations and drains admitted writes and reconciliation', async () => {
+    const { store, state, ownerA } = await readyStore();
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const update = state.update.bind(state);
+    state.update = async (key, value) => { entered(); await held; await update(key, value); };
+    const first = store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/first' });
+    await started;
+    const second = store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/second' });
+    const reconciled = store.reconcileRoots(roots().slice(0, 1));
+    const admitted = Promise.allSettled([first, second, reconciled]);
+    let stopping: Promise<void> | undefined;
+    try {
+      stopping = store.shutdown();
+      assert.strictEqual(store.shutdown(), stopping);
+      await assert.rejects(store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/late' }), WorkspaceDataUnavailableError);
+      await assert.rejects(store.reconcileRoots([]), WorkspaceDataUnavailableError);
+      let finished = false;
+      void stopping.then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(finished, false);
+      release();
+      await stopping;
+      assert.deepStrictEqual((await admitted).map(result => result.status), ['fulfilled', 'fulfilled', 'fulfilled']);
+      const saved = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+      assert.deepStrictEqual(saved.partitions[0].data.items.map(item => item.uri),
+        ['file:///workspace/a/first', 'file:///workspace/a/second']);
+      assert.strictEqual(saved.partitions[1].attachment, null);
+      await assert.rejects(store.removeItem(ownerA, 'missing'), WorkspaceDataUnavailableError);
+    } finally { release(); await admitted; await stopping; store.dispose(); }
+  });
+
   test('moving within one collection preserves the requested insertion position', async () => {
     const { store, ownerA } = await readyStore();
     const collection = await store.addCollection(ownerA, 'Collection');
@@ -374,6 +408,24 @@ suite('WorkspaceBookmarkStore content operations', () => {
     })), [{ collectionId: null, description: 'item note', order: 0 }]);
   });
 
+  test('addItem normalizes descriptions before returning and persisting owner data', async () => {
+    const { store, state, ownerA } = await readyStore();
+
+    const trimmed = await store.addItem(ownerA, {
+      type: 'file', uri: 'file:///workspace/a/trimmed.ts', description: '  entrypoint  '
+    });
+    const absent = await store.addItem(ownerA, {
+      type: 'file', uri: 'file:///workspace/a/absent.ts', description: '   '
+    });
+
+    assert.strictEqual(trimmed.description, 'entrypoint');
+    assert.strictEqual('description' in absent, false);
+    const persisted = state.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+    const items = persisted.partitions.find((partition) => partition.id === ownerA.partitionId)!.data.items;
+    assert.strictEqual(items.find((item) => item.id === trimmed.id)?.description, 'entrypoint');
+    assert.strictEqual('description' in items.find((item) => item.id === absent.id)!, false);
+  });
+
   test('rejects Unassigned and detached creates without writing', async () => {
     const state = new FakeMemento({
       [WORKSPACE_PARTITION_STORAGE_KEY]: snapshotWithDetachedAndUnassigned()
@@ -416,6 +468,18 @@ suite('WorkspaceBookmarkStore content operations', () => {
       store.getAll().items.map((item: BookmarkItem) => item.uri).sort(),
       ['file:///workspace/a/a.ts', 'file:///workspace/b/b.ts']
     );
+  });
+
+  test('getOwnerData returns a defensive copy', async () => {
+    const { store, ownerA } = await readyStore();
+    await store.addItem(ownerA, { type: 'file', uri: 'file:///workspace/a/a.ts' });
+
+    const first = store.getOwnerData(ownerA)!;
+    first.items.push({
+      id: 'outside', type: 'file', uri: 'file:///workspace/a/outside.ts', collectionId: null, order: 1
+    });
+
+    assert.strictEqual(store.getOwnerData(ownerA)?.items.length, 1);
   });
 
   test('serializes concurrent mutations and persists one snapshot/event per change', async () => {
