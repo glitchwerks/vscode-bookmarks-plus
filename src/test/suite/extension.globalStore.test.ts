@@ -220,6 +220,36 @@ suite('Extension - partitioned activation (#62)', () => {
     } finally { gate.release(); await additions; await stopping; await f.stop(); }
   });
 
+  test('shutdown drains queued workspace mutations with no active mirrors or bridge requests', async () => {
+    const f = activationFixture(['a']);
+    const gate = barrier();
+    let stopping: Promise<void> | undefined;
+    let additions: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await f.start();
+      const owner = { kind: 'partition' as const, partitionId: f.stores.workspace.getView().attached[0].partitionId };
+      const item = await f.stores.workspace.addItem(owner, { type: 'file', uri: 'file:///a/original' });
+      await f.change([]);
+      // Isolate the store's shutdown contract from the coordinator's incidental queue drain.
+      f.coordinator.drainAndFlush = async () => {};
+      const update = f.context.workspaceState.update.bind(f.context.workspaceState);
+      f.context.workspaceState.update = async (key, value) => { await gate.wait(); await update(key, value); };
+      const first = f.stores.workspace.setItemDescription(owner, item.id, 'first');
+      await gate.entered;
+      const second = f.stores.workspace.setItemDescription(owner, item.id, 'second');
+      additions = Promise.allSettled([first, second]);
+      let finished = false;
+      stopping = deactivate().then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.strictEqual(finished, false, 'workspace queue alone must keep shutdown pending');
+      gate.release();
+      await stopping;
+      assert.deepStrictEqual((await additions).map(result => result.status), ['fulfilled', 'fulfilled']);
+      const saved = f.context.workspaceState.get<WorkspacePartitionSnapshot>(WORKSPACE_PARTITION_STORAGE_KEY)!;
+      assert.strictEqual(saved.partitions[0].data.items[0].description, 'second');
+    } finally { gate.release(); await additions; await stopping; await f.stop(); }
+  });
+
   test('shutdown fences issued grants and existing sessions while reconciliation is held', async () => {
     const f = activationFixture(['a']);
     const gate = barrier();

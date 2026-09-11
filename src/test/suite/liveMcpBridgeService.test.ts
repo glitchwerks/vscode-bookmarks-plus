@@ -546,6 +546,13 @@ suite('LiveMcpBridgeService authentication', () => {
     }
   });
 
+  test('does not classify an unrelated persistence error by its disposal message', async () => {
+    const { socket, sessionId } = await client(['global']);
+    globalState.update = async () => { throw new Error('Global bookmark store is disposed.'); };
+    const response = await request(socket, sessionId, 'add', { scope: 'global', uri: ROOT + '/file', type: 'file' });
+    assert.deepStrictEqual(response.error, { code: 'internal-error', message: 'internal-error' });
+  });
+
   test('root reordering and addition preserve sessions past grant expiry; removal revokes only the selected root', async () => {
     const rootB = 'file:///workspace/b';
     const roots = [

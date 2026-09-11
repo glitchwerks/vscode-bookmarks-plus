@@ -53,6 +53,14 @@ export class CollectionNotFoundError extends Error {
 
 const noopOutput: OutputSink = { appendLine: () => {} };
 
+/** Rejects global mutations after admission is fenced or the store is disposed. */
+export class GlobalStoreUnavailableError extends Error {
+  constructor() {
+    super('Global bookmark store is disposed.');
+    this.name = 'GlobalStoreUnavailableError';
+  }
+}
+
 
 export class BookmarkStore implements BookmarkContentReader {
   private data: BookmarkData;
@@ -293,7 +301,7 @@ export class BookmarkStore implements BookmarkContentReader {
 
   private enqueue<T>(operation: (draft: BookmarkData) => { value: T; changed: boolean }): Promise<T> {
     if (!this.acceptingMutations) {
-      return Promise.reject(new Error('Global bookmark store is disposed.'));
+      return Promise.reject(new GlobalStoreUnavailableError());
     }
     const run = this.operationTail.then(async () => {
       this.assertAvailable();
@@ -316,7 +324,7 @@ export class BookmarkStore implements BookmarkContentReader {
 
   private assertAvailable(): void {
     if (this.disposed) {
-      throw new Error('Global bookmark store is disposed.');
+      throw new GlobalStoreUnavailableError();
     }
   }
 }

@@ -36,6 +36,8 @@ export class InitializationGate implements Transport {
     this.inner.onerror = (error) => this.onerror?.(error);
     this.inner.onclose = () => this.didClose();
     this.startup = Promise.resolve().then(() => this.inner.start());
+    // No initialize can arrive after failed startup. Retire the gate without waiting for one.
+    void this.startup.catch(() => this.closeInner()).catch(() => {});
     return this.startup;
   }
 

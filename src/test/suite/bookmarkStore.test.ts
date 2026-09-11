@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { BookmarkStore, DuplicateBookmarkError } from '../../bookmarkStore';
+import { BookmarkStore, DuplicateBookmarkError, GlobalStoreUnavailableError } from '../../bookmarkStore';
 import { BookmarkData } from '../../types';
 import { FakeMemento, FakeOutput } from './fixtures';
 
@@ -278,7 +278,8 @@ suite('BookmarkStore - load and core CRUD', () => {
     store.onBookmarksChanged(() => { events++; });
     store.dispose();
 
-    await assert.rejects(store.addItem({ type: 'file', uri: 'file:///disposed' }), /Global bookmark store is disposed/);
+    await assert.rejects(store.addItem({ type: 'file', uri: 'file:///disposed' }),
+      (error: unknown) => error instanceof GlobalStoreUnavailableError && error.message === 'Global bookmark store is disposed.');
 
     assert.strictEqual(state.updateCallCount, 0);
     assert.strictEqual(events, 0);
@@ -326,7 +327,8 @@ suite('BookmarkStore - load and core CRUD', () => {
     store.dispose();
     state.releaseFirstGlobalUpdate();
     await firstAdd;
-    await assert.rejects(queuedAdd, /Global bookmark store is disposed/);
+    await assert.rejects(queuedAdd,
+      (error: unknown) => error instanceof GlobalStoreUnavailableError && error.message === 'Global bookmark store is disposed.');
     assert.deepStrictEqual(store.getAll().items.map((item) => item.uri), ['file:///in-flight']);
   });
 });

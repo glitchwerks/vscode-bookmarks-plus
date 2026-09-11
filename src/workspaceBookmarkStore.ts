@@ -138,6 +138,8 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
   private snapshot: WorkspacePartitionSnapshot | undefined;
   private unavailableReason: string | undefined;
   private operationTail: Promise<void> = Promise.resolve();
+  private shutdownPromise: Promise<void> | undefined;
+  private acceptingMutations = true;
   private disposed = false;
   private readonly _onBookmarksChanged = new vscode.EventEmitter<void>();
   readonly onBookmarksChanged: vscode.Event<void> = this._onBookmarksChanged.event;
@@ -547,6 +549,9 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
    * against the last committed content; it must never await operations on this store's queue.
    */
   reconcileRoots(roots: readonly RootCandidate[], beforeCommit?: () => void): Promise<RootReconcileResult> {
+    if (!this.acceptingMutations) {
+      return Promise.reject(new WorkspaceDataUnavailableError('Workspace bookmark store is disposed.'));
+    }
     const run = this.operationTail.then(async () => {
       this.assertReady();
       const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);
@@ -707,8 +712,18 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
     } while (tail !== this.operationTail);
   }
 
-  /** Disposes the change event emitter; workspace state itself remains untouched. */
+  /** Fences new work, drains every admitted mutation, then releases store resources. */
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) { return this.shutdownPromise; }
+    this.acceptingMutations = false;
+    this.shutdownPromise = this.operationTail.then(() => this.dispose());
+    return this.shutdownPromise;
+  }
+
+  /** Immediately retires the store, including mutations still waiting in its queue. */
   dispose(): void {
+    if (this.disposed) { return; }
+    this.acceptingMutations = false;
     this.disposed = true;
     this._onBookmarksChanged.dispose();
     this._onDidChangePartitions.dispose();
@@ -858,6 +873,9 @@ export class WorkspaceBookmarkStore implements BookmarkContentReader, vscode.Dis
   }
 
   private enqueue<T>(operation: (draft: WorkspacePartitionSnapshot) => MutationResult<T>): Promise<T> {
+    if (!this.acceptingMutations) {
+      return Promise.reject(new WorkspaceDataUnavailableError('Workspace bookmark store is disposed.'));
+    }
     const run = this.operationTail.then(async () => {
       this.assertReady();
       const draft = cloneWorkspacePartitionSnapshot(this.snapshot!);

@@ -24,6 +24,23 @@ async function makeProvider(resolve: (uri: string) => Promise<{ exists: boolean;
 }
 
 suite('BookmarksTreeDataProvider - default mode', () => {
+  test('global same-collection drop inserts a preceding item before its target', async () => {
+    const workspace = await createSingleRootFixtureStore();
+    const global = new BookmarkStore(new FakeMemento());
+    const cache = new FsGitCache(async () => ({ exists: true }));
+    const provider = new BookmarksTreeDataProvider(workspace, cache, global);
+    const token = new vscode.CancellationTokenSource();
+    try {
+      const collection = await global.addCollection('Global');
+      const first = await global.addItem({ type: 'file', uri: 'file:///first', collectionId: collection.id });
+      const second = await global.addItem({ type: 'file', uri: 'file:///second', collectionId: collection.id });
+      const third = await global.addItem({ type: 'file', uri: 'file:///third', collectionId: collection.id });
+      await provider.handleDrop({ kind: 'item', item: third, scope: 'global' }, makeDropTransfer('global', [first.id]), token.token);
+      assert.deepStrictEqual(global.getAll().items.sort((a, b) => a.order - b.order).map(item => item.id),
+        [second.id, first.id, third.id]);
+    } finally { token.dispose(); global.dispose(); workspace.dispose(); }
+  });
+
   test('empty store yields no root children', async () => {
     const { provider } = await makeProvider();
     const children = await provider.getChildren();

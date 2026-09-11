@@ -48,3 +48,11 @@ test('list_bookmarks exposes no workspace-selecting input schema', () => {
   const list = createListHandler(fakeBackend());
   assert.deepEqual(Object.keys(list.inputSchema), []);
 });
+
+test('list_bookmarks sanitizes an untyped backend error', async () => {
+  const backend = fakeBackend({ list: async () => { throw new Error('private bootstrap token'); } });
+  const result = await createListHandler(backend).handler({});
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: 'text', text: 'The bookmarks backend failed to list bookmarks.' }]);
+  assert.ok(!JSON.stringify(result).includes('private bootstrap token'));
+});

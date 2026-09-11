@@ -8,6 +8,7 @@ import * as vscode from 'vscode';
 import {
   CollectionNotFoundError,
   DuplicateBookmarkError,
+  GlobalStoreUnavailableError,
   type AddItemInput,
   type BookmarkStore,
   type OutputSink
@@ -244,7 +245,7 @@ export class LiveMcpBridgeService {
           : error instanceof CollectionNotFoundError ? 'collection-not-found'
           : error instanceof PartitionBoundaryError ? 'bookmark-outside-root'
           : error instanceof WorkspaceDataUnavailableError
-            || (error instanceof Error && error.message === 'Global bookmark store is disposed.') ? 'store-unavailable'
+            || error instanceof GlobalStoreUnavailableError ? 'store-unavailable'
           : 'internal-error';
         response.error = { code, message: code };
         if (code === 'internal-error') {

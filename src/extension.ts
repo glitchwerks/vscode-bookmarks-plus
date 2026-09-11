@@ -554,10 +554,10 @@ function shutdownRuntime(runtime: NonNullable<typeof activeRuntime>): Promise<vo
     await bridgeStopped;
     try { await runtime.mirrors.drainAndFlush(); }
     catch { runtime.output.appendLine('Bookmarks Plus: workspace mirror flush failed.'); }
-    for (const resource of [runtime.mirrors, runtime.store]) {
-      try { resource.dispose(); }
-      catch { runtime.output.appendLine('Bookmarks Plus: workspace resource disposal failed.'); }
-    }
+    try { runtime.mirrors.dispose(); }
+    catch { runtime.output.appendLine('Bookmarks Plus: workspace resource disposal failed.'); }
+    try { await runtime.store.shutdown(); }
+    catch { runtime.output.appendLine('Bookmarks Plus: workspace store shutdown failed.'); }
     try { await runtime.globalStore.shutdown(); }
     catch { runtime.output.appendLine('Bookmarks Plus: Global store shutdown failed.'); }
   }).finally(() => {

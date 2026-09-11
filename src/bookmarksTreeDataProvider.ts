@@ -99,7 +99,11 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       if (!this.globalStore) return;
       for (const id of envelope.ids) {
         const data = this.globalStore.getAll();
-        try { await this.globalStore.moveItem(id, targetInfo.collectionId, targetInfo.index(data)); }
+        const movingItem = data.items.find(item => item.id === id);
+        let index = targetInfo.index(data);
+        // moveItem removes the source before inserting it, shifting a later sibling target left.
+        if (target?.kind === 'item' && movingItem?.collectionId === targetInfo.collectionId && movingItem.order < index) index--;
+        try { await this.globalStore.moveItem(id, targetInfo.collectionId, index); }
         catch { moveFailed = true; }
       }
     } else {

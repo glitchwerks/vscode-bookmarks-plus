@@ -43,3 +43,11 @@ test('a disabled add handler returns its configured reason', async () => {
   assert.equal(result.isError, true);
   assert.equal((result.content[0] as { text: string }).text, 'No folder.');
 });
+
+test('add_bookmark sanitizes an untyped backend error', async () => {
+  const backend = fakeBackend({ add: async () => { throw new Error('private bootstrap token'); } });
+  const result = await createAddHandler(backend).handler({ uri: 'file:///workspace/a.ts', type: 'file' });
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: 'text', text: 'The bookmarks backend failed to add a bookmark.' }]);
+  assert.ok(!JSON.stringify(result).includes('private bootstrap token'));
+});

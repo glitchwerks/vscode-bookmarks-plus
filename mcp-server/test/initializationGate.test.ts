@@ -21,6 +21,23 @@ async function createGate(inner: Transport): Promise<Gate> {
 const initialize: JSONRPCMessage = { jsonrpc: '2.0', id: 7, method: 'initialize', params: {} };
 const discovery: JSONRPCMessage = { jsonrpc: '2.0', id: 8, method: 'tools/list' };
 
+test('rejected transport startup settles failure without initialize and closes once', { timeout: 1000 }, async () => {
+  let closes = 0;
+  let notifications = 0;
+  const inner: Transport = {
+    start: async () => { throw new Error('start failed'); },
+    send: async () => { assert.fail('a failed transport cannot send'); },
+    close: async () => { closes++; },
+  };
+  const gate = await createGate(inner);
+  gate.onclose = () => { notifications++; };
+  await assert.rejects(gate.start(), /start failed/);
+  await gate.fail('bridge-unavailable', 'Unavailable.');
+  await Promise.all([gate.close(), gate.fail('bridge-unavailable', 'Unavailable.')]);
+  assert.equal(closes, 1);
+  assert.equal(notifications, 1);
+});
+
 test('gate holds stdio initialize and discovery and releases unchanged messages in order', async () => {
   const input = new PassThrough();
   const output = new PassThrough();
