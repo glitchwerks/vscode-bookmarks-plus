@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import {
   createWriteStream,
   existsSync,
@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
 import vsce from '@vscode/vsce';
 import yauzl from 'yauzl';
+import { runRestrictedProcess } from './restricted-test-process.mjs';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const suitePath = join(repoRoot, 'scripts', 'packaged-native-mcp-suite.cjs');
@@ -103,24 +104,15 @@ async function extractVsix(archivePath, destination) {
 /** Keep Workspace Trust enabled: test-electron runTests hardcodes its disabling flag. */
 async function runRestrictedTests(options) {
   const executable = await downloadAndUnzipVSCode(options.version);
-  await new Promise((resolveRun, reject) => {
-    const child = spawn(executable, [
-      ...options.launchArgs,
-      '--no-sandbox',
-      '--disable-gpu-sandbox',
-      '--disable-updates',
-      `--extensionTestsPath=${options.extensionTestsPath}`,
-      ...options.extensionDevelopmentPath.map(value => `--extensionDevelopmentPath=${value}`),
-    ], {
-      env: { ...process.env, ...options.extensionTestsEnv },
-      stdio: 'inherit',
-    });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      console.log(`Restricted Mode VS Code exit: ${code ?? signal}`);
-      if (code === 0) resolveRun();
-      else reject(new Error(`Restricted Mode test failed (exit ${code}, signal ${signal})`));
-    });
+  await runRestrictedProcess(executable, [
+    ...options.launchArgs,
+    '--no-sandbox',
+    '--disable-gpu-sandbox',
+    '--disable-updates',
+    `--extensionTestsPath=${options.extensionTestsPath}`,
+    ...options.extensionDevelopmentPath.map(value => `--extensionDevelopmentPath=${value}`),
+  ], {
+    env: { ...process.env, ...options.extensionTestsEnv },
   });
 }
 

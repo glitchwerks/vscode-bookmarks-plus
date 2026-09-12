@@ -177,19 +177,22 @@ async function startWithOptionalBookmarksMcp(
     return launchWithoutBookmarks();
   }
 
-  try {
+  // Example consumer-owned budget, shared by discovery, activation, and the request.
+  const timeoutMs = 5_000;
+  const deadline = performance.now() + timeoutMs;
+  const discoverDescriptor = async (): Promise<McpConnectionDescriptor | undefined> => {
     const extension = vscode.extensions.getExtension<unknown>(
       'cbeaulieu-gt.vscode-bookmarks-plus'
     );
-    if (extension === undefined) {
-      return launchWithoutBookmarks();
+    if (extension === undefined || performance.now() >= deadline) {
+      return undefined;
     }
 
     const candidate = await extension.activate();
-    if (!isBookmarksPlusApiV1(candidate) ||
+    if (performance.now() >= deadline || !isBookmarksPlusApiV1(candidate) ||
         !candidate.capabilities.mcpConnection.transports.includes('stdio') ||
         !candidate.capabilities.mcpConnection.descriptorVersions.includes(1)) {
-      return launchWithoutBookmarks();
+      return undefined;
     }
 
     const result = await candidate.requestMcpConnection({
@@ -197,21 +200,32 @@ async function startWithOptionalBookmarksMcp(
       scopes: ['workspace', 'global'],
       supportedDescriptorVersions: [1]
     });
-    if (result.kind === 'error') {
-      return launchWithoutBookmarks();
-    }
+    return performance.now() < deadline && result.kind === 'success'
+      ? result.descriptor : undefined;
+  };
 
-    return launchWithMcpDescriptor(result.descriptor);
-  } catch {
-    return launchWithoutBookmarks();
-  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<undefined>(resolve => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+  const descriptor = await Promise.race([discoverDescriptor(), timedOut])
+    .catch(() => undefined)
+    .finally(() => clearTimeout(timer));
+
+  // Only the race winner selects a launch. Late promises have no launch side effects.
+  // Keep launch errors outside the discovery catch so they cannot start a second launch.
+  return descriptor === undefined || performance.now() >= deadline
+    ? launchWithoutBookmarks()
+    : launchWithMcpDescriptor(descriptor);
 }
 ```
 
-Use a finite timeout around activation and the request, and treat a timeout, rejected promise, or
-typed `McpConnectionFailure` as the same graceful fallback. Do not launch a descriptor that arrives
-after that fallback begins. The example's `isBookmarksPlusApiV1` is a consumer-owned runtime type
-guard; it must validate `apiVersion.major === 1` and the capabilities the consumer needs.
+The example uses one finite overall deadline and treats a timeout, rejected promise, or typed
+`McpConnectionFailure` as the same graceful fallback. The five-second budget is an example, not an
+API requirement; choose a finite budget appropriate for your consumer. A timed-out operation can
+still settle later, but its descriptor is discarded. The example's `isBookmarksPlusApiV1` is a
+consumer-owned runtime type guard; it must validate `apiVersion.major === 1` and the capabilities
+the consumer needs.
 
 The v1 public shapes are:
 
@@ -521,9 +535,9 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
   `dist/bookmarks-plus-mcp.mjs` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
 - `npm run test:mcp-bundle` — verify the bundled MCP server and packaged VSIX contents
-- `npm run test:packaged-mcp` — package a real VSIX, verify native provider behavior, and exercise
-  a second extension consuming the returned public API in trusted, missing, incompatible, and
-  Restricted Mode scenarios
+- `npm run test:packaged-mcp` — check the Restricted Mode process deadline, package a real VSIX,
+  verify native provider behavior, and exercise a second extension consuming the returned public
+  API in trusted, missing, incompatible, and Restricted Mode scenarios
 - Marketplace publishes and GitHub Releases are gated on the MCP bundle check plus packaged-VSIX
   validation on Linux and Windows, all pinned to one immutable tag commit; see
   [`docs/release-strategy.md`](docs/release-strategy.md).
