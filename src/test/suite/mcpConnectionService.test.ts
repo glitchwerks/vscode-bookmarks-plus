@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
   BookmarkScope,
+  McpConnectionDescriptor,
   McpConnectionErrorCode,
   McpConnectionFailure,
   McpConnectionRequest,
@@ -22,6 +23,47 @@ import {
 
 const ROOT = 'file:///workspace';
 const EXPIRES_AT = 1_800_000_000_000;
+
+/** Deliberately synthetic: verifies evolution without publishing a production v2. */
+interface TestOnlyDescriptorV2 {
+  readonly version: 2;
+  readonly transport: 'test-only';
+  readonly fixtureValue: string;
+}
+
+type TestOnlyConnectionResult = McpConnectionFailure | {
+  readonly kind: 'success';
+  readonly descriptor: McpConnectionDescriptor | TestOnlyDescriptorV2;
+};
+
+/** Consumer-style narrowing must distinguish failures and both descriptor shapes. */
+function describeTestOnlyResult(result: TestOnlyConnectionResult): string {
+  if (result.kind === 'error') {
+    const failure: McpConnectionFailure = result;
+    // @ts-expect-error Failures cannot expose success launch material.
+    void result.descriptor;
+    return failure.error.code;
+  }
+  const descriptor = result.descriptor;
+  switch (descriptor.version) {
+    case 1: {
+      const v1: McpConnectionDescriptor = descriptor;
+      // @ts-expect-error Narrowing to v1 excludes the synthetic v2-only field.
+      void descriptor.fixtureValue;
+      return v1.command;
+    }
+    case 2: {
+      const v2: TestOnlyDescriptorV2 = descriptor;
+      // @ts-expect-error Narrowing to v2 excludes v1 launch fields.
+      void descriptor.command;
+      return v2.fixtureValue;
+    }
+    default: {
+      const exhaustive: never = descriptor;
+      return exhaustive;
+    }
+  }
+}
 
 interface MutableBridge extends McpBridgeGrantIssuer {
   activationGeneration: string;
@@ -138,6 +180,24 @@ suite('Bookmarks Plus API v1 MCP connection service (#138)', () => {
   test('selects the highest mutual descriptor version', () => {
     assert.strictEqual(selectHighestMutualDescriptorVersion([1, 2], [1, 2]), 2);
     assert.strictEqual(selectHighestMutualDescriptorVersion([1], [2]), undefined);
+  });
+
+  test('selects a test-only second descriptor and narrows each result variant', async () => {
+    const fixture = createFixture();
+    const api = createBookmarksPlusApi(fixture.deps);
+    const v1 = requireSuccess(await api.requestMcpConnection(request()));
+    const v2: TestOnlyDescriptorV2 = {
+      version: 2, transport: 'test-only', fixtureValue: 'selected test-only v2'
+    };
+    const descriptors = [v1.descriptor, v2] as const;
+    const version = selectHighestMutualDescriptorVersion([2, 1], descriptors.map(value => value.version));
+    const selected = descriptors.find(value => value.version === version);
+    assert.ok(selected);
+
+    assert.strictEqual(describeTestOnlyResult({ kind: 'success', descriptor: selected }), 'selected test-only v2');
+    assert.strictEqual(describeTestOnlyResult(v1), fixture.deps.executablePath);
+    const failure = await api.requestMcpConnection(request({ supportedDescriptorVersions: [2] }));
+    assert.strictEqual(describeTestOnlyResult(failure), 'unsupported-descriptor-version');
   });
 
   test('publishes a deeply frozen v1.0 capability snapshot', () => {
@@ -300,6 +360,42 @@ suite('Bookmarks Plus API v1 MCP connection service (#138)', () => {
     assert.strictEqual(fixture.checkedBundlePath, undefined);
     assert.strictEqual(fixture.issuedRequests.length, 0);
   });
+
+  for (const phase of ['during', 'after'] as const) {
+    test(`prefers shutting-down over an absent bundle when shutdown begins ${phase} isFile`, async () => {
+      const fixture = createFixture();
+      fixture.bundlePresent = false;
+      fixture.onIsFile = () => {
+        const shutdown = () => { fixture.shuttingDown = true; };
+        // A queued microtask runs after isFile returns, before its await resumes.
+        if (phase === 'after') { queueMicrotask(shutdown); }
+        else { shutdown(); }
+      };
+
+      const result = await createBookmarksPlusApi(fixture.deps).requestMcpConnection(request());
+
+      assert.ok(fixture.checkedBundlePath);
+      assert.strictEqual(requireFailure(result, 'shutting-down').error.retryable, true);
+      assert.strictEqual(fixture.issuedRequests.length, 0);
+    });
+
+    test(`prefers stale-request over an absent bundle when the selected root is removed ${phase} isFile`, async () => {
+      const fixture = createFixture();
+      fixture.bundlePresent = false;
+      fixture.onIsFile = () => {
+        const removeRoot = () => { fixture.folders = []; };
+        // Cover both the check itself and the gap before its awaiting continuation.
+        if (phase === 'after') { queueMicrotask(removeRoot); }
+        else { removeRoot(); }
+      };
+
+      const result = await createBookmarksPlusApi(fixture.deps).requestMcpConnection(request());
+
+      assert.ok(fixture.checkedBundlePath);
+      assert.strictEqual(requireFailure(result, 'stale-request').error.retryable, true);
+      assert.strictEqual(fixture.issuedRequests.length, 0);
+    });
+  }
 
   test('returns stale-request without a grant when the attachment changes during the bundle check', async () => {
     const fixture = createFixture();

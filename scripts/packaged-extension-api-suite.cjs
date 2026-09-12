@@ -86,8 +86,9 @@ async function run() {
   console.log(`Packaged public API scenario passed: ${scenario}`);
 }
 
-/** Use the public descriptor from an unrelated cwd and verify both granted scopes. */
-async function exerciseDescriptor(descriptor, folders, expectedMcpVersion) {
+/** Launch a JSON-round-tripped public DTO from an unrelated cwd and verify both scopes. */
+async function exerciseDescriptor(publicDescriptor, folders, expectedMcpVersion) {
+  const descriptor = JSON.parse(JSON.stringify(publicDescriptor));
   assert.equal(descriptor.version, 1);
   assert.equal(descriptor.transport, 'stdio');
   assert.equal(path.isAbsolute(descriptor.command), true);

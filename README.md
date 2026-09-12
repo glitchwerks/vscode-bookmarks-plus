@@ -306,8 +306,9 @@ named in `sensitiveEnvKeys`, and never log or persist the descriptor. Start the 
 
 Each descriptor names exactly one current workspace root. Its `grantedScopes` use canonical order:
 `workspace`, then `global`. Request scopes explicitly; there is no implicit global scope. The
-launched process cannot use cross-root or unassigned data, and each new process needs a new request
-and descriptor.
+launched process can access workspace-scoped data only from the selected root, excluding other
+roots and the unassigned partition. A granted `global` scope exposes the global store, including
+bookmarks outside the selected root. Each new process needs a new request and descriptor.
 
 ### Trust, lifecycle, and current limitations
 
