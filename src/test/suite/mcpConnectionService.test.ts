@@ -203,6 +203,35 @@ suite('Bookmarks Plus API v1 MCP connection service (#138)', () => {
     });
   });
 
+  const sparseScopes = Array<string>(2);
+  sparseScopes[1] = 'workspace';
+  const sparseDescriptorVersions = Array<number>(2);
+  sparseDescriptorVersions[0] = 1;
+
+  for (const [label, input] of [
+    ['scopes', {
+      workspaceFolderUri: ROOT,
+      scopes: sparseScopes,
+      supportedDescriptorVersions: [1]
+    }],
+    ['descriptor versions', {
+      workspaceFolderUri: ROOT,
+      scopes: ['workspace'],
+      supportedDescriptorVersions: sparseDescriptorVersions
+    }]
+  ] as const) {
+    test(`rejects sparse ${label} as a non-retryable invalid request without issuing a grant`, async () => {
+      const fixture = createFixture();
+
+      const result = await createBookmarksPlusApi(fixture.deps).requestMcpConnection(
+        input as unknown as McpConnectionRequest
+      );
+
+      assert.strictEqual(requireFailure(result, 'invalid-request').error.retryable, false);
+      assert.strictEqual(fixture.issuedRequests.length, 0);
+    });
+  }
+
   test('ignores unknown request properties for additive compatibility', async () => {
     const fixture = createFixture();
     const api = createBookmarksPlusApi(fixture.deps);

@@ -83,17 +83,20 @@ function validateRequest(request: unknown): ValidationResult {
     return failure('invalid-request', 'The workspace folder URI must identify an absolute root.');
   }
 
-  if (!Array.isArray(value.scopes) || value.scopes.length === 0
-    || new Set(value.scopes).size !== value.scopes.length
-    || value.scopes.some(scope => typeof scope !== 'string')) {
+  const requestedScopes = Array.isArray(value.scopes) ? Array.from(value.scopes) : undefined;
+  if (!requestedScopes || requestedScopes.length === 0
+    || new Set(requestedScopes).size !== requestedScopes.length
+    || requestedScopes.some(scope => typeof scope !== 'string')) {
     return failure('invalid-request', 'Scopes must be a non-empty list of unique strings.');
   }
-  if (value.scopes.some(scope => scope !== 'workspace' && scope !== 'global')) {
+  if (requestedScopes.some(scope => scope !== 'workspace' && scope !== 'global')) {
     return failure('unsupported-scope', 'One or more requested scopes are not supported.');
   }
 
-  const versions = value.supportedDescriptorVersions;
-  if (!Array.isArray(versions) || versions.length === 0
+  const versions = Array.isArray(value.supportedDescriptorVersions)
+    ? Array.from(value.supportedDescriptorVersions)
+    : undefined;
+  if (!versions || versions.length === 0
     || new Set(versions).size !== versions.length
     || versions.some(version => typeof version !== 'number'
       || !Number.isInteger(version) || version <= 0)) {
@@ -108,7 +111,6 @@ function validateRequest(request: unknown): ValidationResult {
     return failure('unsupported-descriptor-version', 'No requested descriptor version is supported.');
   }
 
-  const requestedScopes = value.scopes as BookmarkScope[];
   const scopes = Object.freeze(
     (['workspace', 'global'] as const).filter(scope => requestedScopes.includes(scope))
   );
