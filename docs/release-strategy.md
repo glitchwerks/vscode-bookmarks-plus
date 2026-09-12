@@ -216,6 +216,8 @@ pre-release lane using the odd/even minor rule above.
    - Test the packaged VSIX integration on both Linux and Windows.
    - Block Marketplace publication and GitHub Release creation unless every MCP
      release gate succeeds for the same immutable commit resolved from the tag.
+   - Rewrite relative Marketplace README links and images against that immutable
+     commit instead of the mutable repository `HEAD`.
    - Publish the extension to the VS Code Marketplace (stable or pre-release
      channel, determined automatically from the minor parity).
    - Create a GitHub Release for the tag using the matching CHANGELOG entry as
