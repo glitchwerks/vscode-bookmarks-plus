@@ -14,6 +14,13 @@
   "icon": "images/icon.png",
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Bookmarks Plus MCP access can start a process with access to workspace bookmark data."
+    }
+  },
   "contributes": {
     "mcpServerDefinitionProviders": [
       { "id": "bookmarks-plus.mcp", "label": "Bookmarks Plus" }

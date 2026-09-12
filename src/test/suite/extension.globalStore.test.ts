@@ -3,6 +3,7 @@ import * as net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import * as vscode from 'vscode';
+import type { BookmarksPlusApiV1 } from '../../bookmarksPlusApi';
 import { LiveMcpBridgeService, LiveMcpBridgeServiceOptions } from '../../liveMcpBridgeService';
 import { BookmarkData } from '../../types';
 import { activate, deactivate } from '../../extension';
@@ -30,6 +31,8 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
   const lifecycle: string[] = [];
   const deps = {
     isWorkspaceTrusted: () => true,
+    isMcpBundleFile: async () => true,
+    mcpExecutablePath: process.execPath,
     startLiveBridge: async (options: LiveMcpBridgeServiceOptions) => {
       assert.ok(options.workspaceStore instanceof WorkspaceBookmarkStore);
       assert.deepStrictEqual(options.globalStore.getAll().items, []);
@@ -58,7 +61,12 @@ function activationFixture(names = ['a', 'b'], malformed = false) {
     get provider() { assert.ok(provider); return provider; },
     get coordinator() { assert.ok(coordinator); return coordinator; },
     get mcp() { assert.ok(mcp); return mcp; },
-    async start() { await activate(context as unknown as vscode.ExtensionContext, deps as unknown as Parameters<typeof activate>[1]); },
+    async start(): Promise<BookmarksPlusApiV1 | undefined> {
+      return activate(
+        context as unknown as vscode.ExtensionContext,
+        deps as unknown as Parameters<typeof activate>[1]
+      );
+    },
     async change(names: string[]) {
       folders = names.map((name, index) => ({ name, index, uri: vscode.Uri.parse('file:///' + name) }));
       await changed?.();
@@ -299,7 +307,14 @@ suite('Extension - partitioned activation (#62)', () => {
   test('trusted activation starts the bridge after store initialization and before provider registration', async () => {
     const f = activationFixture(['a']);
     try {
-      await f.start();
+      const api = await f.start();
+      assert.deepStrictEqual(api?.apiVersion, { major: 1, minor: 0 });
+      const result = await api!.requestMcpConnection({
+        workspaceFolderUri: 'file:///a',
+        scopes: ['workspace'],
+        supportedDescriptorVersions: [1]
+      });
+      assert.strictEqual(result.kind, 'success');
       assert.deepStrictEqual(f.lifecycle, ['bridge', 'provider']);
       const token = { isCancellationRequested: false } as vscode.CancellationToken;
       const definition = (await f.mcp.provideMcpServerDefinitions(token))![0];
@@ -312,7 +327,8 @@ suite('Extension - partitioned activation (#62)', () => {
     const f = activationFixture(['a']);
     f.deps.isWorkspaceTrusted = () => false;
     try {
-      await f.start();
+      const api = await f.start();
+      assert.strictEqual(api, undefined);
       assert.deepStrictEqual(f.lifecycle, []);
       assert.strictEqual(f.registeredMcp, undefined);
       await f.stores.global.addItem({ type: 'file', uri: 'file:///global' });
@@ -354,7 +370,15 @@ suite('Extension - partitioned activation (#62)', () => {
     const f = activationFixture(['a']);
     f.deps.startLiveBridge = async () => { throw new Error('private endpoint'); };
     try {
-      await f.start();
+      const api = await f.start();
+      assert.deepStrictEqual(api?.apiVersion, { major: 1, minor: 0 });
+      const result = await api!.requestMcpConnection({
+        workspaceFolderUri: 'file:///a',
+        scopes: ['workspace'],
+        supportedDescriptorVersions: [1]
+      });
+      assert.strictEqual(result.kind, 'error');
+      assert.strictEqual(result.error.code, 'temporarily-unavailable');
       const token = {} as vscode.CancellationToken;
       const definition = (await f.mcp.provideMcpServerDefinitions(token))![0];
       assert.strictEqual(await f.mcp.resolveMcpServerDefinition!(definition, token), undefined);

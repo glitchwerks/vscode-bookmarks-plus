@@ -4,6 +4,13 @@ import * as path from 'path';
 
 interface ExtensionManifest {
   engines?: { vscode?: string };
+  extensionKind?: string[];
+  capabilities?: {
+    untrustedWorkspaces?: {
+      supported?: boolean;
+      description?: string;
+    };
+  };
   contributes?: {
     mcpServerDefinitionProviders?: Array<{ id: string; label: string }>;
   };
@@ -29,5 +36,15 @@ suite('MCP provider manifest contract (#126)', () => {
     assert.deepStrictEqual(manifest.contributes?.mcpServerDefinitionProviders, [
       { id: 'bookmarks-plus.mcp', label: 'Bookmarks Plus' }
     ]);
+  });
+
+  test('runs in the workspace host and disables itself in untrusted workspaces', () => {
+    const manifest = readManifest();
+
+    assert.deepStrictEqual(manifest.extensionKind, ['workspace']);
+    assert.deepStrictEqual(manifest.capabilities?.untrustedWorkspaces, {
+      supported: false,
+      description: 'Bookmarks Plus MCP access can start a process with access to workspace bookmark data.'
+    });
   });
 });
