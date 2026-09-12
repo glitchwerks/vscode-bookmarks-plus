@@ -157,6 +157,171 @@ For example, a native `list_bookmarks` result is:
 See VS Code's [MCP server documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
 for the editor's server-management and trust controls.
 
+## Using Bookmarks Plus from another VS Code extension
+
+Bookmarks Plus exposes an optional, versioned API to other extensions in the same Node workspace
+extension host. Discover it with the extension ID `cbeaulieu-gt.vscode-bookmarks-plus`. Do not
+declare it as an `extensionDependencies` dependency when your primary feature works without it:
+the producer may be absent, incompatible, unavailable, or disabled in Restricted Mode.
+
+Check Workspace Trust before looking up or activating the producer. In Restricted Mode, continue
+with the consumer's normal fallback instead of attempting to obtain an MCP connection:
+
+```ts
+import * as vscode from 'vscode';
+
+async function startWithOptionalBookmarksMcp(
+  selectedRoot: vscode.WorkspaceFolder
+): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    return launchWithoutBookmarks();
+  }
+
+  try {
+    const extension = vscode.extensions.getExtension<unknown>(
+      'cbeaulieu-gt.vscode-bookmarks-plus'
+    );
+    if (extension === undefined) {
+      return launchWithoutBookmarks();
+    }
+
+    const candidate = await extension.activate();
+    if (!isBookmarksPlusApiV1(candidate) ||
+        !candidate.capabilities.mcpConnection.transports.includes('stdio') ||
+        !candidate.capabilities.mcpConnection.descriptorVersions.includes(1)) {
+      return launchWithoutBookmarks();
+    }
+
+    const result = await candidate.requestMcpConnection({
+      workspaceFolderUri: selectedRoot.uri.toString(true),
+      scopes: ['workspace', 'global'],
+      supportedDescriptorVersions: [1]
+    });
+    if (result.kind === 'error') {
+      return launchWithoutBookmarks();
+    }
+
+    return launchWithMcpDescriptor(result.descriptor);
+  } catch {
+    return launchWithoutBookmarks();
+  }
+}
+```
+
+Use a finite timeout around activation and the request, and treat a timeout, rejected promise, or
+typed `McpConnectionFailure` as the same graceful fallback. Do not launch a descriptor that arrives
+after that fallback begins. The example's `isBookmarksPlusApiV1` is a consumer-owned runtime type
+guard; it must validate `apiVersion.major === 1` and the capabilities the consumer needs.
+
+The v1 public shapes are:
+
+```ts
+export type BookmarkScope = 'workspace' | 'global';
+
+export interface BookmarksPlusApiVersion {
+  readonly major: 1;
+  readonly minor: number;
+}
+
+export type McpTransport = 'stdio';
+
+export interface McpConnectionCapabilities {
+  readonly descriptorVersions: readonly number[];
+  readonly transports: readonly McpTransport[];
+  readonly scopes: readonly BookmarkScope[];
+  readonly rootSelection: 'explicit-workspace-folder';
+  readonly sessionLifecycle: 'pinned-root';
+}
+
+export interface BookmarksPlusCapabilities {
+  readonly mcpConnection: McpConnectionCapabilities;
+}
+
+export interface BookmarksPlusApiV1 {
+  readonly apiVersion: BookmarksPlusApiVersion;
+  readonly capabilities: BookmarksPlusCapabilities;
+  requestMcpConnection(request: McpConnectionRequest): Promise<McpConnectionResult>;
+}
+
+export interface McpConnectionRequest {
+  readonly workspaceFolderUri: string;
+  readonly scopes: readonly BookmarkScope[];
+  readonly supportedDescriptorVersions: readonly number[];
+}
+
+export interface McpStdioDescriptorV1 {
+  readonly version: 1;
+  readonly transport: 'stdio';
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env: Readonly<Record<string, string>>;
+  readonly sensitiveEnvKeys: readonly string[];
+  readonly workspaceFolderUri: string;
+  readonly grantedScopes: readonly BookmarkScope[];
+  readonly bootstrapExpiresAt: string;
+}
+
+export type McpConnectionDescriptor = McpStdioDescriptorV1;
+
+export interface McpConnectionSuccess {
+  readonly kind: 'success';
+  readonly descriptor: McpConnectionDescriptor;
+}
+
+export type McpConnectionErrorCode =
+  | 'invalid-request'
+  | 'unsupported-descriptor-version'
+  | 'workspace-folder-not-found'
+  | 'workspace-folder-unavailable'
+  | 'unsupported-scope'
+  | 'stale-request'
+  | 'temporarily-unavailable'
+  | 'shutting-down';
+
+export interface McpConnectionFailure {
+  readonly kind: 'error';
+  readonly error: {
+    readonly code: McpConnectionErrorCode;
+    readonly message: string;
+    readonly retryable: boolean;
+  };
+}
+
+export type McpConnectionResult = McpConnectionSuccess | McpConnectionFailure;
+```
+
+### Compatibility and descriptor handling
+
+API major `1` is the compatibility boundary. Minor releases can add optional capabilities or
+fields. Consumers and producers negotiate the highest mutually supported descriptor version;
+unknown fields are ignored. A field change that an existing descriptor consumer cannot safely
+ignore requires a new descriptor version. Breaking a method or result's semantics requires a new
+API major.
+
+Treat a successful descriptor as opaque, short-lived launch material. Forward `command`, `args`,
+and `env` unchanged to the subprocess. `env` overlays the consumer's inherited environment, with
+descriptor values winning on collisions. Do not set a required `cwd`. Redact the value of every key
+named in `sensitiveEnvKeys`, and never log or persist the descriptor. Start the process before
+`bootstrapExpiresAt`.
+
+Each descriptor names exactly one current workspace root. Its `grantedScopes` use canonical order:
+`workspace`, then `global`. Request scopes explicitly; there is no implicit global scope. The
+launched process cannot use cross-root or unassigned data, and each new process needs a new request
+and descriptor.
+
+### Trust, lifecycle, and current limitations
+
+After Workspace Trust is granted, any installed extension in the same host may call API v1; the
+API does not authenticate an individual calling extension. Both extensions must run in the Node
+workspace extension host (`extensionKind` is `"workspace"`). Remote extension-host support is not
+claimed.
+
+A bootstrap authorization is single-use. Its expiry applies only before initialization; an active
+session has no periodic expiry. Removing the selected root, reloading the producer, or disposing
+the producer closes the server. Changes to unrelated roots do not close it. Bookmarks Plus does
+not hot-reconnect a running client: a consumer that needs another process or reconnect attempt must
+request a fresh descriptor and retain its own fallback behavior.
+
 ## Using bookmarks from Claude (MCP server)
 
 `mcp-server/` is a standalone Node/TypeScript package that exposes a workspace's
@@ -355,7 +520,9 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
   `dist/bookmarks-plus-mcp.mjs` via esbuild
 - `npm test` — compile tests, then run the full suite in a headless VS Code Extension Development Host
 - `npm run test:mcp-bundle` — verify the bundled MCP server and packaged VSIX contents
-- `npm run test:packaged-mcp` — package a real VSIX and exercise its bundled MCP server in a VS Code Extension Host
+- `npm run test:packaged-mcp` — package a real VSIX, verify native provider behavior, and exercise
+  a second extension consuming the returned public API in trusted, missing, incompatible, and
+  Restricted Mode scenarios
 - Marketplace publishes and GitHub Releases are gated on the MCP bundle check plus packaged-VSIX
   validation on Linux and Windows, all pinned to one immutable tag commit; see
   [`docs/release-strategy.md`](docs/release-strategy.md).
