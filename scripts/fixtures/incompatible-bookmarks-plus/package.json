@@ -1,0 +1,10 @@
+{
+  "name": "vscode-bookmarks-plus",
+  "publisher": "cbeaulieu-gt",
+  "version": "2.0.0",
+  "engines": { "vscode": "^1.101.0" },
+  "extensionKind": ["workspace"],
+  "capabilities": { "untrustedWorkspaces": { "supported": true } },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.cjs"
+}

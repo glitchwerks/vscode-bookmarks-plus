@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   createWriteStream,
   existsSync,
@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
-import { runTests } from '@vscode/test-electron';
+import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
 import vsce from '@vscode/vsce';
 import yauzl from 'yauzl';
 
@@ -100,6 +100,30 @@ async function extractVsix(archivePath, destination) {
   });
 }
 
+/** Keep Workspace Trust enabled: test-electron runTests hardcodes its disabling flag. */
+async function runRestrictedTests(options) {
+  const executable = await downloadAndUnzipVSCode(options.version);
+  await new Promise((resolveRun, reject) => {
+    const child = spawn(executable, [
+      ...options.launchArgs,
+      '--no-sandbox',
+      '--disable-gpu-sandbox',
+      '--disable-updates',
+      `--extensionTestsPath=${options.extensionTestsPath}`,
+      ...options.extensionDevelopmentPath.map(value => `--extensionDevelopmentPath=${value}`),
+    ], {
+      env: { ...process.env, ...options.extensionTestsEnv },
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      console.log(`Restricted Mode VS Code exit: ${code ?? signal}`);
+      if (code === 0) resolveRun();
+      else reject(new Error(`Restricted Mode test failed (exit ${code}, signal ${signal})`));
+    });
+  });
+}
+
 async function main() {
   const tempRoot = mkdtempSync(join(tmpdir(), 'bookmarks-plus-packaged-native-mcp-'));
   const packageDir = join(tempRoot, 'package');
@@ -158,6 +182,60 @@ async function main() {
         '--skip-release-notes',
       ],
     });
+    console.log('Packaged native MCP scenario passed');
+
+    const consumerPath = join(repoRoot, 'scripts', 'fixtures', 'bookmarks-api-consumer');
+    const incompatiblePath = join(repoRoot, 'scripts', 'fixtures', 'incompatible-bookmarks-plus');
+    const apiSuitePath = join(repoRoot, 'scripts', 'packaged-extension-api-suite.cjs');
+    const scenarios = [
+      { name: 'trusted', paths: [extensionPath, consumerPath], disableTrust: true },
+      { name: 'missing', paths: [consumerPath], disableTrust: true },
+      { name: 'incompatible', paths: [incompatiblePath, consumerPath], disableTrust: true },
+      { name: 'restricted', paths: [extensionPath, consumerPath], disableTrust: false },
+    ];
+
+    for (const scenario of scenarios) {
+      const scenarioRoot = join(tempRoot, scenario.name);
+      const scenarioWorkspace = join(scenarioRoot, 'workspace');
+      const scenarioAnchor = join(scenarioRoot, 'anchor');
+      const scenarioFile = join(scenarioRoot, 'api.code-workspace');
+      mkdirSync(scenarioWorkspace, { recursive: true });
+      mkdirSync(scenarioAnchor, { recursive: true });
+      if (!scenario.disableTrust) {
+        const profileSettings = join(scenarioRoot, 'user-data', 'User');
+        mkdirSync(profileSettings, { recursive: true });
+        // Suppress only the startup dialog; the fresh workspace remains untrusted.
+        writeFileSync(join(profileSettings, 'settings.json'), JSON.stringify({
+          'security.workspace.trust.startupPrompt': 'never',
+        }));
+      }
+      // Root removal persists in a .code-workspace file; each run needs its own.
+      writeFileSync(scenarioFile, JSON.stringify({ folders: [
+        { name: 'anchor', path: scenarioAnchor }, { name: 'workspace', path: scenarioWorkspace },
+      ] }));
+      const runScenario = scenario.disableTrust ? runTests : runRestrictedTests;
+      await runScenario({
+        version: '1.101.0',
+        extensionDevelopmentPath: scenario.paths,
+        extensionTestsPath: apiSuitePath,
+        extensionTestsEnv: {
+          BOOKMARKS_PACKAGED_API_SCENARIO: scenario.name,
+          BOOKMARKS_PACKAGED_CONSUMER_PATH: consumerPath,
+          BOOKMARKS_PACKAGED_EXTENSION_PATH: scenario.name === 'incompatible' ? incompatiblePath : extensionPath,
+          BOOKMARKS_PACKAGED_WORKSPACE_PATH: scenarioWorkspace,
+          BOOKMARKS_PACKAGED_MCP_VERSION: mcpManifest.version,
+        },
+        launchArgs: [
+          scenarioFile,
+          '--disable-extensions',
+          ...(scenario.disableTrust ? ['--disable-workspace-trust'] : []),
+          `--user-data-dir=${join(scenarioRoot, 'user-data')}`,
+          `--extensions-dir=${join(scenarioRoot, 'extensions')}`,
+          '--skip-welcome',
+          '--skip-release-notes',
+        ],
+      });
+    }
   } finally {
     await removeDirWithRetry(tempRoot);
   }
