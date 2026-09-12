@@ -22,11 +22,24 @@ import {
   decodeClientBridgeMessage, encodeBridgeMessage, MAX_LIVE_BRIDGE_FRAME_BYTES
 } from './liveMcpBridgeProtocol';
 
+export type LiveMcpBridgeGrantErrorCode =
+  | 'workspace-folder-unavailable'
+  | 'scope-unavailable'
+  | 'bridge-unavailable';
+
+export class LiveMcpBridgeGrantError extends Error {
+  constructor(readonly code: LiveMcpBridgeGrantErrorCode) {
+    super(code);
+    this.name = 'LiveMcpBridgeGrantError';
+  }
+}
+
 export interface IssuedLiveBridgeGrant {
   readonly endpoint: string;
   readonly protocolVersion: 1;
   readonly generation: string;
   readonly token: string;
+  readonly expiresAt: number;
   revoke(): void;
 }
 
@@ -122,30 +135,34 @@ export class LiveMcpBridgeService {
 
   /** Issues an immutable 60-second root grant and returns its raw token exactly once. */
   issueGrant(rootUri: string, scopes: readonly BookmarkScope[]): IssuedLiveBridgeGrant {
-    if (this.stopping) { throw new Error('bridge-unavailable'); }
+    if (this.stopping) { throw new LiveMcpBridgeGrantError('bridge-unavailable'); }
     this.cleanupExpired();
     let canonicalRoot: string;
     try { canonicalRoot = canonicalizeRootUri(vscode.Uri.parse(rootUri, true)); }
-    catch { throw new Error('workspace-folder-unavailable'); }
+    catch { throw new LiveMcpBridgeGrantError('workspace-folder-unavailable'); }
     const root = this.resolveRoot(canonicalRoot);
     if (!root || root.canonicalRootUri !== canonicalRoot || root.owner.kind !== 'partition') {
-      throw new Error('workspace-folder-unavailable');
+      throw new LiveMcpBridgeGrantError('workspace-folder-unavailable');
     }
-    if (!validScopes(scopes)) { throw new Error('scope-unavailable'); }
+    if (!validScopes(scopes)) { throw new LiveMcpBridgeGrantError('scope-unavailable'); }
     const bytes = (this.options.randomBytes ?? randomBytes)(32);
-    if (bytes.length !== 32) { throw new Error('bridge-unavailable'); }
+    if (bytes.length !== 32) { throw new LiveMcpBridgeGrantError('bridge-unavailable'); }
     const token = bytes.toString('base64url');
     const tokenDigest = digestToken(token);
     if (this.pendingGrants.has(tokenDigest) || this.retiredGrants.has(tokenDigest)) {
-      throw new Error('bridge-unavailable');
+      throw new LiveMcpBridgeGrantError('bridge-unavailable');
     }
+    const expiresAt = this.now() + 60_000;
     this.pendingGrants.set(tokenDigest, Object.freeze({
       tokenDigest, generation: this.generation, workspaceFolderUri: canonicalRoot,
-      owner: Object.freeze({ ...root.owner }), scopes: Object.freeze([...scopes]), expiresAt: this.now() + 60_000
+      owner: Object.freeze({ ...root.owner }), scopes: Object.freeze([...scopes]), expiresAt
     }));
     return Object.freeze({ endpoint: this.endpoint, protocolVersion: 1, generation: this.generation,
-      token, revoke: this.makeRevoker(tokenDigest) });
+      token, expiresAt, revoke: this.makeRevoker(tokenDigest) });
   }
+
+  /** Returns the generation identifier for this bridge activation. */
+  get activationGeneration(): string { return this.generation; }
 
   /** Invalidates grants and sessions whose exact selected attachment is no longer available. */
   refreshAvailableRoots(): void {

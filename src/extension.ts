@@ -27,6 +27,8 @@ import {
   GitExtensionExports
 } from './gitInfo';
 import { registerBookmarksMcpProvider } from './mcpServerProvider';
+import { createBookmarksPlusApi } from './mcpConnectionService';
+import type { BookmarksPlusApiV1 } from './bookmarksPlusApi';
 import { LiveMcpBridgeService, LiveMcpBridgeServiceOptions } from './liveMcpBridgeService';
 import { extractTabUri, loadRecentItems, normalizeMaxItems, recordOpen, saveRecentItems } from './recentItems';
 import {
@@ -67,6 +69,8 @@ export interface McpActivationDependencies {
   registerCommands?: typeof registerCommands;
   isWorkspaceTrusted?: () => boolean;
   startLiveBridge?: (options: LiveMcpBridgeServiceOptions) => Promise<LiveMcpBridgeService>;
+  isMcpBundleFile?: (filePath: string) => Promise<boolean>;
+  mcpExecutablePath?: string;
 }
 
 function createCacheResolver(getGitApi: GitApiFactory): ResolveFn {
@@ -279,7 +283,7 @@ export async function activate(
     onDidChangeWorkspaceFolders: (listener) =>
       vscode.workspace.onDidChangeWorkspaceFolders(listener)
   }
-): Promise<void> {
+): Promise<BookmarksPlusApiV1 | undefined> {
   const subscriptionStart = context.subscriptions.length;
   const output = mcpDeps.createOutputChannel?.() ?? vscode.window.createOutputChannel('Bookmarks Plus');
   context.subscriptions.push(output);
@@ -350,6 +354,21 @@ export async function activate(
         output.appendLine('Bookmarks Plus: live MCP bridge startup failed.');
       }
     }
+
+    const publicApi = trusted ? createBookmarksPlusApi({
+      getWorkspaceFolders: mcpDeps.getWorkspaceFolders,
+      getAttachedRoot: canonicalRootUri => {
+        const root = getAttachedRoot(canonicalRootUri);
+        return root?.owner.kind === 'partition'
+          ? { canonicalRootUri: root.canonicalRootUri, partitionId: root.owner.partitionId }
+          : undefined;
+      },
+      getBridge: () => runtime.bridge,
+      isShuttingDown: () => runtime.stopping,
+      extensionUri: context.extensionUri,
+      executablePath: mcpDeps.mcpExecutablePath ?? process.execPath,
+      isFile: mcpDeps.isMcpBundleFile
+    }) : undefined;
 
     let provider: BookmarksTreeDataProvider | undefined = undefined;
     const getGitApi = createGitApiFactory(
@@ -486,6 +505,7 @@ export async function activate(
       const message = error instanceof Error ? error.message : String(error);
       output.appendLine(`Git integration unavailable: ${message}`);
     });
+    return publicApi;
   } catch (error) {
     try { await shutdownRuntime(runtime); }
     catch { output.appendLine('Bookmarks Plus: activation runtime shutdown failed.'); }

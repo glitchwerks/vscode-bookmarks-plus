@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { BookmarkStore } from '../../bookmarkStore';
 import { BookmarkDecorationProvider } from '../../bookmarkDecorationProvider';
 import { BOOKMARKED_RESOURCE_CONTEXT_KEY } from '../../bookmarkContextKeys';
+import type { BookmarksPlusApiV1 } from '../../bookmarksPlusApi';
 import {
   registerBookmarkDecorationProvider,
   registerRecentItemsTracker,
@@ -18,11 +19,20 @@ import { loadRecentlyViewed } from '../../recentlyViewed';
 import { FakeMemento, fakeTab, FakeOutput } from './fixtures';
 
 suite('Extension activation', () => {
-  test('normal activation returns no public API and exposes no packaged state commands', async () => {
-    const ext = vscode.extensions.getExtension('cbeaulieu-gt.vscode-bookmarks-plus')!;
-    assert.strictEqual(await ext.activate(), undefined);
+  test('normal activation returns the frozen public API and exposes no packaged state commands', async () => {
+    const ext = vscode.extensions.getExtension<BookmarksPlusApiV1>(
+      'cbeaulieu-gt.vscode-bookmarks-plus'
+    )!;
+    const api = await ext.activate();
+    assert.deepStrictEqual(api.apiVersion, { major: 1, minor: 0 });
+    assert.deepStrictEqual(api.capabilities.mcpConnection.descriptorVersions, [1]);
+    assert.strictEqual(typeof api.requestMcpConnection, 'function');
+    assert.ok(Object.isFrozen(api));
     const commands = await vscode.commands.getCommands(true);
-    for (const command of ['bookmarks.test.resolveMcpServerDefinition', 'bookmarks.test.getScopedBookmarkState']) {
+    for (const command of [
+      'bookmarks.test.resolveMcpServerDefinition',
+      'bookmarks.test.getScopedBookmarkState'
+    ]) {
       assert.strictEqual(commands.includes(command), false);
     }
   });

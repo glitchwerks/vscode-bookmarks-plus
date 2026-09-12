@@ -80,7 +80,10 @@ async function run() {
     'VS Code must load the extension extracted from the packaged VSIX',
   );
 
-  assert.equal(await extension.activate(), undefined, 'activation must expose no public API');
+  const api = await extension.activate();
+  assert.deepEqual(api.apiVersion, { major: 1, minor: 0 });
+  assert.equal(Object.isFrozen(api), true);
+  assert.equal(typeof api.requestMcpConnection, 'function');
 
   const folders = vscode.workspace.workspaceFolders;
   assert.equal(folders?.length, 2, 'an anchor folder keeps the host alive when the selected folder is removed');

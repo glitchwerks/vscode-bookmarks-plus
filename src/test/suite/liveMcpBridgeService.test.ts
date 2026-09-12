@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { BookmarkStore } from '../../bookmarkStore';
 import { WorkspaceBookmarkStore } from '../../workspaceBookmarkStore';
-import { LiveMcpBridgeService, IssuedLiveBridgeGrant, LiveMcpBridgeServiceOptions } from '../../liveMcpBridgeService';
+import { LiveMcpBridgeGrantError, LiveMcpBridgeService, IssuedLiveBridgeGrant, LiveMcpBridgeServiceOptions } from '../../liveMcpBridgeService';
 import { BookmarkData, BookmarkScope } from '../../types';
 import { BridgeReady, BridgeResponse, MAX_LIVE_BRIDGE_FRAME_BYTES } from '../../liveMcpBridgeProtocol';
 import { FakeMemento, FakeOutput } from './fixtures';
@@ -599,6 +599,31 @@ suite('LiveMcpBridgeService authentication', () => {
     assert.strictEqual((await authenticate(first)).message.error?.code, 'producer-restarted');
   });
 
+  test('returns the activation generation and exact immutable bootstrap expiry', () => {
+    const grant = service.issueGrant(ROOT, ['workspace']);
+    assert.strictEqual(service.activationGeneration, grant.generation);
+    assert.strictEqual(grant.expiresAt, now + 60_000);
+    assert.ok(Object.isFrozen(grant));
+  });
+
+  test('uses typed grant failures without classifying unrelated errors', async () => {
+    assert.throws(
+      () => service.issueGrant('file:///workspace/b', ['workspace']),
+      (error: unknown) =>
+        error instanceof LiveMcpBridgeGrantError &&
+        error.code === 'workspace-folder-unavailable'
+    );
+    await service.stop();
+    assert.throws(
+      () => service.issueGrant(ROOT, ['workspace']),
+      (error: unknown) => error instanceof LiveMcpBridgeGrantError && error.code === 'bridge-unavailable'
+    );
+    assert.strictEqual(
+      new Error('workspace-folder-unavailable') instanceof LiveMcpBridgeGrantError,
+      false
+    );
+  });
+
   test('retains only a SHA-256 digest and snapshots immutable grant scopes', async () => {
     const scopes: BookmarkScope[] = ['workspace', 'global'];
     const grant = service.issueGrant(ROOT, scopes);
@@ -666,7 +691,11 @@ suite('LiveMcpBridgeService authentication', () => {
 
   test('rejects unavailable roots and unsupported, empty or duplicate scopes at issuance', () => {
     assert.throws(() => service.issueGrant('file:///workspace/b', ['workspace']), /workspace-folder-unavailable/);
-    for (const scopes of [[], ['invalid'], ['workspace', 'workspace']]) {
+    assert.throws(
+      () => service.issueGrant(ROOT, []),
+      (error: unknown) => error instanceof LiveMcpBridgeGrantError && error.code === 'scope-unavailable'
+    );
+    for (const scopes of [['invalid'], ['workspace', 'workspace']]) {
       assert.throws(() => service.issueGrant(ROOT, scopes as BookmarkScope[]), /scope-unavailable/);
     }
   });

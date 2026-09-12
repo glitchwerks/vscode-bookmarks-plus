@@ -14,6 +14,7 @@ interface TestGrant {
   readonly protocolVersion: 1;
   readonly generation: string;
   readonly token: string;
+  readonly expiresAt: number;
   revoke(): void;
 }
 
@@ -65,6 +66,7 @@ function createLiveProviderFixture(): LiveProviderFixture {
         protocolVersion: 1,
         generation: 'bridge-generation',
         token: `token-${nextToken++}`,
+        expiresAt: 61_000,
         revoke: () => fixture.revokeCount++
       };
       grants.push(grant);
