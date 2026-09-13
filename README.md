@@ -8,7 +8,7 @@ workspaces, Git-aware grouping, and optional AI-tool access.
 
 ## Highlights
 
-- Bookmark whole files and folders from the Explorer, editor tabs, or the Command Palette.
+- Bookmark whole files and folders from the Explorer, and bookmark open files from editor tabs.
 - Organize bookmarks into collections and reorder them with drag and drop.
 - Keep bookmarks with one workspace or place them in **Global** so they appear everywhere.
 - Work naturally with multi-root workspaces: each root owns its bookmarks, while removed roots can
