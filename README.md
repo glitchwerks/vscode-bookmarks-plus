@@ -28,7 +28,8 @@ workspaces, Git-aware grouping, and optional AI-tool access.
    (Global)** when the bookmark should be available in every workspace.
 5. Create collections from the view title bar, then drag bookmarks to organize them.
 
-The same commands are available from the Command Palette under **Bookmarks Plus**.
+Additional management commands, including collection creation and workspace recovery, are
+available from the Command Palette under **Bookmarks Plus**.
 
 ## Workspace and global bookmarks
 

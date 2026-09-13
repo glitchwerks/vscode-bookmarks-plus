@@ -7,8 +7,9 @@ such as Claude Code and Claude Desktop. It reads and writes one workspace's
 
 The extension creates and maintains the mirror, but the server works whether or not VS Code is
 running. Global, Detached, and Unassigned bookmarks are not mirrored and therefore are not exposed
-by standalone launches. See [MCP integrations](../docs/mcp.md) for the difference between this
-server and VS Code's live native integration.
+by standalone launches. See
+[MCP integrations](https://github.com/glitchwerks/vscode-bookmarks-plus/blob/main/docs/mcp.md)
+for the difference between this server and VS Code's live native integration.
 
 ## Build from source
 
