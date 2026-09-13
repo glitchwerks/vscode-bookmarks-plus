@@ -8,6 +8,7 @@ interface WorkflowStep {
   uses?: string;
   run?: string;
   if?: string;
+  env?: Record<string, string>;
   'continue-on-error'?: boolean;
   with?: {
     ref?: string;
@@ -122,6 +123,16 @@ suite('Publish workflow native MCP release gates (#136)', () => {
     assert.strictEqual(checkout.with?.ref, immutableReleaseCommit);
     assert.strictEqual(checkout.with?.['persist-credentials'], false);
     assert.strictEqual(setupNode.uses, setupNodeAction);
+  });
+
+  test('pins published README links to the immutable release commit', () => {
+    const publish = getStep(getJob('publish'), 'Publish');
+
+    assert.strictEqual(publish.env?.RELEASE_COMMIT, immutableReleaseCommit);
+    assert.strictEqual(
+      publish.run,
+      'npm run "publish:$CHANNEL" -- --githubBranch "$RELEASE_COMMIT"'
+    );
   });
 
   test('defaults to read-only contents and grants write access only to publishing', () => {

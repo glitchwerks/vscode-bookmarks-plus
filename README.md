@@ -541,6 +541,8 @@ Install from the VS Code Marketplace: search **Bookmarks Plus** in the Extension
 - Marketplace publishes and GitHub Releases are gated on the MCP bundle check plus packaged-VSIX
   validation on Linux and Windows, all pinned to one immutable tag commit; see
   [`docs/release-strategy.md`](docs/release-strategy.md).
+- The automated Marketplace publish rewrites README links and images against that same immutable
+  release commit, so previously published versions do not follow later changes on `main`.
 - Press F5 in VS Code (or use the "Run Extension" launch config) to open an Extension Development Host with the extension loaded
 - `mcp-server/` has its own `package.json`, build, and test suite — not run by the commands
   above. See "Using bookmarks from Claude (MCP server)" for its build steps.

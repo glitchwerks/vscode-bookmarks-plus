@@ -146,8 +146,9 @@ jobs:
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
 
       - name: Publish
-        run: npm run "publish:$CHANNEL"
+        run: npm run "publish:$CHANNEL" -- --githubBranch "$RELEASE_COMMIT"
         env:
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       - name: Extract release notes
