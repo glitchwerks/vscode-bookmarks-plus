@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-// Regression guard for issue #66 / T2 (plan
-// docs/superpowers/plans/2026-08-30-publish-mcp-server-to-npm.md, §6 T2,
-// constraint 3.1): runs `npm pack --dry-run --json` (which invokes `prepack`
+// Regression guard for Issue #66 and PR #113: runs `npm pack --dry-run --json` (which invokes `prepack`
 // -> the real build, per T1's move off `prepublishOnly`) against the package
 // in the current working directory, and asserts the resulting tarball's file
 // list is correct:

@@ -56,6 +56,9 @@ The repository also includes a standalone MCP server for clients such as Claude 
 Desktop. It reads the selected workspace's `.vscode/bookmarks.json` mirror, so it works without VS
 Code running but does not expose global bookmarks.
 
+External MCP clients can run the standalone server with
+`npx -y @glitchwerks/bookmarks-plus-mcp`; see [MCP integrations](docs/mcp.md) for configuration.
+
 See [MCP integrations](docs/mcp.md) for setup, scope, lifecycle, and client-specific guidance.
 Developers building another VS Code extension can use the optional
 [versioned extension API](docs/extension-api.md) to request a live MCP connection.

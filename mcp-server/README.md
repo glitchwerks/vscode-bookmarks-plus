@@ -1,4 +1,4 @@
-# bookmarks-plus-mcp
+# @glitchwerks/bookmarks-plus-mcp
 
 The standalone MCP server exposes workspace bookmarks managed by the
 [Bookmarks Plus](https://github.com/glitchwerks/vscode-bookmarks-plus) VS Code extension to clients
@@ -11,7 +11,18 @@ by standalone launches. See
 [MCP integrations](https://github.com/glitchwerks/vscode-bookmarks-plus/blob/main/docs/mcp.md)
 for the difference between this server and VS Code's live native integration.
 
-## Build from source
+## Run the public package
+
+No global install is required:
+
+```sh
+npx -y @glitchwerks/bookmarks-plus-mcp [workspace-path]
+```
+
+The npm package and VS Code extension have independent versions. Compatibility is defined by the
+mirror schema: version `0.1.0` reads schema versions through `2` and refuses newer versions.
+
+## Source-build fallback
 
 From this directory:
 
@@ -20,13 +31,14 @@ npm ci
 npm run build
 ```
 
-This produces `dist/index.js`, which the configurations below use as the server entry point.
+This produces `dist/index.js` for the fallback and development configurations below.
 
 ## Workspace resolution
 
 The server resolves its workspace from four sources, stopping at the first one present:
 
-1. **An explicit path** supplied as the positional argument after `dist/index.js`.
+1. **An explicit path** supplied as the positional argument after the package command (or
+   `dist/index.js` for a source build).
 2. **`BOOKMARKS_PLUS_WORKSPACE`**, set by Bookmarks Plus in integrated terminals:
 
    | Window state | Value |
@@ -45,22 +57,34 @@ If none of these resolves, the server refuses to start.
 
 ## Claude Code
 
-For a source checkout, register the server per project in `.mcp.json` and omit the workspace path.
-Claude Code supplies `CLAUDE_PROJECT_DIR` automatically:
+Register the public package per project in `.mcp.json` and omit the workspace path. Claude Code
+supplies `CLAUDE_PROJECT_DIR` automatically:
+
+```json
+{
+  "mcpServers": {
+    "bookmarks-plus": {
+      "command": "npx",
+      "args": ["-y", "@glitchwerks/bookmarks-plus-mcp"]
+    }
+  }
+}
+```
+
+### Source-build fallback (development)
+
+For a source checkout, use the built entry point instead:
 
 ```json
 {
   "mcpServers": {
     "bookmarks-plus": {
       "command": "node",
-      "args": ["${BOOKMARKS_PLUS_MCP:-/absolute/path/to/mcp-server/dist/index.js}"]
+      "args": ["/absolute/path/to/vscode-bookmarks-plus/mcp-server/dist/index.js"]
     }
   }
 }
 ```
-
-Set `BOOKMARKS_PLUS_MCP` once per machine to the absolute path of the built `dist/index.js`. The
-fallback keeps the project file loadable before that environment variable is configured.
 
 Claude Code asks for one-time approval before using a project-scoped server from `.mcp.json`. Reset
 that choice with `claude mcp reset-project-choices` when needed.
@@ -69,10 +93,33 @@ Do not register the same `bookmarks-plus` name at both project and user scope. T
 Desktop's Code tab can select different definitions when both exist, making them point at different
 workspaces.
 
-## Explicit workspace path
+## Claude Desktop and other fixed workspaces
 
 Pass a workspace path after the server entry point to pin a specific root regardless of automatic
 resolution:
+
+```json
+{
+  "mcpServers": {
+    "bookmarks-plus": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@glitchwerks/bookmarks-plus-mcp",
+        "/absolute/path/to/your/workspace"
+      ]
+    }
+  }
+}
+```
+
+This public-package configuration is the supported form for Claude Desktop's standalone chat
+interface, which has no per-session project directory. It is also the way to select one root in a
+multi-root workspace.
+
+### Source-build fallback (development)
+
+For source development, replace the `npx` command and its first two arguments with:
 
 ```json
 {
@@ -88,9 +135,6 @@ resolution:
 }
 ```
 
-This is the supported form for Claude Desktop's standalone chat interface, which has no per-session
-project directory. It is also the way to select one root in a multi-root workspace.
-
 ## Migrating from `BOOKMARKS_MCP_WORKSPACE`
 
 `BOOKMARKS_MCP_WORKSPACE` is checked after `CLAUDE_PROJECT_DIR`. Under Claude Code, an automatically
@@ -104,18 +148,19 @@ for normal project resolution, or an explicit positional path when a fixed works
   duplicate `(uri, collection)` pair. It cannot edit or remove bookmarks or collections.
 
 Both return JSON text and MCP `structuredContent`. Records include additive
-`scope: "workspace"`. A list result for a version-2 mirror has this shape:
+`scope: "workspace"`. A list result for a version-1 mirror has this shape:
 
 ```json
 {
   "workspacePath": "/workspace",
   "mirrorPath": "/workspace/.vscode/bookmarks.json",
-  "version": 2,
+  "version": 1,
   "collections": [
     { "id": "collection-1", "name": "Core", "order": 0, "scope": "workspace" }
   ],
   "items": [
-    { "id": "item-1", "type": "file", "uri": "file:///workspace/src/index.ts", "collectionId": "collection-1", "order": 0, "scope": "workspace" }
+    { "id": "item-1", "type": "file", "uri": "file:///workspace/src/index.ts", "collectionId": "collection-1", "order": 0, "scope": "workspace" },
+    { "id": "item-2", "type": "folder", "uri": "file:///workspace/src/utils", "collectionId": null, "order": 0, "scope": "workspace" }
   ]
 }
 ```

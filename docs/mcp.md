@@ -77,12 +77,20 @@ for server-management and trust controls.
 
 ## Standalone MCP clients
 
-The standalone server under [`mcp-server/`](../mcp-server/) reads and writes one workspace root's
-`.vscode/bookmarks.json` mirror. It works whether or not VS Code is running. Because Global,
-Detached, and Unassigned data is not mirrored, those scopes are unavailable to standalone clients.
+Run the public package without a global install:
 
-See the [standalone server README](../mcp-server/README.md) for source builds, workspace resolution,
-Claude Code and Claude Desktop configuration, tool results, and concurrency limitations.
+```sh
+npx -y @glitchwerks/bookmarks-plus-mcp [workspace-path]
+```
+
+The standalone server reads and writes one workspace root's `.vscode/bookmarks.json` mirror and
+works whether or not VS Code is running. It resolves the workspace from an explicit argument,
+`BOOKMARKS_PLUS_WORKSPACE`, `CLAUDE_PROJECT_DIR`, or the legacy `BOOKMARKS_MCP_WORKSPACE`, in that
+order. Because Global, Detached, and Unassigned data is not mirrored, those scopes are unavailable
+to standalone clients.
+
+See the [standalone server README](../mcp-server/README.md) for Claude Code and Claude Desktop
+configuration, source-build fallback, result shapes, and concurrency limitations.
 
 ## Integrating another VS Code extension
 

@@ -1,5 +1,5 @@
 {
-  "name": "bookmarks-plus-mcp",
+  "name": "@glitchwerks/bookmarks-plus-mcp",
   "version": "0.1.0",
   "type": "module",
   "description": "MCP server exposing Bookmarks Plus's workspace bookmarks to Claude Desktop / Claude Code.",
@@ -25,7 +25,7 @@
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json && node scripts/copy-schema.mjs",
-    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test dist/test",
+    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test scripts/run-tests.test.mjs && node scripts/run-tests.mjs",
     "test:packaging": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test dist/test/packaging.test.js",
     "lint": "eslint src test --ext ts --no-error-on-unmatched-pattern",
     "prepack": "npm run build",
