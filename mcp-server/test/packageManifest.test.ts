@@ -203,23 +203,11 @@ test('the `test` script invokes copy-test-fixtures.mjs', () => {
   );
 });
 
-test('the `test` script\'s `node --test` argument is not a quoted glob (PR #113 CI regression)', () => {
-  // Node's `--test` CLI flag only glob-expands a quoted pattern like
-  // "dist/test/**/*.test.js" on Node 21+; on Node 18/20 (what CI's
-  // actions/setup-node@v4 pins via node-version: '20.x') the shell passes
-  // the quoted string through literally, `--test` treats it as a literal
-  // path, finds no such file, and the whole `npm test` step fails with
-  // "Could not find '.../dist/test/**/*.test.js'" -- see PR #113 / issue
-  // #66, CI run 33346984629. The fix is the directory form (`node --test
-  // dist/test`), which both Node 18/20 and 21+ discover correctly. This
-  // test pins that shape so the quoted glob cannot silently return.
+test('the `test` script uses the cross-version explicit-file launcher', () => {
   const scripts = readManifest().scripts ?? {};
   const testScript = scripts.test ?? '';
-  const match = testScript.match(/node --test (\S+)/);
-  assert.ok(match, 'the `test` script must invoke `node --test <arg>`');
-  const testArg = match![1];
-  assert.ok(
-    !/[*"]/.test(testArg),
-    `the \`node --test\` argument must not be a quoted glob (Node <21 does not expand it) -- got ${JSON.stringify(testArg)}`,
-  );
+  assert.match(testScript, /node --test scripts\/run-tests\.test\.mjs/);
+  assert.match(testScript, /node scripts\/run-tests\.mjs/);
+  assert.doesNotMatch(testScript, /node --test dist\/test(?:\s|$)/);
+  assert.doesNotMatch(testScript, /dist\/test\/.*\*/);
 });
