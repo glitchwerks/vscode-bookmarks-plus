@@ -12,6 +12,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = join(here, '..', '..', 'package.json');
 
 interface PackageManifest {
+  name?: string;
+  bin?: Record<string, string>;
   private?: boolean;
   version?: string;
   description?: string;
@@ -29,6 +31,20 @@ interface PackageManifest {
 function readManifest(): PackageManifest {
   return JSON.parse(readFileSync(packageJsonPath, 'utf8')) as PackageManifest;
 }
+
+test('package uses the approved public npm scope', () => {
+  assert.equal(readManifest().name, '@glitchwerks/bookmarks-plus-mcp');
+});
+
+test('scoping the package does not rename the executable', () => {
+  assert.deepEqual(readManifest().bin, {
+    'bookmarks-plus-mcp': 'dist/index.js',
+  });
+});
+
+test('the first package release remains independently versioned at 0.1.0', () => {
+  assert.equal(readManifest().version, '0.1.0');
+});
 
 // Issue #66 / T1(b) + constraint 3.1 + D2 + D6: mcp-server/package.json must
 // become a publishable manifest. Every assertion below is checked against
