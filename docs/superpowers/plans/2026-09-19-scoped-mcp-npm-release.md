@@ -28,7 +28,8 @@
 ### Phase 1 — package release PR
 
 - Create `mcp-server/scripts/run-tests.mjs`: recursively discover compiled test files and pass explicit paths to `node --test` on every supported Node version.
-- Create `mcp-server/scripts/run-tests.test.mjs`: unit-test discovery, ordering, explicit arguments, and empty-suite failure.
+- Create `mcp-server/scripts/run-tests.test.mjs`: unit-test discovery, ordering, explicit arguments,
+  real path-with-spaces execution, and empty-suite failure.
 - Modify `mcp-server/package.json`: scoped package identity and cross-version test launcher wiring.
 - Modify `mcp-server/package-lock.json`: synchronize the root package identity/version through npm, not hand editing.
 - Modify `mcp-server/test/packageManifest.test.ts`: pin scoped name, retained bin, public-access publish command, and launcher wiring.
@@ -92,6 +93,7 @@ import { join, relative } from 'node:path';
 import {
   buildNodeTestArguments,
   discoverTestFiles,
+  runTests,
 } from './run-tests.mjs';
 
 test('discoverTestFiles recursively returns only .test.js files in stable order', (t) => {
@@ -113,6 +115,27 @@ test('buildNodeTestArguments passes each file as an explicit argument', () => {
     buildNodeTestArguments(['C:/suite/a.test.js', 'C:/suite/b.test.js']),
     ['--test', 'C:/suite/a.test.js', 'C:/suite/b.test.js'],
   );
+});
+
+test('runTests executes a test file whose root and name contain spaces', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'bookmarks mcp launcher '));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(
+    join(root, 'passes with spaces.test.js'),
+    "import test from 'node:test';\ntest('passes', () => {});\n",
+  );
+
+  const testContext = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try {
+    assert.equal(runTests(root), 0);
+  } finally {
+    if (testContext === undefined) {
+      delete process.env.NODE_TEST_CONTEXT;
+    } else {
+      process.env.NODE_TEST_CONTEXT = testContext;
+    }
+  }
 });
 
 test('discoverTestFiles rejects an empty suite', (t) => {
@@ -185,7 +208,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 ```
 
-- [ ] Run `node --test scripts/run-tests.test.mjs`; verify 3 tests pass.
+- [ ] Run `node --test scripts/run-tests.test.mjs`; verify 4 tests pass, including a real
+  `runTests()` invocation for a temporary root and `.test.js` filename containing spaces.
 
 ### Step 3: Pin package-script wiring before changing it
 
@@ -319,6 +343,7 @@ All notable changes to `@glitchwerks/bookmarks-plus-mcp` are documented in this 
 - Automatic workspace resolution for Bookmarks Plus terminals and Claude Code, plus an explicit
   workspace path for clients such as Claude Desktop.
 - Package-content verification and a real installed-package MCP handshake on Linux and Windows.
+- Reads mirror schema versions through `2` and refuses newer schemas.
 
 See Issue #66 and PR #113 for the release and packaging history.
 ```

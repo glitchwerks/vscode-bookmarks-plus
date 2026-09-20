@@ -13,5 +13,6 @@ All notable changes to `@glitchwerks/bookmarks-plus-mcp` are documented in this 
 - Automatic workspace resolution for Bookmarks Plus terminals and Claude Code, plus an explicit
   workspace path for clients such as Claude Desktop.
 - Package-content verification and a real installed-package MCP handshake on Linux and Windows.
+- Reads mirror schema versions through `2` and refuses newer schemas.
 
 See Issue #66 and PR #113 for the release and packaging history.
