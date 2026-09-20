@@ -15,9 +15,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
-// Issue #66 / T3 (original implementation plan, §6 T3, §4 E2):
-// the automated form of E2, "the highest-severity check in this
-// plan". E2 was already run manually and passed (real `npm pack` -> real
+// Issue #66 / PR #113: the automated form of E2, the highest-severity check
+// in that release history. E2 was already run manually and passed (real `npm pack` -> real
 // `npm install` into a scratch dir -> npm's real generated shim -> `npx
 // bookmarks-plus-mcp <workspace>` -> `initialize` + `tools/list` over stdin ->
 // both tools came back). This file codifies that same procedure as a
@@ -58,13 +57,9 @@ import { fileURLToPath } from 'node:url';
 //   and no extra dependency (unlike setting a custom env var portably from
 //   inside a package.json script string, which differs between cmd.exe and
 //   POSIX shells and would otherwise require a `cross-env`-style
-//   dependency). The compiled file still lands at `dist/test/packaging.test.js`
-//   and is still matched by the default `test` script's
-//   `"dist/test/**/*.test.js"` glob (Node's test runner CLI has no exclude-glob
-//   syntax -- confirmed empirically while authoring this file: a `!`-prefixed
-//   negation pattern passed alongside the positive glob was silently ignored
-//   and the negated file still ran), so the self-skip guard -- not the glob
-//   -- is what keeps it out of the default run. Running it via
+//   dependency). `scripts/run-tests.mjs` explicitly discovers this compiled
+//   file, and the self-skip lifecycle guard -- not discovery -- is what keeps
+//   the network-dependent body out of the default run. Running it via
 //   `npm run test:packaging` (or, for manual/local verification, via
 //   `npm_lifecycle_event=test:packaging node --test dist/test/packaging.test.js`)
 //   sets the flag and lets it run for real.
@@ -299,18 +294,20 @@ test(
     assert.deepEqual(packedPaths.filter((path) =>
       /(^|\/)(src|test|fixtures)\//.test(path) || /\.fixtures\.json$/.test(path)), []);
 
-    // These are public result examples, not snapshots of README wording.
-    // A stale example must fail against the real installed server below.
-    const documentedResults = ['README.md', 'mcp-server/README.md'].map((path) => {
-      const readme = readFileSync(join(mcpServerRoot, '..', path), 'utf8');
-      const examples = [...readme.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g)]
-        .map((match) => JSON.parse(match[1]) as Record<string, unknown>);
-      const list = examples.find((example) => example.workspacePath === '/workspace');
-      const add = examples.find((example) => example.id === 'new-bookmark-id');
-      assert.ok(list, `${path} must document the standalone list result`);
-      assert.ok(add, `${path} must document the standalone add result`);
-      return { list, add };
-    });
+    // The package README is the detailed standalone documentation. The root
+    // README intentionally remains high-level, so only package examples are
+    // a public-result contract. A stale example must fail against the real
+    // installed server below.
+    const packageReadmePath = 'mcp-server/README.md';
+    const packageReadme = readFileSync(join(mcpServerRoot, 'README.md'), 'utf8');
+    const examples = [...packageReadme.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g)]
+      .map((match) => JSON.parse(match[1]) as Record<string, unknown>);
+    const documentedResults = {
+      list: examples.find((example) => example.workspacePath === '/workspace'),
+      add: examples.find((example) => example.id === 'new-bookmark-id'),
+    };
+    assert.ok(documentedResults.list, `${packageReadmePath} must document the standalone list result`);
+    assert.ok(documentedResults.add, `${packageReadmePath} must document the standalone add result`);
 
     assert.ok(
       readdirSync(packDestDir).includes(packEntry.filename),
@@ -426,13 +423,11 @@ test(
         params: { name: 'list_bookmarks', arguments: {} } })}\n`);
       const listResponse = await waitFor(listPromise, 30_000, 'installed list_bookmarks result');
       const listResult = listResponse?.result as { structuredContent: Record<string, unknown> };
-      for (const example of documentedResults) {
-        assert.deepEqual(listResult.structuredContent, {
-          ...example.list,
-          workspacePath: workspaceDir,
-          mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
-        });
-      }
+      assert.deepEqual(listResult.structuredContent, {
+        ...documentedResults.list,
+        workspacePath: workspaceDir,
+        mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+      });
 
       const addPromise = collectJsonRpcResponse(child, 4);
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call',
@@ -442,13 +437,11 @@ test(
       const addResponse = await waitFor(addPromise, 30_000, 'installed add_bookmark result');
       const addResult = addResponse?.result as { structuredContent: Record<string, unknown> };
       assert.equal(typeof addResult.structuredContent.id, 'string');
-      for (const example of documentedResults) {
-        assert.deepEqual(addResult.structuredContent, {
-          ...example.add,
-          id: addResult.structuredContent.id,
-          mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
-        });
-      }
+      assert.deepEqual(addResult.structuredContent, {
+        ...documentedResults.add,
+        id: addResult.structuredContent.id,
+        mirrorPath: join(workspaceDir, '.vscode', 'bookmarks.json'),
+      });
     } finally {
       // `child` is the shell (`shell: true`), not npx/node directly -- npx
       // and the real server process are its grandchildren. Closing stdin

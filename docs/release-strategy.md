@@ -1,5 +1,34 @@
 # Release Strategy
 
+## Standalone MCP package
+
+`@glitchwerks/bookmarks-plus-mcp` has independent SemVer and uses `mcp-vX.Y.Z` tags. Its release
+record is `mcp-server/CHANGELOG.md`; do not use the extension version or `vX.Y.Z` tag lane.
+
+For the Phase 1 bootstrap release, check out clean `main` at the merged commit and run:
+
+```bash
+cd mcp-server
+npm ci
+npm run lint
+npm test
+npm run build
+npm run verify-pack
+npm run test:packaging
+npm publish --access public
+```
+
+The public publish command is required for the first scoped release ([npm scoped public
+packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/), fetched
+2026-09-19). After publishing, verify `npm view @glitchwerks/bookmarks-plus-mcp@0.1.0 version`
+returns `0.1.0`, then use a cold temporary install to launch `bookmarks-plus-mcp`, complete
+`initialize` and `tools/list`, and confirm both `list_bookmarks` and `add_bookmark` are returned.
+
+Only after those registry and cold-install checks pass, create and push `mcp-v0.1.0` at the exact
+published commit. The automation workflow intentionally does not exist during the first tag push:
+the bootstrap tag records released source without starting an OIDC workflow that npm cannot yet
+authorize. Later package releases use the trusted-publishing workflow.
+
 ## Why this convention exists
 
 The VS Code Marketplace does not support semver pre-release suffixes (`1.2.0-beta.1`).
