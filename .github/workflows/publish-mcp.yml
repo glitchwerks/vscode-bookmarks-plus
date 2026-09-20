@@ -32,6 +32,14 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify release commit is on main
+        shell: bash
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::The selected release commit is not contained in main"
+            exit 1
+          fi
       - name: Resolve immutable release commit
         id: release
         shell: bash
@@ -55,9 +63,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
-      - name: Use current npm 11
-        run: npm install --global npm@11
+          node-version: '24.14.0'
+      - name: Use npm 11.9.0
+        run: npm install --global npm@11.9.0
       - name: Install
         working-directory: mcp-server
         run: npm ci
@@ -79,9 +87,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
-      - name: Use current npm 11
-        run: npm install --global npm@11
+          node-version: '24.14.0'
+      - name: Use npm 11.9.0
+        run: npm install --global npm@11.9.0
       - name: Install
         working-directory: mcp-server
         run: npm ci
@@ -118,9 +126,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
-      - name: Use current npm 11
-        run: npm install --global npm@11
+          node-version: '24.14.0'
+      - name: Use npm 11.9.0
+        run: npm install --global npm@11.9.0
       - name: Install
         working-directory: mcp-server
         run: npm ci
