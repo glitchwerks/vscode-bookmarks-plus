@@ -5,7 +5,11 @@
 `@glitchwerks/bookmarks-plus-mcp` has independent SemVer and uses `mcp-vX.Y.Z` tags. Its release
 record is `mcp-server/CHANGELOG.md`; do not use the extension version or `vX.Y.Z` tag lane.
 
-For the Phase 1 bootstrap release, check out clean `main` at the merged commit and run:
+Prepare each MCP release in a normal pull request:
+
+1. Update the version in `mcp-server/package.json` and the matching dated entry in
+   `mcp-server/CHANGELOG.md`.
+2. Run the complete local MCP gate:
 
 ```bash
 cd mcp-server
@@ -15,19 +19,44 @@ npm test
 npm run build
 npm run verify-pack
 npm run test:packaging
-npm publish --access public
+MCP_RELEASE_TAG=mcp-vX.Y.Z npm run verify-release
 ```
 
-The public publish command is required for the first scoped release ([npm scoped public
-packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/), fetched
-2026-09-19). After publishing, verify `npm view @glitchwerks/bookmarks-plus-mcp@0.1.0 version`
-returns `0.1.0`, then use a cold temporary install to launch `bookmarks-plus-mcp`, complete
-`initialize` and `tools/list`, and confirm both `list_bookmarks` and `add_bookmark` are returned.
+3. Merge the pull request, then create `mcp-vX.Y.Z` on the intended `main` commit and push the
+   tag. Pushing the tag starts the **Publish MCP package** workflow.
+4. The workflow resolves the tag once, validates that immutable commit's release metadata,
+   lints and tests the package, verifies its packed and installed forms, and publishes the public
+   package through npm trusted publishing. Only the publish job receives OIDC permission; no npm
+   publish token is used ([npm trusted publishing](https://docs.npmjs.com/trusted-publishers/),
+   fetched 2026-09-19).
 
-Only after those registry and cold-install checks pass, create and push `mcp-v0.1.0` at the exact
-published commit. The automation workflow intentionally does not exist during the first tag push:
-the bootstrap tag records released source without starting an OIDC workflow that npm cannot yet
-authorize. Later package releases use the trusted-publishing workflow.
+If a run fails before publication, use **Actions → Publish MCP package → Run workflow** and enter
+the existing `mcp-vX.Y.Z` tag. Manual dispatch is a retry path for an existing tag, not a way to
+publish a branch or untagged commit. A retry after npm accepted the package may fail because a
+published npm version is immutable.
+
+### One-time npm trusted-publisher setup
+
+Configure the package's GitHub Actions trusted publisher with this exact tuple:
+
+```text
+Owner: glitchwerks
+Repository: vscode-bookmarks-plus
+Workflow filename: publish-mcp.yml
+Environment: none
+Allowed action: publish
+```
+
+After saving the publisher, authenticate with a current npm CLI and verify it with:
+
+```bash
+npm trust list @glitchwerks/bookmarks-plus-mcp
+```
+
+Only after that command reports `glitchwerks/vscode-bookmarks-plus` and `publish-mcp.yml` should
+traditional publish tokens be disallowed. The trust-list command requires an authenticated current
+npm CLI and an existing package ([npm trust CLI](https://docs.npmjs.com/cli/v11/commands/npm-trust/),
+fetched 2026-09-19).
 
 ## Why this convention exists
 
