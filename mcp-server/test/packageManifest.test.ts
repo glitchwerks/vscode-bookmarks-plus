@@ -227,3 +227,12 @@ test('the `test` script uses the cross-version explicit-file launcher', () => {
   assert.doesNotMatch(testScript, /node --test dist\/test(?:\s|$)/);
   assert.doesNotMatch(testScript, /dist\/test\/.*\*/);
 });
+
+test('release validation is exposed and its tests run in the default suite', () => {
+  const scripts = readManifest().scripts ?? {};
+  assert.equal(scripts['verify-release'], 'node scripts/validate-release.mjs');
+  assert.match(
+    scripts.test ?? '',
+    /node --test scripts\/run-tests\.test\.mjs scripts\/validate-release\.test\.mjs/,
+  );
+});

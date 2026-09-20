@@ -25,11 +25,12 @@
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json && node scripts/copy-schema.mjs",
-    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test scripts/run-tests.test.mjs && node scripts/run-tests.mjs",
+    "test": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test scripts/run-tests.test.mjs scripts/validate-release.test.mjs && node scripts/run-tests.mjs",
     "test:packaging": "tsc -p tsconfig.test.json && node scripts/copy-schema.mjs && node scripts/copy-test-fixtures.mjs && node --test dist/test/packaging.test.js",
     "lint": "eslint src test --ext ts --no-error-on-unmatched-pattern",
     "prepack": "npm run build",
-    "verify-pack": "node scripts/verify-pack.mjs"
+    "verify-pack": "node scripts/verify-pack.mjs",
+    "verify-release": "node scripts/validate-release.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
