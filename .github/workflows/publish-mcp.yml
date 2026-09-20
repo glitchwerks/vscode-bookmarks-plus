@@ -1,0 +1,134 @@
+name: Publish MCP package
+
+on:
+  push:
+    tags:
+      - 'mcp-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing MCP package tag to publish (for example, mcp-v0.1.1)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-mcp-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Checkout selected release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve immutable release commit
+        id: release
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: [resolve-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Use current npm 11
+        run: npm install --global npm@11
+      - name: Install
+        working-directory: mcp-server
+        run: npm ci
+      - name: Lint
+        working-directory: mcp-server
+        run: npm run lint
+
+  test-package:
+    needs: [resolve-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Use current npm 11
+        run: npm install --global npm@11
+      - name: Install
+        working-directory: mcp-server
+        run: npm ci
+      - name: Validate release metadata
+        working-directory: mcp-server
+        env:
+          MCP_RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: npm run verify-release
+      - name: Test
+        working-directory: mcp-server
+        run: npm test
+      - name: Build
+        working-directory: mcp-server
+        run: npm run build
+      - name: Verify pack contents
+        working-directory: mcp-server
+        run: npm run verify-pack
+      - name: Test installed package
+        working-directory: mcp-server
+        run: npm run test:packaging
+
+  publish:
+    needs: [resolve-release, lint, test-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Use current npm 11
+        run: npm install --global npm@11
+      - name: Install
+        working-directory: mcp-server
+        run: npm ci
+      - name: Revalidate release metadata
+        working-directory: mcp-server
+        env:
+          MCP_RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: npm run verify-release
+      - name: Publish
+        working-directory: mcp-server
+        run: npm publish --access public
