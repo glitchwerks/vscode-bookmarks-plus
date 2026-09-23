@@ -244,9 +244,12 @@ pre-release lane using the odd/even minor rule above.
       **Bookmarks Plus** is listed and starts without an error.
    3. Open Chat in Agent mode, select the tools button, and confirm that
       `list_bookmarks` and `add_bookmark` appear under **Bookmarks Plus**.
-   4. Repeat with no folder and with a multi-root workspace. Confirm that the server is not
-      advertised and that the **Bookmarks Plus** output channel explains the disabled state
-      (`src/mcpServerProvider.ts:L18-L52`).
+   4. Open a multi-root workspace. Confirm that one server is advertised per attached root as
+      **Bookmarks Plus (<folder name>)** and that each server exposes the two tools for its own
+      root (`src/mcpServerProvider.ts:L54-L91`; `docs/mcp.md:L27-L35`).
+   5. Open a no-folder window. Confirm that no server is advertised and that the
+      **Bookmarks Plus** output channel explains that no attached workspace roots are available
+      (`src/mcpServerProvider.ts:L61-L71`).
 
    The server-management names above follow the
    [VS Code MCP documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
