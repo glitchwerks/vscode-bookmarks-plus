@@ -4,31 +4,46 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-09-23
+
 ### Added
 
-- VS Code-native MCP integration (#124): installing Bookmarks Plus now registers the bundled
-  **Bookmarks Plus** MCP server automatically in VS Code. Agent mode can use `list_bookmarks`
-  and `add_bookmark` without an `mcp.json` entry or separate server installation. The live bridge
-  (#129) exposes the selected root's workspace bookmarks and global bookmarks through
-  extension-owned stores, with one native server per attached root and explicit scope on results.
-  Adds default to workspace when both scopes are granted. Bridge failure blocks initialization
-  without mirror fallback; direct npm/Claude launches remain workspace-mirror-only. Remote
-  extension-host support is not claimed.
-- Toggle Show Full Path (#115): a view-title-bar button switches bookmark labels between
-  filename-only (the default) and the path relative to the workspace root, using `/` separators.
-  Combines cleanly with Group by Repo (no duplicated repo-name prefix); a bookmark outside every
-  workspace folder falls back to filename-only. The toggle state persists across window reloads.
+- Multi-root workspace support (#62): every workspace folder owns an independent bookmark
+  partition and `.vscode/bookmarks.json` mirror. Nested resources belong to the deepest matching
+  root. Removed roots remain available under **Detached**, while legacy data that cannot be
+  assigned safely appears under **Unassigned**; both can be recovered without discarding data.
+- VS Code-native MCP integration (#124, #129): Bookmarks Plus automatically registers one MCP
+  server per available workspace root. Agent mode can use `list_bookmarks` and `add_bookmark`
+  against the extension's live workspace and global stores, with explicit scope on results and
+  workspace scope as the default. Direct npm and Claude launches remain mirror-backed.
+- A typed, versioned extension API (#138) lets trusted VS Code extensions request short-lived,
+  root-scoped MCP connections with capability negotiation, scope validation, grant revocation,
+  and Restricted Mode enforcement.
+- A **Recent** section (#108) shows the ten most recently viewed files and can promote them to
+  workspace bookmarks. Files can now be added from the editor body or tab context menu, and
+  already-bookmarked resources expose **Remove Bookmark** in Explorer and editor menus (#114).
+- **Toggle Show Full Path** (#115, #160) switches between filename-only rows and an expandable
+  folder hierarchy relative to the deepest containing workspace root. Generated path folders are
+  muted, bookmarked folders merge into their expandable branch, multi-root Global bookmarks stay
+  separated by workspace root, and repository grouping does not duplicate the root name.
+- The standalone MCP server is now available as the public
+  `@glitchwerks/bookmarks-plus-mcp` package for `npx`-based clients (#66).
 
 ### Changed
 
 - The minimum supported VS Code version is now 1.101.0, which provides the MCP server definition
   provider API used by the native integration.
+- Workspace bookmark persistence now uses a versioned root-partition snapshot and mirror schema
+  version 2. Existing supported data migrates automatically; unsupported future data remains
+  untouched and unavailable rather than being overwritten.
 
 ### Fixed
 
-- Workspace-folder changes now rebind `.vscode/bookmarks.json` to the current single folder,
-  dispose the former folder's watcher, and disable both reads and writes in no-folder or
-  multi-root windows (#135). Rapid successive folder changes are processed in order.
+- Workspace-folder changes, mirror writes, external edits, root removal, and shutdown now drain
+  in deterministic order so rapid topology changes cannot lose or misassign bookmark data (#135).
+- Workspace and global context-menu state is tracked independently, so bookmarking a resource in
+  one scope no longer hides the add action for the other scope (#120). Windows resource-path
+  matching now follows VS Code's path casing.
 
 ## [1.3.0] — 2026-08-29
 

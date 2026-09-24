@@ -1267,20 +1267,17 @@ suite('BookmarksTreeDataProvider - suggested bookmarks (#95)', () => {
 // added, matching this file's own precedent for introducing new provider API (see the header
 // comments above the #95 and #108 suites).
 //
-// Design decisions this test-implementer is pinning (none of these are stated by issue #115
-// itself, so flag them for router/implementer confirmation):
+// Design decisions from the #160 release-candidate correction:
 //
-//   1. Slot: the relative path replaces `TreeItem.label`, never `TreeItem.description`. The
-//      "descriptions" suite above already pins `description` to the repo-name badge / "missing"
-//      badge, so `label` is the only free slot — using `description` would contradict tests this
-//      implementer cannot edit. See "does not displace" tests below for the explicit AC-2 pin.
-//   2. Path separator: labels always use `/`, even on Windows (`path.relative` would otherwise
-//      yield `src\index.ts` on a Windows CI/dev box). Assert the POSIX form explicitly.
-//   3. Fallback rule is per-URI, not per-scope: "no workspace root to be relative to" means the
+//   1. Relative path segments become expandable presentation-only folder nodes. Their muted
+//      `path` description and icon distinguish them from actual bookmarked folders.
+//   2. A bookmarked folder merges with its generated branch, retaining bookmark identity and
+//      actions while exposing bookmarked descendants.
+//   3. Fallback remains per-URI, not per-scope: "no workspace root to be relative to" means the
 //      bookmark's own URI falls outside every current `getWorkspaceFolders()` entry — checked with
 //      the same `getWorkspaceFolders` DI seam the T9 suite above already uses (an *empty* or
 //      *undefined* folder list, or a URI outside every folder, all count as "no root"). A
-//      global-scoped bookmark *inside* a workspace folder still gets a relative path; a
+//      global-scoped bookmark *inside* a workspace folder still gets a hierarchy; a
 //      workspace-scoped bookmark *outside* every folder still falls back to filename-only. The
 //      fallback display is filename-only (the pre-#115 baseline), not the absolute path.
 //   4. Persistence seam (AC: "Toggle state persists across window reloads, matching existing
@@ -1311,18 +1308,193 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
     assert.strictEqual(treeItem.label, 'index.ts');
   });
 
-  test('toggle on: label becomes the path relative to the workspace root, using "/" separators', async () => {
+  test('toggle on: path segments become expandable folder nodes down to the bookmarked leaf', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
-    const { store, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    const store = await createSingleRootFixtureStore();
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      new FsGitCache(async () => ({ exists: true })),
+      undefined,
+      () => folders
+    );
     provider.setShowFullPath(true);
-    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/model/catppuccin.go' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
+    const rootChildren = await provider.getChildren();
+    assert.strictEqual(rootChildren.length, 1);
+    assert.strictEqual(rootChildren[0].kind, 'pathFolder');
+    assert.strictEqual((await provider.getTreeItem(rootChildren[0])).label, 'internal');
 
-    assert.strictEqual(treeItem.label, 'src/index.ts');
+    const internalChildren = await provider.getChildren(rootChildren[0]);
+    assert.strictEqual(internalChildren.length, 1);
+    assert.strictEqual(internalChildren[0].kind, 'pathFolder');
+    assert.strictEqual((await provider.getTreeItem(internalChildren[0])).label, 'model');
+
+    const modelChildren = await provider.getChildren(internalChildren[0]);
+    assert.strictEqual(modelChildren.length, 1);
+    assert.strictEqual(modelChildren[0].kind, 'item');
+    assert.strictEqual((await provider.getTreeItem(modelChildren[0])).label, 'catppuccin.go');
   });
 
-  test('toggle on + Group by Repo: relative-path label has no duplicated repo-name prefix (AC-2)', async () => {
+  test('generated path folders use the muted path presentation and no bookmark resource identity', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const store = await createSingleRootFixtureStore();
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      new FsGitCache(async () => ({ exists: true })),
+      undefined,
+      () => folders
+    );
+    provider.setShowFullPath(true);
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/open_linux.go' });
+
+    const generatedFolder = (await provider.getChildren())[0];
+    const treeItem = await provider.getTreeItem(generatedFolder);
+
+    assert.strictEqual(generatedFolder.kind, 'pathFolder');
+    assert.strictEqual(treeItem.label, 'internal');
+    assert.strictEqual(treeItem.description, 'path');
+    assert.strictEqual(treeItem.contextValue, 'bookmarkPathFolder');
+    assert.strictEqual(treeItem.resourceUri, undefined, 'a presentation-only folder must not receive bookmark decorations');
+    assert.strictEqual((treeItem.iconPath as vscode.ThemeIcon).color?.id, 'disabledForeground');
+  });
+
+  test('a bookmarked folder and its generated path branch merge into one expandable bookmarked row', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const store = await createSingleRootFixtureStore();
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      new FsGitCache(async () => ({ exists: true })),
+      undefined,
+      () => folders
+    );
+    provider.setShowFullPath(true);
+    const folder = await store.addItem({ type: 'folder', uri: 'file:///workspace/repo-a/internal' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/open_linux.go' });
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.length, 1);
+    assert.strictEqual(roots[0].kind, 'item');
+    assert.strictEqual((roots[0] as Extract<BookmarkNode, { kind: 'item' }>).item.id, folder.id);
+
+    const treeItem = await provider.getTreeItem(roots[0]);
+    assert.strictEqual(treeItem.label, 'internal');
+    assert.strictEqual(treeItem.contextValue, 'bookmarkItem');
+    assert.strictEqual(treeItem.resourceUri?.toString(), folder.uri);
+    assert.strictEqual(treeItem.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+
+    const children = await provider.getChildren(roots[0]);
+    assert.strictEqual(children.length, 1);
+    assert.strictEqual((await provider.getTreeItem(children[0])).label, 'open_linux.go');
+  });
+
+  test('bookmarked folder branches use the folder bookmark order rather than the first descendant order', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const store = await createSingleRootFixtureStore();
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      new FsGitCache(async () => ({ exists: true })),
+      undefined,
+      () => folders
+    );
+    provider.setShowFullPath(true);
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/open_linux.go' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/dashboard.go' });
+    await store.addItem({ type: 'folder', uri: 'file:///workspace/repo-a/internal' });
+
+    const roots = await provider.getChildren();
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['dashboard.go', 'internal']
+    );
+  });
+
+  test('global bookmarks in different workspace roots keep identical relative paths in separate root branches', async () => {
+    const folders = [
+      workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0),
+      workspaceFolder(vscode.Uri.file('/workspace/repo-b'), 'repo-b', 1)
+    ];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const folderA = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a/internal' });
+    const folderB = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-b/internal' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-b/internal/b.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const workspaceRoots = await provider.getChildren(globalRoot);
+    assert.deepStrictEqual(
+      await Promise.all(workspaceRoots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['repo-a', 'repo-b']
+    );
+
+    for (const [workspaceRoot, expectedFolder, expectedLeaf] of [
+      [workspaceRoots[0], folderA, 'a.go'],
+      [workspaceRoots[1], folderB, 'b.go']
+    ] as const) {
+      const pathChildren = await provider.getChildren(workspaceRoot);
+      assert.strictEqual(pathChildren.length, 1);
+      assert.strictEqual(pathChildren[0].kind, 'item');
+      assert.strictEqual((pathChildren[0] as Extract<BookmarkNode, { kind: 'item' }>).item.id, expectedFolder.id);
+      const leaves = await provider.getChildren(pathChildren[0]);
+      assert.strictEqual(leaves.length, 1);
+      assert.strictEqual((await provider.getTreeItem(leaves[0])).label, expectedLeaf);
+    }
+  });
+
+  test('a bookmarked workspace root becomes the expandable hierarchy root', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a')];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const rootBookmark = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const roots = await provider.getChildren(globalRoot);
+    assert.strictEqual(roots.length, 1);
+    assert.strictEqual(roots[0].kind, 'item');
+    assert.strictEqual((roots[0] as Extract<BookmarkNode, { kind: 'item' }>).item.id, rootBookmark.id);
+    assert.strictEqual((await provider.getTreeItem(roots[0])).label, 'repo-a');
+
+    const rootChildren = await provider.getChildren(roots[0]);
+    assert.strictEqual(rootChildren.length, 1);
+    assert.strictEqual((await provider.getTreeItem(rootChildren[0])).label, 'internal');
+  });
+
+  test('bookmarked roots replace synthetic root branches in a multi-root Global hierarchy', async () => {
+    const folders = [
+      workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0),
+      workspaceFolder(vscode.Uri.file('/workspace/repo-b'), 'repo-b', 1)
+    ];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const rootA = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a' });
+    const rootB = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-b' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-b/internal/b.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const roots = await provider.getChildren(globalRoot);
+    assert.deepStrictEqual(
+      roots.map(node => node.kind === 'item' ? node.item.id : undefined),
+      [rootA.id, rootB.id]
+    );
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['repo-a', 'repo-b']
+    );
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).contextValue)),
+      ['bookmarkItem', 'bookmarkItem']
+    );
+    for (const root of roots) {
+      const children = await provider.getChildren(root);
+      assert.strictEqual(children.length, 1);
+      assert.strictEqual((await provider.getTreeItem(children[0])).label, 'internal');
+    }
+  });
+
+  test('toggle on + Group by Repo: hierarchy starts below the repository group without duplicating its name', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
     const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
     provider.setGroupMode('byRepo');
@@ -1334,24 +1506,27 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
     assert.ok(repoGroup, 'expected a repo-a group to drill into');
     const children = await provider.getChildren(repoGroup);
     assert.strictEqual(children.length, 1);
-    const treeItem = await provider.getTreeItem(children[0]);
+    assert.strictEqual(children[0].kind, 'pathFolder');
+    assert.strictEqual((await provider.getTreeItem(children[0])).label, 'src');
 
-    assert.strictEqual(treeItem.label, 'src/index.ts');
-    assert.ok(
-      !(treeItem.label as string).startsWith('repo-a'),
-      'the relative-path label must not repeat the repo-name prefix the Group-by-Repo grouping already shows'
-    );
+    const leaves = await provider.getChildren(children[0]);
+    assert.strictEqual(leaves.length, 1);
+    assert.strictEqual((await provider.getTreeItem(leaves[0])).label, 'index.ts');
   });
 
   test('toggle on does not displace the repo-name description badge', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
     const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
     provider.setShowFullPath(true);
-    const item = await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/index.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'workspace', owner: SINGLE_ROOT_OWNER });
+    const workspaceRoots = excludeGlobalRoot(await provider.getChildren());
+    assert.strictEqual(workspaceRoots.length, 1);
+    const leaves = await provider.getChildren(workspaceRoots[0]);
+    assert.strictEqual(leaves.length, 1);
+    const treeItem = await provider.getTreeItem(leaves[0]);
 
-    assert.strictEqual(treeItem.label, 'src/index.ts');
+    assert.strictEqual(treeItem.label, 'index.ts');
     assert.strictEqual(treeItem.description, 'repo-a', 'the repo-name description badge must survive the full-path toggle');
   });
 
@@ -1386,15 +1561,21 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
     assert.strictEqual(treeItem.label, 'index.ts');
   });
 
-  test('toggle on: a global-scoped bookmark inside a current workspace folder still gets a relative-path label (fallback is per-URI, not per-scope)', async () => {
+  test('toggle on: a global-scoped bookmark inside a current workspace folder gets the same folder hierarchy', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
     const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
     provider.setShowFullPath(true);
-    const item = await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/util.ts' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/src/util.ts' });
 
-    const treeItem = await provider.getTreeItem({ kind: 'item', item, scope: 'global' });
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const pathRoots = await provider.getChildren(globalRoot);
+    assert.strictEqual(pathRoots.length, 1);
+    assert.strictEqual((await provider.getTreeItem(pathRoots[0])).label, 'src');
+    const leaves = await provider.getChildren(pathRoots[0]);
+    assert.strictEqual(leaves.length, 1);
+    const treeItem = await provider.getTreeItem(leaves[0]);
 
-    assert.strictEqual(treeItem.label, 'src/util.ts');
+    assert.strictEqual(treeItem.label, 'util.ts');
   });
 
   test('toggle on: a workspace-scoped bookmark outside every workspace folder falls back to filename-only', async () => {

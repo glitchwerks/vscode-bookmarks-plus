@@ -1,6 +1,12 @@
 import * as vscode from 'vscode';
 import { findDeepestRoot, toRootCandidates } from './rootUri';
 
+export interface WorkspaceRelativeLocation {
+  readonly rootKey: string;
+  readonly rootLabel: string;
+  readonly relativePath: string;
+}
+
 /**
  * Pure predicate for whether `uri` lies inside one of `folders` — the workspace folder itself
  * or any descendant, matching `vscode.workspace.getWorkspaceFolder`'s documented semantics
@@ -30,6 +36,14 @@ export function getWorkspaceRelativePath(
   uri: vscode.Uri,
   folders: readonly vscode.WorkspaceFolder[] | undefined
 ): string | undefined {
+  return getWorkspaceRelativeLocation(uri, folders)?.relativePath;
+}
+
+/** Returns both the deepest containing workspace-root identity and the path relative to it. */
+export function getWorkspaceRelativeLocation(
+  uri: vscode.Uri,
+  folders: readonly vscode.WorkspaceFolder[] | undefined
+): WorkspaceRelativeLocation | undefined {
   const root = findDeepestRoot(uri, toRootCandidates(folders));
   if (!root) {
     return undefined;
@@ -37,5 +51,9 @@ export function getWorkspaceRelativePath(
 
   const uriSegments = uri.path.split('/').filter(Boolean);
   const rootSegmentCount = root.uri.path.split('/').filter(Boolean).length;
-  return uriSegments.slice(rootSegmentCount).join('/');
+  return {
+    rootKey: root.canonicalUri,
+    rootLabel: root.label,
+    relativePath: uriSegments.slice(rootSegmentCount).join('/')
+  };
 }

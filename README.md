@@ -13,7 +13,7 @@ workspaces, Git-aware grouping, and optional AI-tool access.
 - Keep bookmarks with one workspace or place them in **Global** so they appear everywhere.
 - Work naturally with multi-root workspaces: each root owns its bookmarks, while removed roots can
   be recovered later.
-- Group bookmarks by Git repository or show paths relative to the workspace root.
+- Group bookmarks by Git repository or show their folder hierarchy relative to the workspace root.
 - See bookmarked resources directly in the Explorer through a `★` decoration.
 - Add descriptions to bookmarks and collections, and spot missing targets through warning icons.
 - Promote recently opened files from the optional **Suggested** section.

@@ -32,10 +32,13 @@ The view title bar includes two display toggles:
 
 - **Group by Repo** groups bookmarks by Git repository. Anything VS Code's Git extension cannot
   resolve appears under **Unknown**.
-- **Show Full Path** switches labels between filename-only and paths relative to the workspace
-  root, using `/` separators. With repository grouping enabled, the path does not repeat the
-  repository name. Targets outside every attached root fall back to filename-only. The setting
-  persists across window reloads.
+- **Show Full Path** switches between a flat filename list and an expandable folder hierarchy
+  relative to the workspace root. Generated path folders use a muted presentation; a folder that
+  is itself bookmarked remains a normal starred bookmark and also expands to show bookmarked
+  descendants. Global bookmarks from multiple workspace roots stay under separate root branches.
+  With repository grouping enabled, the hierarchy does not repeat the repository name. Targets
+  outside every attached root fall back to filename-only. The setting persists
+  across window reloads.
 
 ## Explorer decorations
 
