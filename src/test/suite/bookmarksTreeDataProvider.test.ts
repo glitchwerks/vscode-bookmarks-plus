@@ -1388,6 +1388,60 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
     assert.strictEqual((await provider.getTreeItem(children[0])).label, 'open_linux.go');
   });
 
+  test('bookmarked folder branches use the folder bookmark order rather than the first descendant order', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
+    const store = await createSingleRootFixtureStore();
+    const provider = new BookmarksTreeDataProvider(
+      store,
+      new FsGitCache(async () => ({ exists: true })),
+      undefined,
+      () => folders
+    );
+    provider.setShowFullPath(true);
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/open_linux.go' });
+    await store.addItem({ type: 'file', uri: 'file:///workspace/repo-a/dashboard.go' });
+    await store.addItem({ type: 'folder', uri: 'file:///workspace/repo-a/internal' });
+
+    const roots = await provider.getChildren();
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['dashboard.go', 'internal']
+    );
+  });
+
+  test('global bookmarks in different workspace roots keep identical relative paths in separate root branches', async () => {
+    const folders = [
+      workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0),
+      workspaceFolder(vscode.Uri.file('/workspace/repo-b'), 'repo-b', 1)
+    ];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const folderA = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a/internal' });
+    const folderB = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-b/internal' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-b/internal/b.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const workspaceRoots = await provider.getChildren(globalRoot);
+    assert.deepStrictEqual(
+      await Promise.all(workspaceRoots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['repo-a', 'repo-b']
+    );
+
+    for (const [workspaceRoot, expectedFolder, expectedLeaf] of [
+      [workspaceRoots[0], folderA, 'a.go'],
+      [workspaceRoots[1], folderB, 'b.go']
+    ] as const) {
+      const pathChildren = await provider.getChildren(workspaceRoot);
+      assert.strictEqual(pathChildren.length, 1);
+      assert.strictEqual(pathChildren[0].kind, 'item');
+      assert.strictEqual((pathChildren[0] as Extract<BookmarkNode, { kind: 'item' }>).item.id, expectedFolder.id);
+      const leaves = await provider.getChildren(pathChildren[0]);
+      assert.strictEqual(leaves.length, 1);
+      assert.strictEqual((await provider.getTreeItem(leaves[0])).label, expectedLeaf);
+    }
+  });
+
   test('toggle on + Group by Repo: hierarchy starts below the repository group without duplicating its name', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
     const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);

@@ -4,7 +4,7 @@ import { BookmarkContentReader, BookmarkStore } from './bookmarkStore';
 import { FsGitCache } from './fsGitCache';
 import { RecentItem } from './recentItems';
 import { BookmarkCollection, BookmarkData, BookmarkItem, BookmarkScope } from './types';
-import { getWorkspaceRelativePath, isInsideWorkspace } from './workspaceFolders';
+import { getWorkspaceRelativeLocation, isInsideWorkspace } from './workspaceFolders';
 import { WorkspaceBookmarkStore, WorkspaceStoreView } from './workspaceBookmarkStore';
 import { ownerKey, WorkspaceOwnerRef } from './workspacePartitionTypes';
 
@@ -22,7 +22,7 @@ export type BookmarkNode =
   | { kind: 'globalRoot' }
   | ({ kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string } & OwnerEnvelope)
   | ({ kind: 'item'; item: BookmarkItem } & OwnerEnvelope & PathChildren)
-  | ({ kind: 'pathFolder'; label: string; relativePath: string; collectionId: string | null; repoKey?: string; children: BookmarkNode[] } & OwnerEnvelope)
+  | ({ kind: 'pathFolder'; label: string; relativePath: string; workspaceRootKey?: string; collectionId: string | null; repoKey?: string; children: BookmarkNode[] } & OwnerEnvelope)
   | { kind: 'repoGroup'; label: string; repoKey: string; scope?: BookmarkScope; owner?: WorkspaceOwnerRef }
   | { kind: 'suggestedRoot' }
   | { kind: 'suggestion'; recentItem: RecentItem }
@@ -138,7 +138,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       case 'detachedPartition': { const item = rootItem(node.label, 'bookmarkDetachedPartition', 'archive'); item.id = `detachedPartition:${node.partitionId}`; return item; }
       case 'workspaceDiagnostic': { const item = new vscode.TreeItem(node.message, vscode.TreeItemCollapsibleState.None); item.contextValue = 'bookmarkWorkspaceDiagnostic'; item.command = { command: 'bookmarks.showOutput', title: 'Open Bookmarks Plus output' }; item.iconPath = new vscode.ThemeIcon('warning'); return item; }
       case 'repoGroup': { const item = rootItem(node.label, 'bookmarkRepoGroup', 'repo'); item.id = `repo:${this.nodeOwnerPrefix(node)}:${node.repoKey}`; return item; }
-      case 'pathFolder': { const item = rootItem(node.label, 'bookmarkPathFolder', 'folder'); item.id = `pathFolder:${this.nodeOwnerPrefix(node)}:${node.repoKey ?? 'default'}:${node.collectionId ?? 'root'}:${node.relativePath}`; item.description = 'path'; item.iconPath = new vscode.ThemeIcon('folder', new vscode.ThemeColor('disabledForeground')); return item; }
+      case 'pathFolder': { const item = rootItem(node.label, 'bookmarkPathFolder', 'folder'); item.id = `pathFolder:${this.nodeOwnerPrefix(node)}:${node.repoKey ?? 'default'}:${node.collectionId ?? 'root'}:${node.workspaceRootKey ?? 'workspace'}:${node.relativePath}`; item.description = 'path'; item.iconPath = new vscode.ThemeIcon('folder', new vscode.ThemeColor('disabledForeground')); return item; }
       case 'suggestedRoot': return rootItem('Suggested', 'bookmarkSuggestedRoot', 'lightbulb');
       case 'recentRoot': return rootItem('Recent', 'bookmarkRecentRoot', 'history');
       case 'suggestion': return leafForUri(node.recentItem.uri, 'bookmarkSuggestion');
@@ -284,9 +284,16 @@ interface MutablePathFolder {
   readonly kind: 'folder';
   readonly label: string;
   readonly relativePath: string;
+  readonly workspaceRootKey: string;
   readonly entries: MutablePathEntry[];
   readonly folders: Map<string, MutablePathFolder>;
   item?: BookmarkItem;
+}
+
+interface MutablePathPartition {
+  readonly rootKey: string;
+  readonly rootLabel: string;
+  readonly container: MutablePathContainer;
 }
 
 function buildPathHierarchy(
@@ -297,19 +304,29 @@ function buildPathHierarchy(
   repoKey?: string
 ): BookmarkNode[] {
   const root: MutablePathContainer = { entries: [], folders: new Map() };
+  const partitions = new Map<string, MutablePathPartition>();
   for (const item of items) {
-    const relative = getWorkspaceRelativePath(vscode.Uri.parse(item.uri), folders);
-    if (!relative) { root.entries.push(item); continue; }
-    const segments = relative.split('/').filter(Boolean);
+    const location = getWorkspaceRelativeLocation(vscode.Uri.parse(item.uri), folders);
+    if (!location) { root.entries.push(item); continue; }
+    let partition = partitions.get(location.rootKey);
+    if (!partition) {
+      partition = {
+        rootKey: location.rootKey,
+        rootLabel: location.rootLabel,
+        container: { entries: [], folders: new Map() }
+      };
+      partitions.set(location.rootKey, partition);
+    }
+    const segments = location.relativePath.split('/').filter(Boolean);
     const folderSegments = item.type === 'folder' ? segments : segments.slice(0, -1);
-    let parent: MutablePathContainer = root;
+    let parent: MutablePathContainer = partition.container;
     let terminalFolder: MutablePathFolder | undefined;
     let currentPath = '';
     for (const segment of folderSegments) {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
       let folder = parent.folders.get(segment);
       if (!folder) {
-        folder = { kind: 'folder', label: segment, relativePath: currentPath, entries: [], folders: new Map() };
+        folder = { kind: 'folder', label: segment, relativePath: currentPath, workspaceRootKey: location.rootKey, entries: [], folders: new Map() };
         parent.folders.set(segment, folder);
         parent.entries.push(folder);
       }
@@ -320,17 +337,42 @@ function buildPathHierarchy(
     else parent.entries.push(item);
   }
 
-  const toNodes = (entries: MutablePathEntry[]): BookmarkNode[] => entries.map((entry): BookmarkNode => {
+  if (partitions.size === 1) {
+    root.entries.push(...partitions.values().next().value!.container.entries);
+  } else {
+    for (const partition of partitions.values()) {
+      root.entries.push({
+        kind: 'folder',
+        label: partition.rootLabel,
+        relativePath: '',
+        workspaceRootKey: partition.rootKey,
+        entries: partition.container.entries,
+        folders: partition.container.folders
+      });
+    }
+  }
+
+  const toNodes = (entries: MutablePathEntry[]): BookmarkNode[] => entries.slice().sort(comparePathEntries).map((entry): BookmarkNode => {
     if (!isMutablePathFolder(entry)) return { kind: 'item', item: entry, ...envelope };
     const children = toNodes(entry.entries);
     if (entry.item) return { kind: 'item', item: entry.item, children, ...envelope };
-    return { kind: 'pathFolder', label: entry.label, relativePath: entry.relativePath, collectionId, repoKey, children, ...envelope };
+    return { kind: 'pathFolder', label: entry.label, relativePath: entry.relativePath, workspaceRootKey: entry.workspaceRootKey, collectionId, repoKey, children, ...envelope };
   });
   return toNodes(root.entries);
 }
 
 function isMutablePathFolder(entry: MutablePathEntry): entry is MutablePathFolder {
   return 'kind' in entry && entry.kind === 'folder';
+}
+
+function comparePathEntries(left: MutablePathEntry, right: MutablePathEntry): number {
+  return pathEntryOrder(left) - pathEntryOrder(right);
+}
+
+function pathEntryOrder(entry: MutablePathEntry): number {
+  if (!isMutablePathFolder(entry)) return entry.order;
+  if (entry.item) return entry.item.order;
+  return Math.min(...entry.entries.map(pathEntryOrder));
 }
 
 function rootItem(label: string, contextValue: string, icon: string): vscode.TreeItem { const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Collapsed); item.contextValue = contextValue; item.iconPath = new vscode.ThemeIcon(icon); return item; }

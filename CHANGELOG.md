@@ -24,8 +24,8 @@ All notable changes to the "Bookmarks Plus" extension are documented in this fil
   already-bookmarked resources expose **Remove Bookmark** in Explorer and editor menus (#114).
 - **Toggle Show Full Path** (#115, #160) switches between filename-only rows and an expandable
   folder hierarchy relative to the deepest containing workspace root. Generated path folders are
-  muted, bookmarked folders merge into their expandable branch, and repository grouping does not
-  duplicate the root name.
+  muted, bookmarked folders merge into their expandable branch, multi-root Global bookmarks stay
+  separated by workspace root, and repository grouping does not duplicate the root name.
 - The standalone MCP server is now available as the public
   `@glitchwerks/bookmarks-plus-mcp` package for `npx`-based clients (#66).
 
