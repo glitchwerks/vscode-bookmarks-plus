@@ -10,6 +10,7 @@ import { ownerKey, WorkspaceOwnerRef } from './workspacePartitionTypes';
 
 export type GroupMode = 'default' | 'byRepo';
 type OwnerEnvelope = { scope: BookmarkScope; owner?: WorkspaceOwnerRef };
+type PathChildren = { children?: BookmarkNode[] };
 
 /** A tree node always retains its workspace owner once it enters the partitioned path. */
 export type BookmarkNode =
@@ -20,7 +21,8 @@ export type BookmarkNode =
   | { kind: 'workspaceDiagnostic'; message: string; scope: BookmarkScope; collection: BookmarkCollection }
   | { kind: 'globalRoot' }
   | ({ kind: 'collection'; collection: BookmarkCollection; repoLabel?: string; repoKey?: string } & OwnerEnvelope)
-  | ({ kind: 'item'; item: BookmarkItem } & OwnerEnvelope)
+  | ({ kind: 'item'; item: BookmarkItem } & OwnerEnvelope & PathChildren)
+  | ({ kind: 'pathFolder'; label: string; relativePath: string; collectionId: string | null; repoKey?: string; children: BookmarkNode[] } & OwnerEnvelope)
   | { kind: 'repoGroup'; label: string; repoKey: string; scope?: BookmarkScope; owner?: WorkspaceOwnerRef }
   | { kind: 'suggestedRoot' }
   | { kind: 'suggestion'; recentItem: RecentItem }
@@ -136,6 +138,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
       case 'detachedPartition': { const item = rootItem(node.label, 'bookmarkDetachedPartition', 'archive'); item.id = `detachedPartition:${node.partitionId}`; return item; }
       case 'workspaceDiagnostic': { const item = new vscode.TreeItem(node.message, vscode.TreeItemCollapsibleState.None); item.contextValue = 'bookmarkWorkspaceDiagnostic'; item.command = { command: 'bookmarks.showOutput', title: 'Open Bookmarks Plus output' }; item.iconPath = new vscode.ThemeIcon('warning'); return item; }
       case 'repoGroup': { const item = rootItem(node.label, 'bookmarkRepoGroup', 'repo'); item.id = `repo:${this.nodeOwnerPrefix(node)}:${node.repoKey}`; return item; }
+      case 'pathFolder': { const item = rootItem(node.label, 'bookmarkPathFolder', 'folder'); item.id = `pathFolder:${this.nodeOwnerPrefix(node)}:${node.repoKey ?? 'default'}:${node.collectionId ?? 'root'}:${node.relativePath}`; item.description = 'path'; item.iconPath = new vscode.ThemeIcon('folder', new vscode.ThemeColor('disabledForeground')); return item; }
       case 'suggestedRoot': return rootItem('Suggested', 'bookmarkSuggestedRoot', 'lightbulb');
       case 'recentRoot': return rootItem('Recent', 'bookmarkRecentRoot', 'history');
       case 'suggestion': return leafForUri(node.recentItem.uri, 'bookmarkSuggestion');
@@ -146,6 +149,7 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   async getChildren(node?: BookmarkNode): Promise<BookmarkNode[]> {
+    if (node?.kind === 'pathFolder' || (node?.kind === 'item' && node.children)) return node.children ?? [];
     if (node?.kind === 'suggestedRoot') return this.getSuggestedLeaves();
     if (node?.kind === 'recentRoot') return this.getRecentLeaves();
     if (node?.kind === 'globalRoot' || ((node?.kind === 'collection' || node?.kind === 'repoGroup') && node.scope === 'global')) return this.getGlobalChildren(node);
@@ -199,9 +203,9 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   private getRecentLeaves(): BookmarkNode[] { return this.recentlyViewed?.getUris().map((uri): BookmarkNode => ({ kind: 'recentItem', uri })) ?? []; }
 
   private getChildrenDefault(node: BookmarkNode | undefined, items: BookmarkItem[], collections: BookmarkCollection[], scope: BookmarkScope, owner?: WorkspaceOwnerRef): BookmarkNode[] {
-    if (!node || node.kind === 'globalRoot') return [...collections.slice().sort(byOrder).map((collection): BookmarkNode => ({ kind: 'collection', collection, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) })), ...items.filter((item) => item.collectionId === null).sort(byOrder).map((item): BookmarkNode => ({ kind: 'item', item, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) }))];
+    if (!node || node.kind === 'globalRoot') return [...collections.slice().sort(byOrder).map((collection): BookmarkNode => ({ kind: 'collection', collection, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) })), ...this.itemNodes(items.filter((item) => item.collectionId === null).sort(byOrder), scope, owner, null)];
     if (node.kind !== 'collection') return [];
-    return items.filter((item) => item.collectionId === node.collection.id).sort(byOrder).map((item): BookmarkNode => ({ kind: 'item', item, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) }));
+    return this.itemNodes(items.filter((item) => item.collectionId === node.collection.id).sort(byOrder), scope, owner, node.collection.id);
   }
 
   private async getChildrenByRepo(node: BookmarkNode | undefined, items: BookmarkItem[], collections: BookmarkCollection[], scope: BookmarkScope, owner?: WorkspaceOwnerRef): Promise<BookmarkNode[]> {
@@ -211,10 +215,16 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
     }
     if (node.kind === 'repoGroup') {
       const inRepo = await this.itemsInRepo(items, node.repoKey); const collectionIds = new Set(inRepo.map((item) => item.collectionId).filter((id): id is string => id !== null));
-      return [...collections.filter((collection) => collectionIds.has(collection.id)).sort(byOrder).map((collection): BookmarkNode => ({ kind: 'collection', collection, repoLabel: node.label, repoKey: node.repoKey, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) })), ...inRepo.filter((item) => item.collectionId === null).sort(byOrder).map((item): BookmarkNode => ({ kind: 'item', item, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) }))];
+      return [...collections.filter((collection) => collectionIds.has(collection.id)).sort(byOrder).map((collection): BookmarkNode => ({ kind: 'collection', collection, repoLabel: node.label, repoKey: node.repoKey, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) })), ...this.itemNodes(inRepo.filter((item) => item.collectionId === null).sort(byOrder), scope, owner, null, node.repoKey)];
     }
     if (node.kind !== 'collection') return [];
-    return (await this.itemsInRepo(items.filter((item) => item.collectionId === node.collection.id), node.repoKey ?? UNKNOWN_REPO_KEY)).sort(byOrder).map((item): BookmarkNode => ({ kind: 'item', item, scope, ...(scope === 'workspace' ? { owner: owner! } : {}) }));
+    return this.itemNodes((await this.itemsInRepo(items.filter((item) => item.collectionId === node.collection.id), node.repoKey ?? UNKNOWN_REPO_KEY)).sort(byOrder), scope, owner, node.collection.id, node.repoKey);
+  }
+
+  private itemNodes(items: BookmarkItem[], scope: BookmarkScope, owner: WorkspaceOwnerRef | undefined, collectionId: string | null, repoKey?: string): BookmarkNode[] {
+    const envelope: OwnerEnvelope = { scope, ...(scope === 'workspace' ? { owner: owner! } : {}) };
+    if (!this.showFullPath) return items.map((item): BookmarkNode => ({ kind: 'item', item, ...envelope }));
+    return buildPathHierarchy(items, this.getWorkspaceFolders(), envelope, collectionId, repoKey);
   }
 
   private async itemsInRepo(items: BookmarkItem[], repoKey: string): Promise<BookmarkItem[]> { const result: BookmarkItem[] = []; for (const item of items) if (repoIdentity((await this.cache.get(item.uri)).repoName).key === repoKey) result.push(item); return result; }
@@ -238,8 +248,8 @@ export class BookmarksTreeDataProvider implements vscode.TreeDataProvider<Bookma
   }
 
   private async bookmarkTreeItem(node: Extract<BookmarkNode, { kind: 'item' }>): Promise<vscode.TreeItem> {
-    const uri = vscode.Uri.parse(node.item.uri); const entry = await this.cache.get(node.item.uri); const relative = this.showFullPath ? getWorkspaceRelativePath(uri, this.getWorkspaceFolders()) : undefined;
-    const item = new vscode.TreeItem(relative || path.basename(uri.fsPath) || uri.fsPath, vscode.TreeItemCollapsibleState.None); item.id = `item:${this.nodeOwnerPrefix(node)}:${node.item.id}`;
+    const uri = vscode.Uri.parse(node.item.uri); const entry = await this.cache.get(node.item.uri);
+    const item = new vscode.TreeItem(path.basename(uri.fsPath) || uri.fsPath, node.children?.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None); item.id = `item:${this.nodeOwnerPrefix(node)}:${node.item.id}`;
     item.contextValue = node.scope === 'global' && node.item.type === 'folder' && !isInsideWorkspace(uri, this.getWorkspaceFolders()) ? 'bookmarkItem-addable' : 'bookmarkItem'; item.resourceUri = uri;
     if (node.item.description) item.tooltip = `${uri.fsPath}\n\n${node.item.description}`;
     if (!entry.exists) { item.iconPath = new vscode.ThemeIcon('warning'); item.description = 'missing'; } else { item.iconPath = new vscode.ThemeIcon(node.item.type === 'folder' ? 'folder' : 'file'); if (entry.repoName) item.description = entry.repoName; }
@@ -264,6 +274,65 @@ function isDragEnvelope(value: unknown): value is DragEnvelope {
   if ((candidate.scope !== 'workspace' && candidate.scope !== 'global') || !Array.isArray(candidate.ids) || !candidate.ids.every((id) => typeof id === 'string')) return false;
   return candidate.owner === undefined || (typeof candidate.owner === 'object' && candidate.owner !== null && (candidate.owner.kind === 'unassigned' || (candidate.owner.kind === 'partition' && typeof candidate.owner.partitionId === 'string')));
 }
+
+type MutablePathEntry = BookmarkItem | MutablePathFolder;
+interface MutablePathContainer {
+  readonly entries: MutablePathEntry[];
+  readonly folders: Map<string, MutablePathFolder>;
+}
+interface MutablePathFolder {
+  readonly kind: 'folder';
+  readonly label: string;
+  readonly relativePath: string;
+  readonly entries: MutablePathEntry[];
+  readonly folders: Map<string, MutablePathFolder>;
+  item?: BookmarkItem;
+}
+
+function buildPathHierarchy(
+  items: BookmarkItem[],
+  folders: readonly vscode.WorkspaceFolder[] | undefined,
+  envelope: OwnerEnvelope,
+  collectionId: string | null,
+  repoKey?: string
+): BookmarkNode[] {
+  const root: MutablePathContainer = { entries: [], folders: new Map() };
+  for (const item of items) {
+    const relative = getWorkspaceRelativePath(vscode.Uri.parse(item.uri), folders);
+    if (!relative) { root.entries.push(item); continue; }
+    const segments = relative.split('/').filter(Boolean);
+    const folderSegments = item.type === 'folder' ? segments : segments.slice(0, -1);
+    let parent: MutablePathContainer = root;
+    let terminalFolder: MutablePathFolder | undefined;
+    let currentPath = '';
+    for (const segment of folderSegments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      let folder = parent.folders.get(segment);
+      if (!folder) {
+        folder = { kind: 'folder', label: segment, relativePath: currentPath, entries: [], folders: new Map() };
+        parent.folders.set(segment, folder);
+        parent.entries.push(folder);
+      }
+      parent = folder;
+      terminalFolder = folder;
+    }
+    if (item.type === 'folder' && terminalFolder) terminalFolder.item = item;
+    else parent.entries.push(item);
+  }
+
+  const toNodes = (entries: MutablePathEntry[]): BookmarkNode[] => entries.map((entry): BookmarkNode => {
+    if (!isMutablePathFolder(entry)) return { kind: 'item', item: entry, ...envelope };
+    const children = toNodes(entry.entries);
+    if (entry.item) return { kind: 'item', item: entry.item, children, ...envelope };
+    return { kind: 'pathFolder', label: entry.label, relativePath: entry.relativePath, collectionId, repoKey, children, ...envelope };
+  });
+  return toNodes(root.entries);
+}
+
+function isMutablePathFolder(entry: MutablePathEntry): entry is MutablePathFolder {
+  return 'kind' in entry && entry.kind === 'folder';
+}
+
 function rootItem(label: string, contextValue: string, icon: string): vscode.TreeItem { const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Collapsed); item.contextValue = contextValue; item.iconPath = new vscode.ThemeIcon(icon); return item; }
 function leafForUri(value: string, contextValue: string): vscode.TreeItem { const uri = vscode.Uri.parse(value); const item = new vscode.TreeItem(path.basename(uri.fsPath) || uri.fsPath, vscode.TreeItemCollapsibleState.None); item.contextValue = contextValue; item.resourceUri = uri; item.iconPath = new vscode.ThemeIcon('file'); item.command = { command: 'vscode.open', title: 'Open', arguments: [uri] }; return item; }
 function byOrder(left: { order: number }, right: { order: number }): number { return left.order - right.order; }
