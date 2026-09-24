@@ -294,6 +294,7 @@ interface MutablePathPartition {
   readonly rootKey: string;
   readonly rootLabel: string;
   readonly container: MutablePathContainer;
+  item?: BookmarkItem;
 }
 
 function buildPathHierarchy(
@@ -318,6 +319,10 @@ function buildPathHierarchy(
       partitions.set(location.rootKey, partition);
     }
     const segments = location.relativePath.split('/').filter(Boolean);
+    if (item.type === 'folder' && segments.length === 0) {
+      partition.item = item;
+      continue;
+    }
     const folderSegments = item.type === 'folder' ? segments : segments.slice(0, -1);
     let parent: MutablePathContainer = partition.container;
     let terminalFolder: MutablePathFolder | undefined;
@@ -338,17 +343,12 @@ function buildPathHierarchy(
   }
 
   if (partitions.size === 1) {
-    root.entries.push(...partitions.values().next().value!.container.entries);
+    const partition = partitions.values().next().value!;
+    if (partition.item) root.entries.push(pathRootFolder(partition));
+    else root.entries.push(...partition.container.entries);
   } else {
     for (const partition of partitions.values()) {
-      root.entries.push({
-        kind: 'folder',
-        label: partition.rootLabel,
-        relativePath: '',
-        workspaceRootKey: partition.rootKey,
-        entries: partition.container.entries,
-        folders: partition.container.folders
-      });
+      root.entries.push(pathRootFolder(partition));
     }
   }
 
@@ -363,6 +363,18 @@ function buildPathHierarchy(
 
 function isMutablePathFolder(entry: MutablePathEntry): entry is MutablePathFolder {
   return 'kind' in entry && entry.kind === 'folder';
+}
+
+function pathRootFolder(partition: MutablePathPartition): MutablePathFolder {
+  return {
+    kind: 'folder',
+    label: partition.rootLabel,
+    relativePath: '',
+    workspaceRootKey: partition.rootKey,
+    entries: partition.container.entries,
+    folders: partition.container.folders,
+    item: partition.item
+  };
 }
 
 function comparePathEntries(left: MutablePathEntry, right: MutablePathEntry): number {

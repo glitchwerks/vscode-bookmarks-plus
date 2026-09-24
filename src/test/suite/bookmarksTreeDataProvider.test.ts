@@ -1442,6 +1442,58 @@ suite('BookmarksTreeDataProvider - show full path toggle (#115)', () => {
     }
   });
 
+  test('a bookmarked workspace root becomes the expandable hierarchy root', async () => {
+    const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a')];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const rootBookmark = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const roots = await provider.getChildren(globalRoot);
+    assert.strictEqual(roots.length, 1);
+    assert.strictEqual(roots[0].kind, 'item');
+    assert.strictEqual((roots[0] as Extract<BookmarkNode, { kind: 'item' }>).item.id, rootBookmark.id);
+    assert.strictEqual((await provider.getTreeItem(roots[0])).label, 'repo-a');
+
+    const rootChildren = await provider.getChildren(roots[0]);
+    assert.strictEqual(rootChildren.length, 1);
+    assert.strictEqual((await provider.getTreeItem(rootChildren[0])).label, 'internal');
+  });
+
+  test('bookmarked roots replace synthetic root branches in a multi-root Global hierarchy', async () => {
+    const folders = [
+      workspaceFolder(vscode.Uri.file('/workspace/repo-a'), 'repo-a', 0),
+      workspaceFolder(vscode.Uri.file('/workspace/repo-b'), 'repo-b', 1)
+    ];
+    const { globalStore, provider } = await makeProviderWithGlobal(undefined, () => folders);
+    provider.setShowFullPath(true);
+    const rootA = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-a' });
+    const rootB = await globalStore.addItem({ type: 'folder', uri: 'file:///workspace/repo-b' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-a/internal/a.go' });
+    await globalStore.addItem({ type: 'file', uri: 'file:///workspace/repo-b/internal/b.go' });
+
+    const globalRoot = findGlobalRoot(await provider.getChildren())!;
+    const roots = await provider.getChildren(globalRoot);
+    assert.deepStrictEqual(
+      roots.map(node => node.kind === 'item' ? node.item.id : undefined),
+      [rootA.id, rootB.id]
+    );
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).label)),
+      ['repo-a', 'repo-b']
+    );
+    assert.deepStrictEqual(
+      await Promise.all(roots.map(async node => (await provider.getTreeItem(node)).contextValue)),
+      ['bookmarkItem', 'bookmarkItem']
+    );
+    for (const root of roots) {
+      const children = await provider.getChildren(root);
+      assert.strictEqual(children.length, 1);
+      assert.strictEqual((await provider.getTreeItem(children[0])).label, 'internal');
+    }
+  });
+
   test('toggle on + Group by Repo: hierarchy starts below the repository group without duplicating its name', async () => {
     const folders = [workspaceFolder(vscode.Uri.file('/workspace/repo-a'))];
     const { store, provider } = await makeProviderWithGlobal(async () => ({ exists: true, repoName: 'repo-a' }), () => folders);
